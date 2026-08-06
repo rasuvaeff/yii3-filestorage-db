@@ -118,7 +118,7 @@
         "release-check": [
             "@build",
             "@rector",
-            "@bc-check"
+            "sh -c 'LATEST=$(git describe --tags --abbrev=0 2>/dev/null || true); if [ -n \"$LATEST\" ]; then composer bc-check -- --from=\"$LATEST\"; else echo \"No previous tag - skipping BC check\"; fi'"
         ],
         "require-checker": "composer-require-checker check composer.json",
         "test": "testo --suite=Unit",

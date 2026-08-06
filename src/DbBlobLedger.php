@@ -89,7 +89,15 @@ final readonly class DbBlobLedger implements BlobLedgerInterface
             // "current transaction is aborted" for everything after. SQLite and
             // MySQL are more forgiving, which is exactly why that shape passes
             // a SQLite test suite and fails in production.
-            $this->claimBlob($id, $blob, $token, $contentHash, $size, $expiresAt);
+            try {
+                $this->claimBlob($id, $blob, $token, $contentHash, $size, $expiresAt);
+            } catch (IntegrityException $retried) {
+                // Once is a race; twice is the row appearing and vanishing
+                // under us, or a token collision. Either way this method
+                // promises only BlobBusyException and LedgerException, so a
+                // raw driver exception must not be what the caller sees.
+                throw new LedgerException("Blob \"{$blob->key()}\" could not be reserved", 0, $retried);
+            }
         }
 
         return new BlobReservation($blob, $token, $expiresAt);
