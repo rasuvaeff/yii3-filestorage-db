@@ -1,0 +1,137 @@
+# rasuvaeff/yii3-filestorage-db
+
+Database metadata backend for `rasuvaeff/yii3-filestorage`. Namespace
+`Rasuvaeff\Yii3FilestorageDb\`. PHP 8.3–8.5, `yiisoft/db` ^2.0,
+`yiisoft/db-migration` ^2.1.
+
+## Install
+
+```bash
+composer require rasuvaeff/yii3-filestorage-db
+```
+
+Binds `RepositoryInterface`, `MaintenanceRepositoryInterface`,
+`ScopedFileResolverInterface`, `BlobLedgerInterface` and the three table-name
+VOs. Does NOT bind `StorageInterface` (core's), `StoreInterface` (a store
+backend's) or `FileScopeProviderInterface` (the application's).
+
+## Rules
+
+1. **Every statement carries the tenant predicate.** There is no method that
+   skips it. A signed download uses `ScopedFileResolverInterface`, which
+   matches the token's authenticated scope as a second predicate — never turn
+   the filter off for downloads.
+2. **`scope_id = null` is a scope**, matching `scope_id IS NULL`. An unscoped
+   token is not a wildcard.
+3. **Shared bytes are never deleted inside a request.** `releaseFile()` only
+   schedules; only `claimForDeletion()` → `completeDeletion()` deletes.
+4. **Ledger guards live in the statement that acts**, and the decision is the
+   affected-row count. Never `SELECT` then `UPDATE`.
+5. **The ledger writes file rows through `DbRepository`, never itself.** Its
+   own `DELETE ... WHERE id = :id` would bypass the tenant predicate.
+6. **`yiisoft/db-migration` ^2.1**, not ^2.0: on 2.0.x `setSourceNamespaces()`
+   resolved to the core package's directory, found nothing and exited 0.
+7. Timestamps are `Y-m-d\TH:i:s.uP` text normalised to UTC. Microseconds are
+   part of the contract; string order must equal chronological order.
+8. A malformed row throws `InvalidFileRowException`; it is never coerced.
+
+## Migrations
+
+```php
+MigrationService::class => [
+    'setSourceNamespaces()' => [['Rasuvaeff\\Yii3FilestorageDb\\Migration']],
+],
+```
+
+`M260807000000CreateFilestorageFileTable` → `filestorage_file`.
+`M260807000001CreateFilestorageBlobTables` → `filestorage_blob` +
+`filestorage_blob_reservation`.
+
+No `reference_count` column: a reference is a `filestorage_file` row with the
+blob's id, and guards ask `NOT EXISTS`. No foreign keys.
+
+## Params
+
+```php
+'rasuvaeff/yii3-filestorage-db' => [
+    'fileTable' => 'filestorage_file',
+    'blobTable' => 'filestorage_blob',
+    'blobReservationTable' => 'filestorage_blob_reservation',
+    'tablePrefix' => '',   // prepended to all three
+],
+```
+
+## API reference
+
+### `DbRepository`
+
+Implements core's `RepositoryInterface` and `MaintenanceRepositoryInterface`.
+
+```php
+new DbRepository(
+    ConnectionInterface $db,
+    FileTableName $table = new FileTableName(),
+    ?FileScopeProviderInterface $scopes = null,   // unbound = single tenant
+);
+
+$repository->find(string $id): ?File;
+$repository->save(File $file, ?BlobId $blob = null): void;  // blob: ledger only
+$repository->delete(string $id): bool;
+$repository->files(?string $afterId = null, int $limit = 1000): iterable<File>;
+$repository->updateContentHash(string $id, string $contentHash): bool;
+$repository->findBlobRowId(string $id): ?string;            // scoped, for the ledger
+```
+
+`save()` is a scoped update falling through to an insert — not an upsert, which
+would match on the primary key alone and hand a row to another tenant.
+
+### `DbScopedFileResolver`
+
+```php
+new DbScopedFileResolver(ConnectionInterface $db, FileTableName $table = new FileTableName());
+
+$resolver->findInScope(string $id, ?string $scopeId): ?File;
+```
+
+Both values in one query. No code path here queries by id alone.
+
+### `DbBlobLedger`
+
+Implements core's `BlobLedgerInterface`.
+
+```php
+new DbBlobLedger(
+    ConnectionInterface $db,
+    DbRepository $repository,        // same connection; owns the tenant predicate
+    ClockInterface $clock,
+    FileTableName $fileTable = new FileTableName(),
+    BlobTableName $blobTable = new BlobTableName(),
+    BlobReservationTableName $reservationTable = new BlobReservationTableName(),
+);
+```
+
+Add protocol: `reserve()` → store `putIfAbsent()` → `commit()`; on failure
+`release()`. Remove: `releaseFile()`. Collect: `expireReservations()` →
+`claimForDeletion()` → `completeDeletion()` / `abandonDeletion()`.
+
+| Method | Notes |
+|---|---|
+| `reserve(BlobId, string $sha256, int $size, DateTimeImmutable $expiresAt)` | Creates or joins. `BlobBusyException` on a `deleting` blob (retry); `LedgerException` on a hash/size mismatch. A `pending_delete` blob is revived |
+| `commit(BlobReservation, File)` | One transaction: claim the reservation row, write the file row through the repository, mark the blob active. `LedgerException` if the reservation is gone or the file does not point at the blob |
+| `release(BlobReservation, DateTimeImmutable $deleteAfter)` | Idempotent. Never deletes bytes |
+| `releaseFile(string $fileId, DateTimeImmutable $deleteAfter)` | Scoped delete + conditional schedule. `false` when there was no such row |
+| `find(BlobId): ?BlobRecord` | Counts are derived, not stored |
+| `expireReservations(DateTimeImmutable $now, DateTimeImmutable $deleteAfter): int` | Run before any collection pass |
+| `claimForDeletion(DateTimeImmutable $now, DateTimeImmutable $leaseExpiresAt): ?BlobLease` | One conditional update per candidate; steals an expired lease |
+| `completeDeletion(BlobLease): bool` | `false` if the lease was lost or the blob was revived |
+| `abandonDeletion(BlobLease, DateTimeImmutable $retryAfter): bool` | Backoff after a failed store delete |
+
+### Value objects and exceptions
+
+| Type | What |
+|---|---|
+| `FileTableName`, `BlobTableName`, `BlobReservationTableName` | Validated identifiers (`/^[A-Za-z_]\w*(\.[A-Za-z_]\w*)?\z/`), `__toString()`, `forIndexName()`. Migrations resolve them by type through `Injector::make()`, which a scalar could not be |
+| `BlobRowId::for(BlobId): string` | `sha256("store:path")`, the ledger primary key. `@internal` |
+| `FileRowMapper` | `toRow()` / `fromRow()` / `blobRowId()`. `@internal` |
+| `Timestamps` | `FORMAT`, `toStorage()`, `fromStorage()`, `fromStorageOrNull()`. `@internal` |
+| `Exception\InvalidFileRowException` | Implements core's `FilestorageException` marker |
