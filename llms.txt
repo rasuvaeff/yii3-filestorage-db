@@ -11,8 +11,8 @@ composer require rasuvaeff/yii3-filestorage-db
 ```
 
 Binds `RepositoryInterface`, `MaintenanceRepositoryInterface`,
-`ScopedFileResolverInterface`, `BlobLedgerInterface` and the three table-name
-VOs. Does NOT bind `StorageInterface` (core's), `StoreInterface` (a store
+`ScopedFileResolverInterface`, `BlobLedgerInterface`, `DeduplicatingStorageFactory`,
+`Command\DeduplicateCommand` and the three table-name VOs. Does NOT bind `StorageInterface` (core's), `StoreInterface` (a store
 backend's) or `FileScopeProviderInterface` (the application's).
 
 ## Rules
@@ -153,6 +153,40 @@ else delegates to the base facade.
 `DedupScope`: `TenantGroup` (default, the only one safe for untrusted tenants),
 `Tenant`, `Global`. Global discloses content existence across tenants through
 write timing and quota.
+
+### `Command\DeduplicateCommand`
+
+`filestorage:deduplicate` — the resumable migration from unique paths onto
+ledger-managed content keys. Bound by this package and named in
+`params['yiisoft/yii-console']['commands']`.
+
+```bash
+./yii filestorage:deduplicate                                    # report only
+./yii filestorage:deduplicate --apply --limit=500 --after=<id>   # act, resumably
+./yii filestorage:gc --orphans --apply                           # then reclaim
+```
+
+| Option | Default | Notes |
+|---|---|---|
+| `--apply` | off | Without it nothing is written |
+| `--scope` | `tenant-group` | Must equal what the app passes to `create()`, or rows land on keys future uploads never join |
+| `--store` | default store | Must be `ContentAddressableStoreInterface`; refused up front otherwise |
+| `--after` / `--limit` | — / 1000 | Cursor and batch. Prints the last id reached |
+| `--max-bytes` | 104857600 | Above it a row keeps its unique object, as a live add would |
+
+Per row: read → hash → `reserve()` → `putIfAbsent()` → `commit()`, `release()` on
+failure. The size in the ledger is **counted while hashing**, not taken from the
+row — a row whose recorded size drifted would otherwise pair the real hash with a
+stale size and make every later add of that content fail.
+
+Rules:
+
+1. The old unique object is **not** deleted. It becomes an orphan; `gc --orphans`
+   reclaims it. Deleting it here would race readers holding the old path.
+2. A second run over the same range is a no-op — a row already at its content key
+   is skipped.
+3. The tenant scope is the ambient one (`FileScopeProviderInterface`). Multi-tenant
+   installations run it once per tenant. The scope is printed before any work.
 
 ### Value objects and exceptions
 

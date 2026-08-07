@@ -112,8 +112,8 @@ final readonly class DeduplicatingStorage implements StorageInterface
         $mimeType = $this->mimeTypeDetector->detect($upload);
         $policy->assertAcceptable($upload, $mimeType);
 
-        $hash = $this->hashWithinLimit($upload);
-        if ($hash === null) {
+        $digest = $this->digestWithinLimit($upload);
+        if ($digest === null) {
             // Too large to address by content. A unique object is the honest
             // outcome, and the caller cannot tell the difference. The store
             // name is this one or null, both of which the base facade resolves
@@ -121,12 +121,23 @@ final readonly class DeduplicatingStorage implements StorageInterface
             return $this->unique->add($upload, $groupName, null, $description, $metadata);
         }
 
+        [$hash, $size] = $digest;
         $blob = BlobId::create(
             $this->store->name(),
             $this->keys->generate($this->scope->keyFor($groupName, $this->scopes?->currentScopeId()), $hash),
         );
 
-        return $this->share($upload, $blob, $hash, $groupName, $mimeType, $description, $metadata, $policy->maxBytes);
+        return $this->share(
+            $upload,
+            $blob,
+            $hash,
+            $size,
+            $groupName,
+            $mimeType,
+            $description,
+            $metadata,
+            $policy->maxBytes,
+        );
     }
 
     #[Override]
@@ -183,6 +194,10 @@ final readonly class DeduplicatingStorage implements StorageInterface
 
     /**
      * @param non-empty-string $hash
+     * @param int<0, max> $size Counted while hashing. `Upload::size()` is null
+     *        for a body that will not declare its length, and reserving zero
+     *        there while committing the real size makes every later add of the
+     *        same content fail on the ledger's size check.
      * @param non-empty-string $groupName
      * @param array<array-key, mixed> $metadata Narrowed by `File::create()`, which validates it.
      */
@@ -190,13 +205,13 @@ final readonly class DeduplicatingStorage implements StorageInterface
         Upload $upload,
         BlobId $blob,
         string $hash,
+        int $size,
         string $groupName,
         ?string $mimeType,
         ?string $description,
         array $metadata,
         int $maxBytes,
     ): File {
-        $size = $upload->size() ?? 0;
         $now = $this->clock->now();
 
         $reservation = $this->ledger->reserve(
@@ -240,15 +255,17 @@ final readonly class DeduplicatingStorage implements StorageInterface
     }
 
     /**
-     * The complete SHA-256, or null when the upload is larger than dedup is
-     * willing to read twice.
+     * The complete SHA-256 and the byte count, or null when the upload is
+     * larger than dedup is willing to read twice.
      *
      * Stops at the limit rather than hashing to the end and then discarding
-     * the answer: the point of the cap is not to read the tail at all.
+     * the answer: the point of the cap is not to read the tail at all. The size
+     * comes from this pass because `Upload::size()` is null for a body that
+     * never declares its length.
      *
-     * @return non-empty-string|null
+     * @return array{non-empty-string, int<0, max>}|null
      */
-    private function hashWithinLimit(Upload $upload): ?string
+    private function digestWithinLimit(Upload $upload): ?array
     {
         $declared = $upload->size();
         if ($declared !== null && $declared > $this->dedupMaxBytes) {
@@ -278,6 +295,6 @@ final readonly class DeduplicatingStorage implements StorageInterface
 
         $stream->rewind();
 
-        return hash_final($context);
+        return [hash_final($context), $read];
     }
 }

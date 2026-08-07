@@ -3,6 +3,7 @@
 declare(strict_types=1);
 
 use Psr\Clock\ClockInterface;
+use Psr\Http\Message\StreamFactoryInterface;
 use Rasuvaeff\Yii3Filestorage\Id\IdGeneratorInterface;
 use Rasuvaeff\Yii3Filestorage\Mime\MimeTypeDetectorInterface;
 use Rasuvaeff\Yii3Filestorage\Policy\PolicyRegistry;
@@ -15,6 +16,7 @@ use Rasuvaeff\Yii3Filestorage\Repository\ScopedFileResolverInterface;
 use Rasuvaeff\Yii3Filestorage\Store\BlobLedgerInterface;
 use Rasuvaeff\Yii3FilestorageDb\BlobReservationTableName;
 use Rasuvaeff\Yii3FilestorageDb\BlobTableName;
+use Rasuvaeff\Yii3FilestorageDb\Command\DeduplicateCommand;
 use Rasuvaeff\Yii3FilestorageDb\DbBlobLedger;
 use Rasuvaeff\Yii3FilestorageDb\DbRepository;
 use Rasuvaeff\Yii3FilestorageDb\DbScopedFileResolver;
@@ -112,6 +114,27 @@ return [
         mimeTypeDetector: $mimeTypeDetector,
         idGenerator: $idGenerator,
         policies: $policies,
+        clock: $clock,
+        scopes: $scopes,
+    ),
+
+    // The migration for existing data. It lives here rather than in core
+    // because it has to produce byte-identical content keys to the
+    // DeduplicatingStorage the application configured — same DedupScope, same
+    // scope provider — and a second copy of that decision in core is how the
+    // two drift into keys that never join.
+    DeduplicateCommand::class => static fn (
+        StoreRegistry $stores,
+        DbRepository $repository,
+        BlobLedgerInterface $ledger,
+        StreamFactoryInterface $streams,
+        ClockInterface $clock,
+        ?FileScopeProviderInterface $scopes = null,
+    ): DeduplicateCommand => new DeduplicateCommand(
+        stores: $stores,
+        repository: $repository,
+        ledger: $ledger,
+        streams: $streams,
         clock: $clock,
         scopes: $scopes,
     ),

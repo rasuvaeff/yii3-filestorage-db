@@ -3,10 +3,11 @@ name: rasuvaeff-yii3-filestorage-db
 description: >-
   Database metadata backend for rasuvaeff/yii3-filestorage — DbRepository with
   a mandatory tenant predicate, DbScopedFileResolver for signed downloads,
-  DbBlobLedger implementing the deduplication state machine, table-name value
-  objects and the bundled migrations. Use when writing, reviewing or debugging
-  file-metadata queries, tenant scoping, migrations or deduplication in a
-  project that has this package installed.
+  DbBlobLedger implementing the deduplication state machine, DeduplicatingStorage
+  with its factory and DedupScope, the filestorage:deduplicate migration command,
+  table-name value objects and the bundled migrations. Use when writing,
+  reviewing or debugging file-metadata queries, tenant scoping, migrations or
+  deduplication in a project that has this package installed.
 ---
 
 # rasuvaeff/yii3-filestorage-db
@@ -43,10 +44,22 @@ delete. Namespace `Rasuvaeff\Yii3FilestorageDb\`. Full API reference:
    `setSourceNamespaces()` registration silently found nothing and `migrate:up`
    exited 0 having created no tables.
 
-7. **No suppressions.** No `@psalm-suppress`, no baseline. Fix the root cause.
+7. **`filestorage:deduplicate` is dry-run by default and never deletes the old
+   object.** The row is repointed and the object it used to point at becomes an
+   orphan for `filestorage:gc --orphans --apply`; deleting it inside the
+   migration would race readers still holding the old path. Its `--scope` must
+   equal what the application passes to `DeduplicatingStorageFactory::create()`,
+   or every migrated row lands on a key no future upload will ever join.
 
-8. **Verification is mandatory.** `make build` *and* `make test-integration` —
-   `composer build` runs the Unit suite only.
+8. **Sizes are counted while hashing, never read off the row.** `Upload::size()`
+   is null for a body that never declares its length, and a row's recorded size
+   can have drifted. Pairing the real hash with a stale size in the ledger makes
+   every later add of that content fail on the size check.
+
+9. **No suppressions.** No `@psalm-suppress`, no baseline. Fix the root cause.
+
+10. **Verification is mandatory.** `make build` *and* `make test-integration` —
+    `composer build` runs the Unit suite only.
 
 ## Gotchas
 

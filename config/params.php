@@ -2,6 +2,8 @@
 
 declare(strict_types=1);
 
+use Rasuvaeff\Yii3FilestorageDb\Command\DeduplicateCommand;
+
 return [
     'rasuvaeff/yii3-filestorage-db' => [
         // one source of truth: the repository, the ledger and the bundled
@@ -12,5 +14,10 @@ return [
         // prepended to every name above; set it once to keep every rasuvaeff
         // table out of the way of your application's own
         'tablePrefix' => '',
+    ],
+    'yiisoft/yii-console' => [
+        'commands' => [
+            'filestorage:deduplicate' => DeduplicateCommand::class,
+        ],
     ],
 ];

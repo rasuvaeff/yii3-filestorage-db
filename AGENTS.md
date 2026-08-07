@@ -11,15 +11,18 @@ makes deduplicated bytes safe to delete. Namespace
 
 Public API: `DbRepository` (core's `RepositoryInterface` +
 `MaintenanceRepositoryInterface`), `DbScopedFileResolver`
-(`ScopedFileResolverInterface`), `DbBlobLedger` (`BlobLedgerInterface`), the
+(`ScopedFileResolverInterface`), `DbBlobLedger` (`BlobLedgerInterface`),
+`DeduplicatingStorage` / `DeduplicatingStorageFactory` / `DedupScope`,
+`Command\DeduplicateCommand`, the
 table-name value objects `FileTableName` / `BlobTableName` /
 `BlobReservationTableName`, the migrations under `src/Migration/`, and
 `Exception\InvalidFileRowException`. `FileRowMapper`, `Timestamps` and
 `BlobRowId` are `@internal`.
 
-DI wiring: `config/di.php` binds the four contracts above and the three table
-names. It must **not** bind `StorageInterface` (core's), `StoreInterface` (a
-store backend's) or `FileScopeProviderInterface` (the application's) —
+DI wiring: `config/di.php` binds the four contracts above, the three table
+names, `DeduplicatingStorageFactory` and `Command\DeduplicateCommand`;
+`config/params.php` names the command under `yiisoft/yii-console`. It must
+**not** bind `StorageInterface` (core's), `StoreInterface` (a store backend's) or `FileScopeProviderInterface` (the application's) —
 `yiisoft/config` allows exactly one vendor package per key, and two packages
 claiming one is a `Duplicate key` error by design.
 
@@ -80,7 +83,7 @@ then the path repository and the mount come out; then this repository goes up.
 
 ## Mutation testing
 
-`minMsi` is **89, and no mutator is ignored.** The 32 survivors fall into four
+`minMsi` is **89, and no mutator is ignored.** The 49 survivors fall into six
 groups, none of which a test can kill without inventing a scenario the schema
 or the driver rules out:
 
@@ -90,6 +93,8 @@ or the driver rules out:
 | Predicates a single process cannot weaken observably | dropping `['id' => $id]` from `completeDeletion()` beside a unique `lease_token`; the `state = 'deleting'` half of the lease-steal arm, where only `deleting` rows have a non-null `lease_expires_at` | Both halves select the same row. Weakening one is visible only to a second process holding a colliding claim, which random 128-bit tokens make unreachable |
 | Ordering and floors | `orderBy(['id' => SORT_ASC])` on the candidate scan; `max(0, …)` around a decrement | Fairness and defence, not correctness: the scan returns the same set unordered, and the floors guard an underflow the callers already make impossible |
 | Exception-code arguments | the `0` in `new InvalidFileRowException($m, 0, $e)` | Nothing asserts an exception code, and asserting one would pin a value that carries no meaning |
+| Page-size constants and paged-walk `continue` | the `500` in `files($after, 500)` and the `262_144` read size in `DeduplicateCommand`; the `continue` in each of its "skip this row" branches | Killing the page sizes needs 500-row fixtures, and even then a different boundary is not a different result. The `continue`s are equivalent to `break` because the cursor advances *before* the branch and the outer `while` re-pages from it |
+| Console option casts and guards | `(bool) $input->getOption('apply')` and the `isset() && is_string() && !== ''` chain in `stringOption()` | Symfony already guarantees the type, so only the `!== ''` half is reachable — and that half is tested. The rest exists so psalm can narrow without a suppression |
 
 Two shapes are worth knowing before adding tests here.
 
@@ -119,6 +124,21 @@ MSI without any test getting worse.
   the first, and every underflow guard only detects drift after it happened.
 - **Shared bytes are never deleted inside a request.** `releaseFile()` and
   `release()` only *schedule*. Only a collector holding a lease deletes.
+- **`filestorage:deduplicate` leaves the old object behind, deliberately.** The
+  row is repointed and the object it used to point at becomes an orphan for
+  `filestorage:gc --orphans`. Deleting it inside the migration would race the
+  readers still holding the old path.
+- **Sizes are counted, never read off the row.** Both `DeduplicatingStorage` and
+  `DeduplicateCommand` count bytes during the hashing pass. `Upload::size()` is
+  null for a body that never declares its length, and a row's recorded size can
+  have drifted — that is what `filestorage:verify --deep` exists to find.
+  Reserving one number while committing another makes every later add of the
+  same content fail on the ledger's size check.
+- **`DeduplicateCommand` lives here, not in core.** It must produce
+  byte-identical content keys to the `DeduplicatingStorage` the application
+  configured — same `DedupScope`, same scope provider — and it commits through a
+  ledger that shares the repository's connection. A second copy of that decision
+  in core is how the two drift.
 - **A deletion lease is exclusive and expiring.** Expiry is not a detail: it is
   the entire recovery story for a worker that dies mid-delete. `reserve()`
   refuses a `deleting` blob with `BlobBusyException` rather than joining it.
@@ -146,6 +166,15 @@ MSI without any test getting worse.
 - **Unit tests run against real in-memory SQLite**, not a fake connection, and
   they build the schema from the migrations. What they are testing *is* the
   SQL; a fake that reimplemented the guards would prove the fake works.
+- **Two packages contributing `params['yiisoft/yii-console']['commands']` is
+  only safe because the runner merges `params` recursively.** This package names
+  `filestorage:deduplicate` there and core names its five; without recursion
+  `yiisoft/config` refuses the *top-level* key, not the leaf. Every Yii3
+  application gets the recursion — `ApplicationRunner` constructs `Config` with
+  `RecursiveMerge::groups(...$paramsGroups, ...)` — so this holds in practice,
+  but a harness that builds `Config` by hand must pass the same modifier or it
+  will report a `Duplicate key` that no application would ever see. Verified
+  against real `yiisoft/config` with a fake vendor layout, 2026-08-07.
 - Code: `declare(strict_types=1)`, `final readonly class`, `#[\Override]`,
   explicit types, named arguments, trailing commas.
 - Every validation regex ends with `\z`, never `$` (`docs/evolved-rules.md`

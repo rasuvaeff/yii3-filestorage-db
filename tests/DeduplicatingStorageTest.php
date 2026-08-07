@@ -8,17 +8,22 @@ use DateInterval;
 use DateTimeImmutable;
 use Nyholm\Psr7\Factory\Psr17Factory;
 use Rasuvaeff\Yii3Filestorage\Exception\InvalidConfigException;
+use Rasuvaeff\Yii3Filestorage\Exception\PolicyViolationException;
 use Rasuvaeff\Yii3Filestorage\Id\Uuid7IdGenerator;
 use Rasuvaeff\Yii3Filestorage\Mime\FinfoMimeTypeDetector;
+use Rasuvaeff\Yii3Filestorage\Path\ContentAddressedKeyGeneratorInterface;
 use Rasuvaeff\Yii3Filestorage\Path\RandomPathGenerator;
 use Rasuvaeff\Yii3Filestorage\Policy\DeliveryPolicyRegistry;
 use Rasuvaeff\Yii3Filestorage\Policy\PolicyRegistry;
 use Rasuvaeff\Yii3Filestorage\Storage;
 use Rasuvaeff\Yii3Filestorage\StorageInterface;
 use Rasuvaeff\Yii3Filestorage\Store\BlobId;
+use Rasuvaeff\Yii3Filestorage\Store\BlobLedgerInterface;
 use Rasuvaeff\Yii3Filestorage\Store\BlobState;
+use Rasuvaeff\Yii3Filestorage\Store\ContentAddressableStoreInterface;
 use Rasuvaeff\Yii3Filestorage\Store\StoreRegistry;
 use Rasuvaeff\Yii3Filestorage\Test\InMemoryStore;
+use Rasuvaeff\Yii3Filestorage\Test\MemoryBlobLedger;
 use Rasuvaeff\Yii3Filestorage\Upload;
 use Rasuvaeff\Yii3FilestorageDb\DbBlobLedger;
 use Rasuvaeff\Yii3FilestorageDb\DbRepository;
@@ -26,10 +31,13 @@ use Rasuvaeff\Yii3FilestorageDb\DeduplicatingStorage;
 use Rasuvaeff\Yii3FilestorageDb\DeduplicatingStorageFactory;
 use Rasuvaeff\Yii3FilestorageDb\DedupScope;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\ContentAddressableInMemoryStore;
+use Rasuvaeff\Yii3FilestorageDb\Tests\Support\FixedKeyGenerator;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\FixedScope;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\SqliteDatabase;
+use Rasuvaeff\Yii3FilestorageDb\Tests\Support\UnsizedStream;
 use Testo\Assert;
 use Testo\Codecov\Covers;
+use Testo\Data\DataProvider;
 use Testo\Expect;
 use Testo\Lifecycle\AfterTest;
 use Testo\Lifecycle\BeforeTest;
@@ -268,8 +276,16 @@ final class DeduplicatingStorageTest
         $plain = new InMemoryStore('upload', $this->factory, new StaticClock($this->at('00:00')));
 
         Expect::exception(InvalidConfigException::class)
-            ->withMessageContaining('cannot deduplicate')
-            ->withMessageContaining('keep the base StorageInterface binding');
+            ->withMessageContaining(
+                'Store "upload" cannot deduplicate: it does not implement '
+                . ContentAddressableStoreInterface::class,
+            )
+            ->withMessageContaining(
+                'Sharing bytes between files needs atomic put-if-absent, which not every adapter can promise '
+                . '— with Flysystem, bind FlysystemContentAddressableStore and declare AdapterSemantics. '
+                . 'Without it, keep the base StorageInterface binding: unique storage is fully functional, '
+                . 'just not deduplicating',
+            );
 
         $this->factory(stores: new StoreRegistry([$plain]))->create();
     }
@@ -287,7 +303,12 @@ final class DeduplicatingStorageTest
             clock: new StaticClock($this->at('00:00')),
         );
 
-        Expect::exception(InvalidConfigException::class)->withMessageContaining('different database connections');
+        Expect::exception(InvalidConfigException::class)->withMessageContaining(
+            'The blob ledger and the file repository are on different database connections, so committing a '
+            . 'file row and its blob reference would be two transactions rather than one — a crash between '
+            . 'them leaves a row with no reference, or a reference with no row. Bind one '
+            . 'Yiisoft\\Db\\Connection\\ConnectionInterface and give it to both',
+        );
 
         try {
             $this->factory(ledger: $ledger)->create();
@@ -296,10 +317,163 @@ final class DeduplicatingStorageTest
         }
     }
 
+
+    /**
+     * A ledger that is not the transactional one cannot promise the joint
+     * commit, and the message has to name what is bound instead — otherwise the
+     * operator is looking for a class nobody mentioned.
+     */
+    public function aNonTransactionalLedgerIsRefusedByName(): void
+    {
+        Expect::exception(InvalidConfigException::class)
+            ->withMessageContaining('Deduplication needs the transactional ' . DbBlobLedger::class)
+            ->withMessageContaining(
+                MemoryBlobLedger::class . ', which cannot promise that a file row and its blob reference commit '
+                . 'together',
+            );
+
+        $this->factory(ledger: new MemoryBlobLedger($this->repository))->create();
+    }
+
+    /**
+     * The key generator is swappable. Without the fallback the default
+     * installation has none; without honouring an injected one, configuring a
+     * different layout does nothing.
+     */
+    public function anInjectedKeyGeneratorDecidesTheLayout(): void
+    {
+        $storage = $this->factory(keys: new FixedKeyGenerator('shared/one/original.bin'))->create();
+
+        $file = $storage->add($this->upload('hello'));
+
+        Assert::same($file->relativePath, 'shared/one/original.bin');
+    }
+
+    /**
+     * A body whose length is only known once it has been read: the cap has to
+     * be enforced during the read, because there is nothing to check before it.
+     */
+    public function anUndeclaredBodyOverTheCapTakesTheUniquePath(): void
+    {
+        $storage = $this->factory()->create(dedupMaxBytes: 4);
+
+        $file = $storage->add(Upload::fromStream(new UnsizedStream($this->factory->createStream('hello')), 'a.txt', $this->factory));
+
+        Assert::null($file->contentHash, 'a unique add records no content hash');
+        Assert::same($this->repository->find($file->id)?->id, $file->id);
+    }
+
+    /**
+     * Exactly at the cap is within it. Off by one here means the documented
+     * boundary is not the enforced one.
+     */
+    public function aBodyExactlyAtTheCapIsStillShared(): void
+    {
+        $storage = $this->factory()->create(dedupMaxBytes: 5);
+
+        Assert::same($storage->add($this->upload('hello'))->contentHash, hash('sha256', 'hello'));
+    }
+
+    /**
+     * A declared size over the cap is refused before a single byte is read —
+     * the whole point of looking at the declaration first.
+     */
+    public function aDeclaredSizeOverTheCapIsRefusedWithoutReading(): void
+    {
+        $storage = $this->factory()->create(dedupMaxBytes: 4);
+
+        Assert::null($storage->add($this->upload('hello'))->contentHash);
+    }
+
+
+    /**
+     * The tenant id is hashed, not used as a path segment: it comes from the
+     * application and may be an email or anything else a path cannot hold. The
+     * width is part of the layout — changing it repartitions every pool.
+     */
+    #[DataProvider('scopeKeyProvider')]
+    public function theScopeKeyIsBuiltFromAHashedTenant(DedupScope $scope, ?string $tenant, string $expected): void
+    {
+        Assert::same($scope->keyFor('avatars', $tenant), $expected);
+    }
+
+    public static function scopeKeyProvider(): iterable
+    {
+        $hashed = substr(hash('xxh128', 'tenant-a'), 0, 16);
+
+        yield 'tenant and group' => [DedupScope::TenantGroup, 'tenant-a', "sha/{$hashed}/avatars"];
+        yield 'tenant only' => [DedupScope::Tenant, 'tenant-a', "sha/{$hashed}"];
+        yield 'global' => [DedupScope::Global, 'tenant-a', 'sha'];
+        yield 'no tenant' => [DedupScope::TenantGroup, null, 'sha/shared/avatars'];
+    }
+
+    /**
+     * Sixteen hex characters, not the whole digest and not a truncation that
+     * would collide across tenants at any realistic count.
+     */
+    public function theHashedTenantIsSixteenCharactersWide(): void
+    {
+        $segment = explode('/', DedupScope::Tenant->keyFor('avatars', 'tenant-a'))[1];
+
+        Assert::same(\strlen($segment), 16);
+        Assert::same(preg_match('/^[0-9a-f]{16}\z/', $segment), 1);
+    }
+
+
+    /**
+     * A body that never declares its length still records the size it actually
+     * had. Reserving zero here and committing the real size makes the ledger
+     * reject every later upload of the same content on the size check.
+     */
+    public function anUndeclaredBodyStillReservesItsRealSize(): void
+    {
+        $storage = $this->factory()->create();
+        $unsized = Upload::fromStream(new UnsizedStream($this->factory->createStream('hello')), 'a.txt', $this->factory);
+
+        $file = $storage->add($unsized);
+
+        Assert::same($this->ledger->find($this->blobOf($file->relativePath))?->size, 5);
+        Assert::same($storage->add($this->upload('hello'))->contentHash, hash('sha256', 'hello'));
+    }
+
+    /**
+     * The cap counts every chunk, not the last one. A counter that forgot the
+     * earlier reads would hash a body of any size and share it — the exact
+     * unbounded second pass the cap exists to prevent.
+     */
+    public function theCapCountsAcrossReads(): void
+    {
+        $storage = $this->factory()->create(dedupMaxBytes: 300_000);
+        $contents = str_repeat('x', 700_000);
+
+        $file = $storage->add(Upload::fromStream(
+            new UnsizedStream($this->factory->createStream($contents)),
+            'a.txt',
+            $this->factory,
+        ));
+
+        Assert::null($file->contentHash, 'a body over the cap takes the unique path');
+    }
+
+    /**
+     * The upload policy runs on the shared path too. Skipping it there would
+     * make deduplication a way past every size and media-type limit.
+     */
+    public function theUploadPolicyStillApplies(): void
+    {
+        $storage = $this->factory(policies: PolicyRegistry::fromArray(['*' => ['maxBytes' => 2]]))->create();
+
+        Expect::exception(PolicyViolationException::class);
+
+        $storage->add($this->upload('hello'));
+    }
+
     private function factory(
         ?StoreRegistry $stores = null,
         ?FixedScope $scopes = null,
-        ?DbBlobLedger $ledger = null,
+        ?BlobLedgerInterface $ledger = null,
+        ?ContentAddressedKeyGeneratorInterface $keys = null,
+        ?PolicyRegistry $policies = null,
     ): DeduplicatingStorageFactory {
         $stores ??= new StoreRegistry([$this->store]);
         $clock = new StaticClock($this->at('00:00'));
@@ -312,9 +486,10 @@ final class DeduplicatingStorageTest
             ledger: $ledger ?? new DbBlobLedger($this->database->db, $repository, $clock),
             mimeTypeDetector: new FinfoMimeTypeDetector(),
             idGenerator: new Uuid7IdGenerator($clock),
-            policies: new PolicyRegistry(),
+            policies: $policies ?? new PolicyRegistry(),
             clock: $clock,
             scopes: $scopes,
+            keys: $keys,
         );
     }
 

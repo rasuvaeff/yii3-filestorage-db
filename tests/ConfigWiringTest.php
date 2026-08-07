@@ -5,7 +5,9 @@ declare(strict_types=1);
 namespace Rasuvaeff\Yii3FilestorageDb\Tests;
 
 use DateTimeImmutable;
+use Nyholm\Psr7\Factory\Psr17Factory;
 use Psr\Clock\ClockInterface;
+use Psr\Http\Message\StreamFactoryInterface;
 use Rasuvaeff\Yii3Filestorage\Repository\FileScopeProviderInterface;
 use Rasuvaeff\Yii3Filestorage\Repository\MaintenanceRepositoryInterface;
 use Rasuvaeff\Yii3Filestorage\Repository\RepositoryInterface;
@@ -13,8 +15,11 @@ use Rasuvaeff\Yii3Filestorage\Repository\ScopedFileResolverInterface;
 use Rasuvaeff\Yii3Filestorage\StorageInterface;
 use Rasuvaeff\Yii3Filestorage\Store\BlobLedgerInterface;
 use Rasuvaeff\Yii3Filestorage\Store\StoreInterface;
+use Rasuvaeff\Yii3Filestorage\Store\StoreRegistry;
+use Rasuvaeff\Yii3Filestorage\Test\InMemoryStore;
 use Rasuvaeff\Yii3FilestorageDb\BlobReservationTableName;
 use Rasuvaeff\Yii3FilestorageDb\BlobTableName;
+use Rasuvaeff\Yii3FilestorageDb\Command\DeduplicateCommand;
 use Rasuvaeff\Yii3FilestorageDb\DbBlobLedger;
 use Rasuvaeff\Yii3FilestorageDb\DbRepository;
 use Rasuvaeff\Yii3FilestorageDb\DbScopedFileResolver;
@@ -181,6 +186,21 @@ final class ConfigWiringTest
     }
 
     /**
+     * The migration for existing data lives here rather than in core because it
+     * has to produce byte-identical content keys to the storage the application
+     * configured — same `DedupScope`, same scope provider.
+     */
+    public function theDeduplicateCommandIsWiredAndNamed(): void
+    {
+        Assert::instanceOf($this->container()->get(DeduplicateCommand::class), DeduplicateCommand::class);
+
+        Assert::same(
+            $this->params()['yiisoft/yii-console']['commands'],
+            ['filestorage:deduplicate' => DeduplicateCommand::class],
+        );
+    }
+
+    /**
      * `params.php` has to carry every key `di.php` reads, or the package fails
      * to boot against its own defaults.
      */
@@ -218,6 +238,12 @@ final class ConfigWiringTest
         $definitions = $this->definitions($params);
 
         $definitions[ConnectionInterface::class] = fn(): ConnectionInterface => $this->database->db;
+        $definitions[StreamFactoryInterface::class] = Psr17Factory::class;
+        $definitions[StoreInterface::class] = static fn(
+            StreamFactoryInterface $streams,
+        ): StoreInterface => new InMemoryStore('upload', $streams);
+        $definitions[StoreRegistry::class] = static fn(StoreInterface $store): StoreRegistry
+            => new StoreRegistry([$store]);
         $definitions[ClockInterface::class] = static fn(): ClockInterface => new StaticClock(
             new DateTimeImmutable('2026-01-01T00:00:00.000000+00:00'),
         );

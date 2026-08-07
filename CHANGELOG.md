@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Initial development. Not released.
 
+- `Command\DeduplicateCommand` → `filestorage:deduplicate`: the resumable
+  migration from unique paths onto ledger-managed content keys. Dry-run by
+  default, idempotent on a second pass, cursor-resumable, and it leaves the old
+  objects for `filestorage:gc --orphans`. It lives here rather than in core
+  because it must produce byte-identical keys to the `DeduplicatingStorage` the
+  application configured — same `DedupScope`, same scope provider.
+- `DeduplicatingStorage` now counts the byte length while hashing instead of
+  reading `Upload::size()`, which is null for a body that never declares its
+  length. Reserving zero there while committing the real size made every later
+  add of the same content fail on the ledger's size check.
+- Added `symfony/console`, `psr/http-factory` and `psr/http-message` to
+  `require` — the new command needs them at runtime.
+
 - `DbRepository`, implementing core's `RepositoryInterface` and
   `MaintenanceRepositoryInterface`, with an optional mandatory tenant predicate
   that no method skips.

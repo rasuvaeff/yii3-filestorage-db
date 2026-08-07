@@ -314,6 +314,22 @@ final class DbBlobLedgerTest
     }
 
     /**
+     * The sweep updates only the blobs whose reservations it just deleted. A
+     * pass over every row would push each already-scheduled blob's grace period
+     * forward on every collection run — and since a run always sweeps first,
+     * nothing would ever become collectable.
+     */
+    public function theSweepDoesNotPostponeAnAlreadyScheduledBlob(): void
+    {
+        $this->ledger->release($this->reserve(), $this->at('01:00'));
+
+        Assert::same($this->ledger->expireReservations($this->at('02:00'), $this->at('03:00')), 0);
+
+        Assert::same($this->ledger->find($this->blob())?->deleteAfter?->format('H:i'), '01:00');
+        Assert::true($this->ledger->claimForDeletion($this->at('02:00'), $this->at('02:05')) !== null);
+    }
+
+    /**
      * A swept reservation on a blob a file still references must not schedule
      * it: the sweep is about abandoned writers, not about live rows.
      */

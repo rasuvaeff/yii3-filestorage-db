@@ -25,13 +25,31 @@ use Rasuvaeff\Yii3Filestorage\Upload;
  *
  * @internal
  */
-final readonly class ContentAddressableInMemoryStore implements ContentAddressableStoreInterface
+final class ContentAddressableInMemoryStore implements ContentAddressableStoreInterface
 {
-    public function __construct(private InMemoryStore $inner) {}
+    private bool $failNextPut = false;
+
+    public function __construct(private readonly InMemoryStore $inner) {}
+
+    /**
+     * Makes the next publish throw. A store that is briefly unavailable mid
+     * protocol is the case the reservation and its release exist for, and it
+     * cannot be produced any other way in a single process.
+     */
+    public function failNextPut(): void
+    {
+        $this->failNextPut = true;
+    }
 
     #[Override]
     public function putIfAbsent(Upload $upload, StoredObjectId $object, int $maxBytes = 0): StoreResult
     {
+        if ($this->failNextPut) {
+            $this->failNextPut = false;
+
+            throw new StoreException("Store is unavailable while writing \"{$object->relativePath}\"");
+        }
+
         $existing = $this->inner->bytesAt($object->relativePath);
         $contents = $upload->stream()->getContents();
 

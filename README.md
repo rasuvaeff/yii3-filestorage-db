@@ -25,6 +25,9 @@ packages are built against it.
 - `ext-json`
 - `rasuvaeff/yii3-filestorage` ^0.1
 - `yiisoft/db` ^2.0 (plus a driver: `yiisoft/db-sqlite`, `-mysql`, `-pgsql`, …)
+- `symfony/console` ^6.4 || ^7.0 || ^8.0, `psr/http-factory` ^1.0 and
+  `psr/http-message` ^2.0 — for `filestorage:deduplicate`, which reads objects
+  back through the store
 - `yiisoft/db-migration` ^2.1 — **not** `^2.0`, see [Migrations](#migrations)
 
 ## Installation
@@ -223,6 +226,44 @@ The disclosure is real: whoever uploads a file learns from the write timing, and
 from a quota that does not move, whether that exact content already existed.
 Between one tenant's own files that says nothing new. Across tenants it is an
 oracle — upload a suspected document, see whether it was "already there".
+
+### Enabling it on data that already exists
+
+`filestorage:backfill-hash` (core) computes integrity hashes and stops there — it
+deliberately does not pretend that existing random paths became shared. Moving
+them is `filestorage:deduplicate`, which this package ships:
+
+```bash
+./yii filestorage:deduplicate                      # a report, changes nothing
+./yii filestorage:deduplicate --apply --limit=500
+./yii filestorage:deduplicate --apply --limit=500 --after=<the last id it printed>
+./yii filestorage:gc --orphans --apply             # reclaim what the rows used to point at
+```
+
+| Option | Default | Notes |
+|---|---|---|
+| `--apply` | off | Without it nothing is written |
+| `--scope` | `tenant-group` | **Must match** what the application passes to `create()`. A mismatch lands every migrated row on a key no future upload will ever join |
+| `--store` | the default store | Must implement `ContentAddressableStoreInterface`, or the command refuses before reading anything |
+| `--after` / `--limit` | — / 1000 | Cursor and batch size. The command prints the last id it reached |
+| `--max-bytes` | 104857600 | Rows above it keep their unique object, exactly as a live `add()` would |
+
+Per row it reads the object, hashes it, reserves the content key, publishes with
+`putIfAbsent()`, and repoints the row through `commit()` — the same protocol a
+live `add()` uses, so a crash anywhere leaves either the old row or the new one,
+never a row pointing at nothing. A second run over the same range is a no-op: a
+row already at its content key is recognised and skipped.
+
+**The old object is left behind on purpose.** It becomes an orphan the moment
+its row is repointed, and `filestorage:gc --orphans --apply` reclaims it once
+in-flight reads have drained. Deleting it inside the migration would race the
+readers still holding the old path.
+
+**The tenant scope is the ambient one.** Rows come from `DbRepository`, which
+filters by whatever `FileScopeProviderInterface` reports, and the content key
+mixes that same scope in — so a multi-tenant installation runs this once per
+tenant, with the tenant established the way its other CLI jobs establish it. The
+scope in force is printed before any work starts.
 
 ## Maintenance
 
