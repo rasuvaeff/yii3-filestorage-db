@@ -3,6 +3,11 @@
 declare(strict_types=1);
 
 use Psr\Clock\ClockInterface;
+use Rasuvaeff\Yii3Filestorage\Id\IdGeneratorInterface;
+use Rasuvaeff\Yii3Filestorage\Mime\MimeTypeDetectorInterface;
+use Rasuvaeff\Yii3Filestorage\Policy\PolicyRegistry;
+use Rasuvaeff\Yii3Filestorage\StorageInterface;
+use Rasuvaeff\Yii3Filestorage\Store\StoreRegistry;
 use Rasuvaeff\Yii3Filestorage\Repository\FileScopeProviderInterface;
 use Rasuvaeff\Yii3Filestorage\Repository\MaintenanceRepositoryInterface;
 use Rasuvaeff\Yii3Filestorage\Repository\RepositoryInterface;
@@ -13,6 +18,7 @@ use Rasuvaeff\Yii3FilestorageDb\BlobTableName;
 use Rasuvaeff\Yii3FilestorageDb\DbBlobLedger;
 use Rasuvaeff\Yii3FilestorageDb\DbRepository;
 use Rasuvaeff\Yii3FilestorageDb\DbScopedFileResolver;
+use Rasuvaeff\Yii3FilestorageDb\DeduplicatingStorageFactory;
 use Rasuvaeff\Yii3FilestorageDb\FileTableName;
 use Yiisoft\Db\Connection\ConnectionInterface;
 
@@ -78,5 +84,35 @@ return [
         fileTable: $fileTable,
         blobTable: $blobTable,
         reservationTable: $reservationTable,
+    ),
+
+    // The factory is bound; the deduplicating facade is not. Replacing
+    // StorageInterface is the application's call and the application's only —
+    // core binds that key, and a second vendor package claiming it is the
+    // `Duplicate key` error this family is arranged to avoid. An application
+    // that wants sharing writes, in its own config:
+    //
+    //     StorageInterface::class => static fn (DeduplicatingStorageFactory $f)
+    //         => $f->create(scope: DedupScope::TenantGroup),
+    DeduplicatingStorageFactory::class => static fn (
+        StorageInterface $unique,
+        StoreRegistry $stores,
+        DbRepository $repository,
+        BlobLedgerInterface $ledger,
+        MimeTypeDetectorInterface $mimeTypeDetector,
+        IdGeneratorInterface $idGenerator,
+        PolicyRegistry $policies,
+        ClockInterface $clock,
+        ?FileScopeProviderInterface $scopes = null,
+    ): DeduplicatingStorageFactory => new DeduplicatingStorageFactory(
+        unique: $unique,
+        stores: $stores,
+        repository: $repository,
+        ledger: $ledger,
+        mimeTypeDetector: $mimeTypeDetector,
+        idGenerator: $idGenerator,
+        policies: $policies,
+        clock: $clock,
+        scopes: $scopes,
     ),
 ];

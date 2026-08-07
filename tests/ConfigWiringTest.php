@@ -18,6 +18,7 @@ use Rasuvaeff\Yii3FilestorageDb\BlobTableName;
 use Rasuvaeff\Yii3FilestorageDb\DbBlobLedger;
 use Rasuvaeff\Yii3FilestorageDb\DbRepository;
 use Rasuvaeff\Yii3FilestorageDb\DbScopedFileResolver;
+use Rasuvaeff\Yii3FilestorageDb\DeduplicatingStorageFactory;
 use Rasuvaeff\Yii3FilestorageDb\FileTableName;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\FixedScope;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\SqliteDatabase;
@@ -109,6 +110,20 @@ final class ConfigWiringTest
 
         Assert::same($container->get(RepositoryInterface::class)->find('a')?->id, 'a');
         Assert::same($ledger->find($blob)?->referenceCount, 1);
+    }
+
+    /**
+     * The factory is bound, the deduplicating facade is not. Replacing
+     * `StorageInterface` is a root-application decision — core owns that key,
+     * and this package claiming it too would be the `Duplicate key` error the
+     * whole arrangement exists to prevent.
+     */
+    public function dedupIsOfferedAsAFactoryRatherThanABinding(): void
+    {
+        $definitions = $this->definitions();
+
+        Assert::true(\array_key_exists(DeduplicatingStorageFactory::class, $definitions));
+        Assert::false(\array_key_exists(StorageInterface::class, $definitions));
     }
 
     /**

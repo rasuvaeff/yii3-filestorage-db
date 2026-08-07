@@ -30,13 +30,18 @@ final readonly class SqliteDatabase
 {
     public ConnectionInterface $db;
 
-    public function __construct()
+    private ?string $file;
+
+    /**
+     * @param bool $shared Back the database with a temporary file instead of
+     *        `:memory:`, so {@see connect()} can open a *second* connection to
+     *        it. Concurrency is the one thing an in-memory database cannot
+     *        model: every connection gets its own empty database.
+     */
+    public function __construct(bool $shared = false)
     {
-        $this->db = new SqliteConnection(
-            driver: new SqliteDriver(dsn: 'sqlite::memory:'),
-            schemaCache: new SchemaCache(psrCache: new MemorySimpleCache()),
-        );
-        $this->db->open();
+        $this->file = $shared ? tempnam(sys_get_temp_dir(), 'filestorage-') . '.sqlite' : null;
+        $this->db = $this->connect();
 
         // the migrations are the schema — a second CREATE TABLE in the tests
         // would be a copy that silently drifts from the one users get
@@ -45,9 +50,33 @@ final readonly class SqliteDatabase
         (new M260807000001CreateFilestorageBlobTables())->up($builder);
     }
 
+    /**
+     * Another connection to the same database — a second process, as far as
+     * SQLite is concerned.
+     */
+    public function connect(): ConnectionInterface
+    {
+        $connection = new SqliteConnection(
+            driver: new SqliteDriver(dsn: 'sqlite:' . ($this->file ?? ':memory:')),
+            schemaCache: new SchemaCache(psrCache: new MemorySimpleCache()),
+        );
+        $connection->open();
+
+        // Without this a writer holding the lock makes the other connection
+        // fail instantly with "database is locked", which is a test artefact
+        // rather than the contention being tested.
+        $connection->createCommand('PRAGMA busy_timeout = 5000')->execute();
+
+        return $connection;
+    }
+
     public function close(): void
     {
         $this->db->close();
+
+        if ($this->file !== null && is_file($this->file)) {
+            @unlink($this->file);
+        }
     }
 
     public static function file(

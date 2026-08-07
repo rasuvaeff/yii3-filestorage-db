@@ -137,6 +137,18 @@ final readonly class DbRepository implements MaintenanceRepositoryInterface
     }
 
     /**
+     * Whether this repository writes through that exact connection.
+     *
+     * Asked by {@see DeduplicatingStorageFactory}: a ledger and a repository on
+     * different connections cannot commit together, and nothing else would
+     * notice until a crash landed between the two transactions.
+     */
+    public function usesConnection(ConnectionInterface $db): bool
+    {
+        return $this->db === $db;
+    }
+
+    /**
      * @return array<string, mixed>|null
      */
     private function row(string $id): ?array

@@ -65,6 +65,19 @@ final readonly class DbBlobLedger implements BlobLedgerInterface
         $this->reservations = $reservationTable->value;
     }
 
+    /**
+     * Whether this ledger and that repository would share one transaction.
+     *
+     * `commit()` puts a file row and a blob reference in the same transaction,
+     * which is only true if both speak to the same connection object. Two
+     * connections to the same database look identical in every test and are
+     * two transactions in production.
+     */
+    public function sharesConnectionWith(DbRepository $repository): bool
+    {
+        return $repository->usesConnection($this->db);
+    }
+
     #[Override]
     public function reserve(
         BlobId $blob,
