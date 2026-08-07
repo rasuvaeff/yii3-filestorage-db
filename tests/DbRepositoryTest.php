@@ -73,6 +73,16 @@ final class DbRepositoryTest
         Assert::same((new Query($this->database->db))->from('filestorage_file')->count(), 1);
     }
 
+    public function savingAnUnchangedFileIsIdempotent(): void
+    {
+        $file = SqliteDatabase::file('same');
+        $this->repository->save($file);
+
+        $this->repository->save($file);
+
+        Assert::same($this->repository->find($file->id)?->id, $file->id);
+    }
+
     public function deleteReportsWhetherThereWasAnything(): void
     {
         $this->repository->save(SqliteDatabase::file('a'));

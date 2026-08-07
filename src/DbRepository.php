@@ -73,9 +73,11 @@ final readonly class DbRepository implements MaintenanceRepositoryInterface
             ->update($this->table, $row, $this->scoped(['id' => $file->id]))
             ->execute();
 
-        if ($updated === 0) {
-            $this->db->createCommand()->insert($this->table, $row)->execute();
+        if ($updated > 0 || $this->row($file->id) !== null) {
+            return;
         }
+
+        $this->db->createCommand()->insert($this->table, $row)->execute();
     }
 
     #[Override]
