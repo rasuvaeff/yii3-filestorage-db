@@ -126,6 +126,34 @@ Add protocol: `reserve()` → store `putIfAbsent()` → `commit()`; on failure
 | `completeDeletion(BlobLease): bool` | `false` if the lease was lost or the blob was revived |
 | `abandonDeletion(BlobLease, DateTimeImmutable $retryAfter): bool` | Backoff after a failed store delete |
 
+### `DeduplicatingStorage` / `DeduplicatingStorageFactory`
+
+Implements core's `StorageInterface`. **Not bound by this package** — replacing
+`StorageInterface` is a root-application override, because core owns that key.
+
+```php
+StorageInterface::class => static fn (DeduplicatingStorageFactory $f): StorageInterface
+    => $f->create(
+        scope: DedupScope::TenantGroup,   // Tenant | Global
+        storeName: null,                  // defaults to the registry's default
+        dedupMaxBytes: 104_857_600,       // above this: the unique path
+        reservationTtl: new DateInterval('PT15M'),
+        deleteGracePeriod: new DateInterval('PT1H'),
+    );
+```
+
+`create()` throws `InvalidConfigException` when the store does not implement
+`ContentAddressableStoreInterface`, or when the ledger and the repository are
+on different connections (which would make `commit()` two transactions).
+
+`add()`: hash → `reserve()` → `putIfAbsent()` → `commit()`; `release()` on any
+failure. `remove()` is `releaseFile()` — it never deletes bytes. Everything
+else delegates to the base facade.
+
+`DedupScope`: `TenantGroup` (default, the only one safe for untrusted tenants),
+`Tenant`, `Global`. Global discloses content existence across tenants through
+write timing and quota.
+
 ### Value objects and exceptions
 
 | Type | What |

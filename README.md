@@ -173,9 +173,56 @@ while ($lease = $ledger->claimForDeletion($now, $now->add($leaseTtl))) {
 }
 ```
 
-`DeduplicatingStorage` — the facade that drives this protocol for you — arrives
-with the operations commands. Until then the ledger is the contract you build
-against.
+### Turning it on
+
+The protocol above is driven for you by `DeduplicatingStorage`. It is **not**
+bound by this package: replacing `StorageInterface` is a root-application
+decision, because core owns that key and two vendor packages claiming one is a
+`yiisoft/config` `Duplicate key` error by design. So the application opts in:
+
+```php
+// config/common/di/filestorage.php
+use Rasuvaeff\Yii3Filestorage\StorageInterface;
+use Rasuvaeff\Yii3FilestorageDb\DedupScope;
+use Rasuvaeff\Yii3FilestorageDb\DeduplicatingStorageFactory;
+
+return [
+    StorageInterface::class => static fn (
+        DeduplicatingStorageFactory $factory,
+    ): StorageInterface => $factory->create(
+        scope: DedupScope::TenantGroup,
+        dedupMaxBytes: 104_857_600,
+        deleteGracePeriod: new DateInterval('PT1H'),
+    ),
+];
+```
+
+`create()` refuses two configurations that would otherwise lose data quietly,
+and says what to do instead: a store that does not implement
+`ContentAddressableStoreInterface`, and a ledger on a different connection than
+the repository — which makes `commit()` two transactions rather than one, so a
+crash between them leaves a row with no reference or a reference with no row.
+
+Everything the consumer sees is unchanged. `add()` still returns a `File` with
+its own id, group, description and metadata; two uploads of the same bytes just
+end up pointing at one object. Above `dedupMaxBytes` an upload silently takes
+the unique path — the content key *is* the hash, so it cannot be chosen without
+reading the whole body, and that read is not worth an unbounded second pass.
+
+### How widely bytes are shared
+
+`DedupScope` is a security choice, not a space/CPU dial:
+
+| Scope | Pool | When |
+|---|---|---|
+| `TenantGroup` *(default)* | per tenant, per group | Always safe. The only one appropriate for untrusted tenants |
+| `Tenant` | per tenant | One tenant's groups share; tenants stay apart |
+| `Global` | everything | Saves the most space, and **discloses content existence across tenants** |
+
+The disclosure is real: whoever uploads a file learns from the write timing, and
+from a quota that does not move, whether that exact content already existed.
+Between one tenant's own files that says nothing new. Across tenants it is an
+oracle — upload a suspected document, see whether it was "already there".
 
 ## Maintenance
 
