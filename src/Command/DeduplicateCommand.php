@@ -216,13 +216,37 @@ final class DeduplicateCommand extends Command
         }
 
         if ($apply && $moved > 0) {
-            $io->success(
-                'Done. The objects the migrated rows used to point at are orphans now — reclaim them with '
-                . '`filestorage:gc --orphans --apply` once in-flight reads have drained.',
-            );
+            $io->success($this->reclaimAdvice());
         }
 
         return Command::SUCCESS;
+    }
+
+    /**
+     * Where the objects this run stranded actually get reclaimed.
+     *
+     * The plain answer is `gc --orphans --apply` — except that this command
+     * runs under the ambient tenant scope, and that is exactly the condition
+     * `gc --orphans` refuses on. Printing the short recipe to a multi-tenant
+     * operator sends them to a command that will not run, with nothing
+     * connecting the refusal back to here.
+     */
+    private function reclaimAdvice(): string
+    {
+        $reclaim = $this->scopes === null
+            ? '`filestorage:gc --orphans --apply`'
+            : sprintf(
+                '`filestorage:gc --orphans --apply` run from a maintenance entry point that leaves %s unbound — '
+                . 'the sweep refuses under a bound scope provider, because a tenant-filtered set of rows cannot '
+                . 'prove an object unreferenced',
+                FileScopeProviderInterface::class,
+            );
+
+        return sprintf(
+            'Done. The objects the migrated rows used to point at are orphans now — reclaim them with %s once '
+            . 'in-flight reads have drained.',
+            $reclaim,
+        );
     }
 
     private function migrateOne(

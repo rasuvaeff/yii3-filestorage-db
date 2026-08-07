@@ -265,6 +265,14 @@ mixes that same scope in — so a multi-tenant installation runs this once per
 tenant, with the tenant established the way its other CLI jobs establish it. The
 scope in force is printed before any work starts.
 
+**Under tenancy the reclaim step moves.** `filestorage:gc --orphans` refuses
+while a `FileScopeProviderInterface` is bound — a tenant-filtered set of rows
+cannot prove an object unreferenced, so the sweep would classify every other
+tenant's objects as orphans. Run the migration once per tenant as above, then
+the sweep **once**, from a maintenance entry point that leaves the scope
+provider unbound. The command says so in its closing line rather than leaving
+you to discover it at the refusal.
+
 ## Maintenance
 
 `DbRepository` implements `MaintenanceRepositoryInterface`, so a long job pages

@@ -187,6 +187,9 @@ Rules:
    is skipped.
 3. The tenant scope is the ambient one (`FileScopeProviderInterface`). Multi-tenant
    installations run it once per tenant. The scope is printed before any work.
+4. **Under tenancy the reclaim step moves.** `gc --orphans` refuses while a scope
+   provider is bound, so run the migration per tenant and the sweep once, from a
+   maintenance entry point with the provider unbound. The closing line says so.
 
 ### Value objects and exceptions
 

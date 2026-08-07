@@ -447,6 +447,33 @@ final class DeduplicateCommandTest
         Assert::string($display)->contains('reclaim them with `filestorage:gc --orphans --apply` once in-flight reads');
     }
 
+    /**
+     * The short recipe is wrong for the installation that is *most* likely to
+     * run this: `gc --orphans` refuses under a bound scope provider, and this
+     * command only works under one when the ambient scope is set. Sending a
+     * multi-tenant operator to a command that will not run leaves the objects
+     * stranded with nothing linking the refusal back to here.
+     */
+    public function theClosingLineSendsAMultiTenantOperatorSomewhereThatWorks(): void
+    {
+        $this->store('a', 'hello');
+
+        $tester = new CommandTester(new DeduplicateCommand(
+            stores: new StoreRegistry([$this->store]),
+            repository: $this->repository,
+            ledger: $this->ledger,
+            streams: $this->factory,
+            clock: new StaticClock($this->at('01:00')),
+            scopes: new FixedScope('tenant-a'),
+        ));
+        $tester->execute(['--apply' => true]);
+
+        $display = (string) preg_replace('/\s+/u', ' ', $tester->getDisplay());
+
+        Assert::string($display)->contains('maintenance entry point that leaves');
+        Assert::string($display)->contains('the sweep refuses under a bound scope provider');
+    }
+
     public function theLimitCanBeOne(): void
     {
         $this->store('a', 'one');

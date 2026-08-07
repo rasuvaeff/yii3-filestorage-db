@@ -128,6 +128,12 @@ MSI without any test getting worse.
   row is repointed and the object it used to point at becomes an orphan for
   `filestorage:gc --orphans`. Deleting it inside the migration would race the
   readers still holding the old path.
+- **The closing line's reclaim advice is scope-dependent, and must stay that
+  way.** This command runs under the ambient tenant scope; `gc --orphans`
+  *refuses* under a bound scope provider. Printing the short recipe to a
+  multi-tenant operator sends them to a command that will not run, with nothing
+  connecting the refusal back here — so with a provider bound the line names the
+  unscoped maintenance entry point instead.
 - **Sizes are counted, never read off the row.** Both `DeduplicatingStorage` and
   `DeduplicateCommand` count bytes during the hashing pass. `Upload::size()` is
   null for a body that never declares its length, and a row's recorded size can

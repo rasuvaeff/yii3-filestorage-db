@@ -49,7 +49,9 @@ delete. Namespace `Rasuvaeff\Yii3FilestorageDb\`. Full API reference:
    orphan for `filestorage:gc --orphans --apply`; deleting it inside the
    migration would race readers still holding the old path. Its `--scope` must
    equal what the application passes to `DeduplicatingStorageFactory::create()`,
-   or every migrated row lands on a key no future upload will ever join.
+   or every migrated row lands on a key no future upload will ever join. Under
+   tenancy the reclaim step moves: `gc --orphans` refuses while a scope provider
+   is bound, so migrate per tenant and sweep once with the provider unbound.
 
 8. **Sizes are counted while hashing, never read off the row.** `Upload::size()`
    is null for a body that never declares its length, and a row's recorded size

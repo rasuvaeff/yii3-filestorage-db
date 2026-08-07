@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Initial development. Not released.
 
+- `filestorage:deduplicate` no longer closes by telling a multi-tenant operator
+  to run `filestorage:gc --orphans --apply`. That command refuses while a
+  `FileScopeProviderInterface` is bound — which is exactly the condition this
+  one runs under — so the recipe sent them to a command that would not run, with
+  nothing linking the refusal back. With a provider bound the line now names the
+  unscoped maintenance entry point instead.
+
 - `Command\DeduplicateCommand` → `filestorage:deduplicate`: the resumable
   migration from unique paths onto ledger-managed content keys. Dry-run by
   default, idempotent on a second pass, cursor-resumable, and it leaves the old
