@@ -1,8 +1,4 @@
-# Mounts the monorepo root, not just this package: composer.json carries a path
-# repository pointing at ../yii3-filestorage while the core package is
-# unpublished, and a relative path repo cannot resolve outside the mount.
-# Both this line and that repository go away with the first core release.
-DOCKER := docker run --rm -v "$(PWD)/..":/repo -w /repo/yii3-filestorage-db composer:2
+DOCKER := docker run --rm -v "$(PWD)":/app -w /app composer:2
 DOCKER_HOST := docker run --rm --network host -v "$(PWD)":/app -w /app
 PCOV_BOOTSTRAP := apk add --no-cache $$PHPIZE_DEPS >/dev/null && pecl install pcov >/dev/null && docker-php-ext-enable pcov
 

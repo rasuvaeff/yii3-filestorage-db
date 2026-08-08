@@ -54,17 +54,6 @@
     "suggest": {
         "rasuvaeff/yii3-tenancy": "Back FileScopeProviderInterface with a real tenant context instead of a fixed scope"
     },
-    "repositories": [
-        {
-            "type": "path",
-            "url": "../yii3-filestorage",
-            "options": {
-                "versions": {
-                    "rasuvaeff/yii3-filestorage": "0.1.0"
-                }
-            }
-        }
-    ],
     "autoload": {
         "psr-4": {
             "Rasuvaeff\\Yii3FilestorageDb\\": "src/"
