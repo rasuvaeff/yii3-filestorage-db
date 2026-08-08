@@ -38,7 +38,7 @@ composer require rasuvaeff/yii3-filestorage-db
 ```
 
 Пакет биндит `RepositoryInterface`, `MaintenanceRepositoryInterface`,
-`ScopedFileResolverInterface` и `BlobLedgerInterface`. Фасад биндит ядро —
+`ScopedFileResolverInterface` и `BlobLedgerInterface`. Ядро биндит фасад —
 этот пакет его не трогает.
 `StoreInterface` вы биндите сами — локальный `FileSystemStore` или
 `rasuvaeff/yii3-filestorage-flysystem` для S3 и подобных.
