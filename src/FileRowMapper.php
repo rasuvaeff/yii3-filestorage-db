@@ -158,7 +158,7 @@ final readonly class FileRowMapper
         // `bigint` comes back as a string on several drivers, and as an int on
         // others; accepting both is not laxity, it is the actual contract
         $value = $row['size'] ?? null;
-        if (\is_string($value) && preg_match('/^\d{1,19}\z/', $value) === 1) {
+        if (\is_string($value) && preg_match('/^(?:0|[1-9]\d{0,18})\z/', $value) === 1) {
             // Not `(int)`: `PHP_INT_MAX + 1` is nineteen digits, so the pattern
             // bounding the length lets it through and the cast *saturates* to
             // `PHP_INT_MAX`. The row would then map to a plausible `File` whose
@@ -167,6 +167,10 @@ final readonly class FileRowMapper
             // And not `filter_var` alone: it accepts surrounding whitespace, so
             // `"12\n"` parses to 12. The pattern is the format gate, `filter_var`
             // is the range gate, and neither does the other's job.
+            //
+            // Leading zeroes fail the format gate on purpose: no driver renders
+            // a `bigint` as `"00012"`, so a row carrying one is malformed, not
+            // a shape to normalise into a plausible `File`.
             $parsed = filter_var($value, \FILTER_VALIDATE_INT);
             $value = $parsed === false ? null : $parsed;
         }

@@ -109,6 +109,9 @@ final class FileRowMapperTest
         yield 'float' => [1.5];
         yield 'null' => [null];
         yield 'a numeric string with a newline' => ["12\n"];
+        // No driver renders a `bigint` with leading zeroes; the format gate
+        // refuses the row instead of normalising it into a plausible `File`.
+        yield 'a numeric string with leading zeroes' => ['00012'];
         yield 'wider than a signed 64-bit integer' => [str_repeat('9', 20)];
         // Nineteen digits, so a length-bounded pattern accepts it, and `(int)`
         // saturates it to PHP_INT_MAX rather than failing — one past the top of

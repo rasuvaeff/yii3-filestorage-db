@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Rasuvaeff\Yii3FilestorageDb\Tests;
 
 use DateTimeImmutable;
+use LogicException;
 use Nyholm\Psr7\Factory\Psr17Factory;
 use Psr\Clock\ClockInterface;
 use Psr\Http\Message\StreamFactoryInterface;
@@ -152,7 +153,9 @@ final class ConfigWiringTest
                 // default double would fail this test for the wrong reason.
                 StoreInterface::class => static fn(
                     StreamFactoryInterface $streams,
-                ): StoreInterface => new ContentAddressableInMemoryStore(new InMemoryStore('upload', $streams)),
+                ): StoreInterface => new ContentAddressableInMemoryStore(
+                    inner: new InMemoryStore(name: 'upload', streamFactory: $streams),
+                ),
                 StorageInterface::class => static fn(DeduplicatingStorageFactory $factory): StorageInterface
                     => $factory->create(scope: DedupScope::TenantGroup),
             ],
@@ -280,15 +283,24 @@ final class ConfigWiringTest
         if ($core) {
             // Core's own definitions, loaded the way `yiisoft/config` would
             // load them: this package's keys on top, and neither claiming one
-            // of the other's.
-            $definitions += $this->coreDefinitions();
+            // of the other's — `yiisoft/config` refuses such a duplicate key,
+            // so a silent `+=` here would hide exactly the failure this test
+            // family exists to catch.
+            $coreDefinitions = $this->coreDefinitions();
+            $overlap = array_intersect_key($definitions, $coreDefinitions);
+            if ($overlap !== []) {
+                throw new LogicException(
+                    'Package and core DI definitions overlap: ' . implode(', ', array_keys($overlap)),
+                );
+            }
+            $definitions += $coreDefinitions;
         }
 
         $definitions[ConnectionInterface::class] = fn(): ConnectionInterface => $this->database->db;
         $definitions[StreamFactoryInterface::class] = Psr17Factory::class;
         $definitions[StoreInterface::class] = static fn(
             StreamFactoryInterface $streams,
-        ): StoreInterface => new InMemoryStore('upload', $streams);
+        ): StoreInterface => new InMemoryStore(name: 'upload', streamFactory: $streams);
         $definitions[StoreRegistry::class] = static fn(StoreInterface $store): StoreRegistry
             => new StoreRegistry([$store]);
         $definitions[ClockInterface::class] = static fn(): ClockInterface => new StaticClock(
