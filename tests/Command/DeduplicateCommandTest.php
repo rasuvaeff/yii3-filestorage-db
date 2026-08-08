@@ -124,7 +124,7 @@ final class DeduplicateCommandTest
         // Whitespace squeezed out: SymfonyStyle wraps a success block to the
         // console width, and that width differs between runners — the command
         // name fits one line here and straddles two on Windows.
-        Assert::string((string) preg_replace('/[\s!\[\]]+/u', ' ', $tester->getDisplay()))
+        Assert::string($this->display($tester))
             ->contains('filestorage:gc --orphans --apply');
     }
 
@@ -285,7 +285,7 @@ final class DeduplicateCommandTest
      */
     public function theHeaderNamesTheScopeTheTenantAndTheStore(): void
     {
-        $display = $this->run()->getDisplay();
+        $display = $this->display($this->run());
 
         Assert::string($display)->contains('Scope tenant-group, tenant (none), store "upload".');
     }
@@ -311,7 +311,7 @@ final class DeduplicateCommandTest
      */
     public function theScopeRefusalListsTheAcceptableValues(): void
     {
-        $display = $this->run(['--scope' => 'per-user'])->getDisplay();
+        $display = $this->display($this->run(['--scope' => 'per-user']));
 
         Assert::string($display)->contains('Use one of: tenant-group, tenant, global.');
         Assert::string($display)->contains('DeduplicatingStorageFactory::create()');
@@ -329,7 +329,7 @@ final class DeduplicateCommandTest
         $gone = $this->store('c', 'vanished');            // skipped: unreadable
         $this->inner->deleteObject(new StoredObjectId($gone->relativePath));
 
-        $display = $this->run(['--apply' => true, '--max-bytes' => '1000'])->getDisplay();
+        $display = $this->display($this->run(['--apply' => true, '--max-bytes' => '1000']));
 
         Assert::string($display)->contains('Migrated 1 of 3 rows; 0 already shared, 2 skipped, 0 failed.');
     }
@@ -338,7 +338,7 @@ final class DeduplicateCommandTest
     {
         $this->store('a', 'hello');
 
-        Assert::string($this->run()->getDisplay())
+        Assert::string($this->display($this->run()))
             ->contains('Would migrate 1 of 1 row; 0 already shared, 0 skipped, 0 failed.');
     }
 
@@ -372,7 +372,7 @@ final class DeduplicateCommandTest
     {
         $this->store('a', 'hello');
 
-        Assert::string($this->run(['--apply' => true, '--max-bytes' => '2'])->getDisplay())
+        Assert::string($this->display($this->run(['--apply' => true, '--max-bytes' => '2'])))
             ->contains('skipping a: 5 bytes is over --max-bytes');
     }
 
@@ -396,10 +396,10 @@ final class DeduplicateCommandTest
      */
     public function theOrphanReminderOnlyFollowsRealWork(): void
     {
-        Assert::string($this->run(['--apply' => true])->getDisplay())->notContains('filestorage:gc');
+        Assert::string($this->display($this->run(['--apply' => true])))->notContains('filestorage:gc');
 
         $this->store('a', 'hello');
-        Assert::string($this->run()->getDisplay())->notContains('filestorage:gc');
+        Assert::string($this->display($this->run()))->notContains('filestorage:gc');
     }
 
     /**
@@ -445,7 +445,7 @@ final class DeduplicateCommandTest
 
         // Asserted in two halves because the success block hard-wraps at the
         // terminal width; together they still pin both concatenation operands.
-        $display = $this->run(['--apply' => true])->getDisplay();
+        $display = $this->display($this->run(['--apply' => true]));
 
         Assert::string($display)->contains('Done. The objects the migrated rows used to point at are orphans now');
         Assert::string($display)->contains('reclaim them with `filestorage:gc --orphans --apply` once in-flight reads');
@@ -472,7 +472,7 @@ final class DeduplicateCommandTest
         ));
         $tester->execute(['--apply' => true]);
 
-        $display = (string) preg_replace('/\s+/u', ' ', $tester->getDisplay());
+        $display = $this->display($tester);
 
         Assert::string($display)->contains('maintenance entry point that leaves');
         Assert::string($display)->contains('the sweep refuses under a bound scope provider');
@@ -617,7 +617,7 @@ final class DeduplicateCommandTest
         $tester = $this->run(['--apply' => true, '--max-bytes' => '100MB']);
 
         Assert::same($tester->getStatusCode(), Command::FAILURE);
-        Assert::string((string) preg_replace('/[\s!\[\]]+/u', ' ', $tester->getDisplay()))
+        Assert::string($this->display($tester))
             ->contains('must be a non-negative whole number of bytes');
         Assert::null($this->repository->find('a')?->contentHash, 'and nothing was migrated');
     }
