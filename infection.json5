@@ -1,0 +1,22 @@
+{
+    "$schema": "vendor/infection/infection/resources/schema.json",
+    "source": {
+        "directories": ["src"]
+    },
+    "logs": {
+        "text": "php://stderr",
+        "summary": "build/infection-summary.log"
+    },
+    "testFramework": "testo",
+    // 89, not 100, and no mutator is ignored — the threshold is what the suite
+    // honestly achieves. The survivors are documented in AGENTS.md; they are
+    // guard branches the schema's NOT NULL columns and `yiisoft/db`'s read-time
+    // typecasting make unreachable, predicates a single process cannot weaken
+    // observably, and exception-code arguments. If a change makes a group
+    // disappear, raise this. If a change adds an escapee outside them, the gate
+    // fails at 89 — strengthen the assertion rather than lowering the number.
+    "minMsi": 89,
+    "mutators": {
+        "@default": true
+    }
+}
