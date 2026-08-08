@@ -10,6 +10,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 First release. Tracks `rasuvaeff/yii3-filestorage` `0.x`: the API settles
 together with core's while the family is built out.
 
+- The documented way to turn deduplication on did not work. `create()` is
+  reached by rebinding `StorageInterface` to `DeduplicatingStorageFactory`, and
+  the factory's wiring asked for `StorageInterface` to get the plain facade —
+  which the application had just pointed at the factory. Every container
+  resolving it answered `CircularReferenceException`, naming an interface the
+  recipe never mentions. The factory now takes core's concrete `Storage::class`
+  (core `^0.1.1`, which is the release that added that id), and a wiring test
+  loads both packages' `config/di.php` and runs the recipe end to end. Every
+  wiring test in this family had only ever loaded its own package's, which is
+  why nothing saw it.
+- `FileRowMapper` no longer accepts a size one past `PHP_INT_MAX`. The pattern
+  bounds the digit count at nineteen, `'9223372036854775808'` is nineteen
+  digits, and `(int)` saturates it — so a corrupted row mapped to a plausible
+  `File` with the wrong size instead of `InvalidFileRowException`.
+- `filestorage:deduplicate` re-checks `--max-bytes` against the byte count taken
+  while hashing, not only against the size the row claims. A row understating
+  its size was read in full regardless of the cap, which is the one thing the
+  option exists to prevent. A failure to release the reservation on the error
+  path is now reported and survived rather than aborting the run past its
+  resume cursor.
 - `filestorage:deduplicate` no longer closes by telling a multi-tenant operator
   to run `filestorage:gc --orphans --apply`. That command refuses while a
   `FileScopeProviderInterface` is bound — which is exactly the condition this

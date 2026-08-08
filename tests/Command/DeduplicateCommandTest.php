@@ -368,6 +368,31 @@ final class DeduplicateCommandTest
         Assert::same($this->repository->find('a')?->relativePath, $this->blobFor('common', 'hello')->relativePath());
     }
 
+    /**
+     * The cap is checked twice, and the second check is the one that matters.
+     * The first uses the size the row records, and this class already treats a
+     * recorded size as something that can have drifted — so a row understating
+     * itself was read in full whatever the cap said, which is the single thing
+     * `--max-bytes` exists to prevent. The second check sees the number counted
+     * while hashing.
+     */
+    public function aRowUnderstatingItsSizeIsStoppedByTheCountedNumber(): void
+    {
+        $this->store('a', 'hello', size: 1);
+
+        $tester = $this->run(['--apply' => true, '--max-bytes' => '2']);
+
+        Assert::string($this->display($tester))
+            ->contains('skipping a: 5 bytes counted is over --max-bytes, though the row said 1');
+        Assert::null($this->repository->find('a')?->contentHash, 'and it was not migrated');
+        // Counted as skipped, not as failed, and the distinction is the point:
+        // the store refuses the same object a moment later and the row stays
+        // put either way, so "not migrated" alone cannot tell a bounded run
+        // from a broken one — and only the failed count turns the exit red.
+        Assert::string($this->display($tester))->contains('0 already shared, 1 skipped, 0 failed');
+        Assert::same($tester->getStatusCode(), Command::SUCCESS);
+    }
+
     public function theSkipMessageNamesTheRowAndItsSize(): void
     {
         $this->store('a', 'hello');
@@ -619,6 +644,22 @@ final class DeduplicateCommandTest
         Assert::same($tester->getStatusCode(), Command::FAILURE);
         Assert::string($this->display($tester))
             ->contains('must be a non-negative whole number of bytes');
+        Assert::null($this->repository->find('a')?->contentHash, 'and nothing was migrated');
+    }
+
+    /**
+     * The same refusal, anchored at the front. `'100MB'` is caught by the tail
+     * anchor alone, so it cannot tell whether the pattern still starts at the
+     * beginning of the string — and an unanchored one accepts `'x100'` as 100,
+     * which is a typo silently becoming a cap.
+     */
+    public function aMaxBytesWithLeadingJunkIsRefusedToo(): void
+    {
+        $this->store('a', 'hello');
+
+        $tester = $this->run(['--apply' => true, '--max-bytes' => 'x100']);
+
+        Assert::same($tester->getStatusCode(), Command::FAILURE);
         Assert::null($this->repository->find('a')?->contentHash, 'and nothing was migrated');
     }
 

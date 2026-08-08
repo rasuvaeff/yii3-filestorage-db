@@ -380,7 +380,7 @@ final class DbBlobLedgerTest
 
         Assert::instanceOf($first, BlobLease::class);
         Assert::instanceOf($second, BlobLease::class);
-        Assert::false(($first ?? $this->forgedLease())->token->equals(($second ?? $this->forgedLease())->token));
+        Assert::false($first->token->equals($second->token));
     }
 
     public function aStolenLeaseCanNoLongerCompleteTheDeletion(): void

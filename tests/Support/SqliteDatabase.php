@@ -8,6 +8,7 @@ use DateTimeImmutable;
 use Rasuvaeff\Yii3Filestorage\File;
 use Rasuvaeff\Yii3FilestorageDb\Migration\M260807000000CreateFilestorageFileTable;
 use Rasuvaeff\Yii3FilestorageDb\Migration\M260807000001CreateFilestorageBlobTables;
+use RuntimeException;
 use Yiisoft\Db\Cache\SchemaCache;
 use Yiisoft\Db\Connection\ConnectionInterface;
 use Yiisoft\Db\Migration\Informer\NullMigrationInformer;
@@ -40,7 +41,17 @@ final readonly class SqliteDatabase
      */
     public function __construct(bool $shared = false)
     {
-        $this->file = $shared ? tempnam(sys_get_temp_dir(), 'filestorage-') . '.sqlite' : null;
+        // `tempnam()` *creates* the file it names, so appending a suffix opened
+        // a database at a path nothing had reserved and left the reserved one
+        // behind on every shared run. It also returns false on failure, and
+        // `false . '.sqlite'` is a relative path — the suite would then write a
+        // database into the working directory and pass.
+        $file = $shared ? tempnam(sys_get_temp_dir(), 'filestorage-') : null;
+        if ($file === false) {
+            throw new RuntimeException('Cannot reserve a temporary file for the shared test database');
+        }
+
+        $this->file = $file;
         $this->db = $this->connect();
 
         // the migrations are the schema — a second CREATE TABLE in the tests

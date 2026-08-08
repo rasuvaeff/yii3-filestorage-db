@@ -64,7 +64,7 @@ make release-check
 
 ## Mutation testing
 
-`minMsi` is **89, and no mutator is ignored.** The 49 survivors fall into six
+`minMsi` is **89, and no mutator is ignored.** The 58 survivors fall into seven
 groups, none of which a test can kill without inventing a scenario the schema
 or the driver rules out:
 
@@ -75,6 +75,7 @@ or the driver rules out:
 | Ordering and floors | `orderBy(['id' => SORT_ASC])` on the candidate scan; `max(0, …)` around a decrement | Fairness and defence, not correctness: the scan returns the same set unordered, and the floors guard an underflow the callers already make impossible |
 | Exception-code arguments | the `0` in `new InvalidFileRowException($m, 0, $e)` | Nothing asserts an exception code, and asserting one would pin a value that carries no meaning |
 | Page-size constants and paged-walk `continue` | the `500` in `files($after, 500)` and the `262_144` read size in `DeduplicateCommand`; the `continue` in each of its "skip this row" branches | Killing the page sizes needs 500-row fixtures, and even then a different boundary is not a different result. The `continue`s are equivalent to `break` because the cursor advances *before* the branch and the outer `while` re-pages from it |
+| Diagnostics on a path a second fault opens | the `$io->text()` naming a reservation that could not be released, in `DeduplicateCommand`'s failure arm | Reaching it needs the store to fail *and* the ledger to fail right after — the double would have to be broken in two coordinated ways, which asserts the double rather than the command. The arm itself is covered; only the message inside it is not |
 | Console option casts and guards | `(bool) $input->getOption('apply')` and the `isset() && is_string() && !== ''` chain in `stringOption()` | Symfony already guarantees the type, so only the `!== ''` half is reachable — and that half is tested. The rest exists so psalm can narrow without a suppression |
 
 Two shapes are worth knowing before adding tests here.
@@ -93,6 +94,16 @@ MSI without any test getting worse.
 
 ## Invariants & gotchas
 
+- **The factory takes core's `Storage::class`, not `StorageInterface`.** The
+  documented way to turn deduplication on rebinds `StorageInterface` to this
+  factory's product; a factory asking for that interface is handed the object
+  being built, and the container answers `CircularReferenceException` naming an
+  interface the recipe never mentions. Core binds `Storage::class` alongside the
+  interface for exactly this (`^0.1.1`), and
+  `ConfigWiringTest::theDocumentedApplicationOverrideResolves` is the only test
+  in the family that loads *both* packages' `config/di.php` and executes the
+  recipe. Every other wiring test here sees one package and would pass with the
+  cycle in place — which is how it shipped.
 - **Guards live in the statement that acts.** `claimForDeletion()`,
   `completeDeletion()` and `scheduleIfUnused()` put the collectable test and
   both `NOT EXISTS` emptiness checks into the same `UPDATE`/`DELETE`, and read

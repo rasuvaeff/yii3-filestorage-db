@@ -110,6 +110,14 @@ final class FileRowMapperTest
         yield 'null' => [null];
         yield 'a numeric string with a newline' => ["12\n"];
         yield 'wider than a signed 64-bit integer' => [str_repeat('9', 20)];
+        // Nineteen digits, so a length-bounded pattern accepts it, and `(int)`
+        // saturates it to PHP_INT_MAX rather than failing — one past the top of
+        // the range is the only value that tells a cast apart from a parse.
+        yield 'one past PHP_INT_MAX, in the same digit count' => ['9223372036854775808'];
+        // `filter_var` accepts a sign; the pattern does not, and it is the
+        // pattern's leading anchor that decides. Without it the digits at the
+        // end still match and `'+12'` parses as 12.
+        yield 'a signed number' => ['+12'];
     }
 
     public function decodesMetadataAndTreatsAnEmptyColumnAsNoMetadata(): void

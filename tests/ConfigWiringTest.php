@@ -12,6 +12,7 @@ use Rasuvaeff\Yii3Filestorage\Repository\FileScopeProviderInterface;
 use Rasuvaeff\Yii3Filestorage\Repository\MaintenanceRepositoryInterface;
 use Rasuvaeff\Yii3Filestorage\Repository\RepositoryInterface;
 use Rasuvaeff\Yii3Filestorage\Repository\ScopedFileResolverInterface;
+use Rasuvaeff\Yii3Filestorage\Storage;
 use Rasuvaeff\Yii3Filestorage\StorageInterface;
 use Rasuvaeff\Yii3Filestorage\Store\BlobLedgerInterface;
 use Rasuvaeff\Yii3Filestorage\Store\StoreInterface;
@@ -23,8 +24,11 @@ use Rasuvaeff\Yii3FilestorageDb\Command\DeduplicateCommand;
 use Rasuvaeff\Yii3FilestorageDb\DbBlobLedger;
 use Rasuvaeff\Yii3FilestorageDb\DbRepository;
 use Rasuvaeff\Yii3FilestorageDb\DbScopedFileResolver;
+use Rasuvaeff\Yii3FilestorageDb\DeduplicatingStorage;
 use Rasuvaeff\Yii3FilestorageDb\DeduplicatingStorageFactory;
+use Rasuvaeff\Yii3FilestorageDb\DedupScope;
 use Rasuvaeff\Yii3FilestorageDb\FileTableName;
+use Rasuvaeff\Yii3FilestorageDb\Tests\Support\ContentAddressableInMemoryStore;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\FixedScope;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\SqliteDatabase;
 use Testo\Assert;
@@ -48,6 +52,8 @@ use Yiisoft\Test\Support\Clock\StaticClock;
 #[CoversNothing]
 final class ConfigWiringTest
 {
+    private const string CORE = __DIR__ . '/../vendor/rasuvaeff/yii3-filestorage';
+
     private SqliteDatabase $database;
 
     #[BeforeTest]
@@ -129,6 +135,41 @@ final class ConfigWiringTest
 
         Assert::true(\array_key_exists(DeduplicatingStorageFactory::class, $definitions));
         Assert::false(\array_key_exists(StorageInterface::class, $definitions));
+    }
+
+    /**
+     * The recipe printed above the factory binding, executed. Every other test
+     * here loads this package's `config/di.php` alone, which is precisely the
+     * blind spot: the recipe only means anything on top of core's definitions,
+     * and the factory it hands the application asks for the very key the
+     * application is being told to replace.
+     */
+    public function theDocumentedApplicationOverrideResolves(): void
+    {
+        $container = $this->container(
+            extra: [
+                // The factory refuses a store that cannot put-if-absent, so the
+                // default double would fail this test for the wrong reason.
+                StoreInterface::class => static fn(
+                    StreamFactoryInterface $streams,
+                ): StoreInterface => new ContentAddressableInMemoryStore(new InMemoryStore('upload', $streams)),
+                StorageInterface::class => static fn(DeduplicatingStorageFactory $factory): StorageInterface
+                    => $factory->create(scope: DedupScope::TenantGroup),
+            ],
+            core: true,
+        );
+
+        Assert::instanceOf($container->get(StorageInterface::class), DeduplicatingStorage::class);
+    }
+
+    /**
+     * The same wiring without the override: core's facade, untouched. Proves
+     * the extra definition core carries for the factory's benefit does not
+     * change what a plain installation gets.
+     */
+    public function coreStillResolvesItsOwnFacadeWithoutTheOverride(): void
+    {
+        Assert::instanceOf($this->container(core: true)->get(StorageInterface::class), Storage::class);
     }
 
     /**
@@ -233,9 +274,15 @@ final class ConfigWiringTest
      * @param array<string, mixed> $extra
      * @param array<string, mixed> $params
      */
-    private function container(array $extra = [], array $params = []): Container
+    private function container(array $extra = [], array $params = [], bool $core = false): Container
     {
         $definitions = $this->definitions($params);
+        if ($core) {
+            // Core's own definitions, loaded the way `yiisoft/config` would
+            // load them: this package's keys on top, and neither claiming one
+            // of the other's.
+            $definitions += $this->coreDefinitions();
+        }
 
         $definitions[ConnectionInterface::class] = fn(): ConnectionInterface => $this->database->db;
         $definitions[StreamFactoryInterface::class] = Psr17Factory::class;
@@ -248,7 +295,10 @@ final class ConfigWiringTest
             new DateTimeImmutable('2026-01-01T00:00:00.000000+00:00'),
         );
 
-        return new Container(ContainerConfig::create()->withDefinitions($definitions + $extra));
+        // `$extra` first: it stands for the application layer, which beats the
+        // vendor layer in `yiisoft/config`. With core merged in, a recipe that
+        // replaces one of core's keys is the whole point of the argument.
+        return new Container(ContainerConfig::create()->withDefinitions($extra + $definitions));
     }
 
     /**
@@ -265,6 +315,16 @@ final class ConfigWiringTest
         ];
 
         return require __DIR__ . '/../config/di.php';
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function coreDefinitions(): array
+    {
+        $params = require self::CORE . '/config/params.php';
+
+        return require self::CORE . '/config/di.php';
     }
 
     /**

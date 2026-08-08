@@ -159,7 +159,16 @@ final readonly class FileRowMapper
         // others; accepting both is not laxity, it is the actual contract
         $value = $row['size'] ?? null;
         if (\is_string($value) && preg_match('/^\d{1,19}\z/', $value) === 1) {
-            $value = (int) $value;
+            // Not `(int)`: `PHP_INT_MAX + 1` is nineteen digits, so the pattern
+            // bounding the length lets it through and the cast *saturates* to
+            // `PHP_INT_MAX`. The row would then map to a plausible `File` whose
+            // size is wrong — the coercion this class exists to refuse.
+            //
+            // And not `filter_var` alone: it accepts surrounding whitespace, so
+            // `"12\n"` parses to 12. The pattern is the format gate, `filter_var`
+            // is the range gate, and neither does the other's job.
+            $parsed = filter_var($value, \FILTER_VALIDATE_INT);
+            $value = $parsed === false ? null : $parsed;
         }
         if (!\is_int($value) || $value < 0) {
             throw new InvalidFileRowException('Column "size" must hold a non-negative integer');

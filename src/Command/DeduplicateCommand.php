@@ -161,6 +161,7 @@ final class DeduplicateCommand extends Command
     }
 
     /**
+     * @param int<0, max> $maxBytes
      * @param non-empty-string|null $after
      */
     private function migrate(
@@ -271,6 +272,9 @@ final class DeduplicateCommand extends Command
         );
     }
 
+    /**
+     * @param int<0, max> $maxBytes
+     */
     private function migrateOne(
         SymfonyStyle $io,
         ContentAddressableStoreInterface $store,
@@ -301,6 +305,23 @@ final class DeduplicateCommand extends Command
         $upload = Upload::fromStream($stream, $file->originalName, $this->streams);
         [$hash, $size] = $this->digest($upload);
 
+        // Checked again against the *counted* number. The pre-check above uses
+        // the recorded row size, and this class already documents that the row
+        // can have drifted — so a row understating its size was read in full
+        // regardless of the cap, which is the one thing the option exists to
+        // prevent. Cheap here: the read has happened, but the second one — the
+        // upload — has not.
+        if ($maxBytes > 0 && $size > $maxBytes) {
+            $io->text(sprintf(
+                '  skipping %s: %d bytes counted is over --max-bytes, though the row said %d',
+                $file->id,
+                $size,
+                $file->size,
+            ));
+
+            return Outcome::Skipped;
+        }
+
         $blob = BlobId::create(
             $store->name(),
             ($this->keys ?? new Sha256KeyGenerator())->generate(
@@ -321,11 +342,13 @@ final class DeduplicateCommand extends Command
             return Outcome::Moved;
         }
 
-        return $this->share($io, $store, $file, $blob, $hash, $size);
+        return $this->share($io, $store, $file, $blob, $hash, $size, $maxBytes);
     }
 
     /**
      * @param non-empty-string $hash
+     * @param int<0, max> $maxBytes Passed on, so the store refuses an oversized
+     *        object rather than trusting a caller that already checked.
      * @param int<0, max> $size Counted while hashing, not read off the row.
      *        The two disagree exactly when `verify --deep` would have something
      *        to report, and a ledger row pairing the real hash with a stale size
@@ -338,6 +361,7 @@ final class DeduplicateCommand extends Command
         BlobId $blob,
         string $hash,
         int $size,
+        int $maxBytes,
     ): Outcome {
         $reservation = $this->ledger->reserve(
             blob: $blob,
@@ -358,6 +382,7 @@ final class DeduplicateCommand extends Command
             $result = $store->putIfAbsent(
                 Upload::fromStream($stream, $file->originalName, $this->streams),
                 new StoredObjectId($blob->relativePath()),
+                $maxBytes,
             );
 
             // Same id, same group, same metadata: this is the same file, at a
@@ -380,10 +405,26 @@ final class DeduplicateCommand extends Command
                 updatedAt: $this->clock->now(),
             ));
         } catch (Throwable $e) {
-            // Scheduling, never deleting: the bytes at this content key may
-            // belong to a writer that committed a microsecond ago.
-            $this->ledger->release($reservation, $this->clock->now()->add($this->deleteGracePeriod));
             $io->text(sprintf('  failed %s: %s', $file->id, $e->getMessage()));
+
+            try {
+                // Scheduling, never deleting: the bytes at this content key may
+                // belong to a writer that committed a microsecond ago.
+                $this->ledger->release($reservation, $this->clock->now()->add($this->deleteGracePeriod));
+            } catch (Throwable $releaseFailure) {
+                // A database outage is a likely cause of the original failure,
+                // and the same outage makes the release fail — so letting this
+                // escape would abort the run before the summary and the resume
+                // cursor, which is exactly the loss this command takes care to
+                // avoid elsewhere. Named instead, because a reservation nobody
+                // released holds its blob until the sweep expires it.
+                $io->text(sprintf(
+                    '  ! could not release the reservation for %s (%s) — it expires on its own, and '
+                    . '`filestorage:gc --apply` sweeps it',
+                    $file->id,
+                    $releaseFailure->getMessage(),
+                ));
+            }
 
             return Outcome::Failed;
         }
@@ -422,11 +463,6 @@ final class DeduplicateCommand extends Command
         return [hash_final($context), $size];
     }
 
-    /**
-     * @param array<array-key, array<array-key, mixed>|scalar|null> $options
-     *
-     * @return non-empty-string|null
-     */
     /**
      * @param array<array-key, mixed> $options
      *

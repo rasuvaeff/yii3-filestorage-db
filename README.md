@@ -200,11 +200,22 @@ return [
 ];
 ```
 
-`create()` refuses two configurations that would otherwise lose data quietly,
+That override points `StorageInterface` at a facade the factory *builds*, so the
+factory cannot ask for `StorageInterface` to get the plain one — it would be
+handed the object it is in the middle of constructing. It asks core for
+`Storage::class` instead, the concrete id core binds alongside the interface for
+exactly this. Nothing to configure; it is why this package requires core
+`^0.1.1`, and the same rule applies to any decorator you write yourself.
+
+`create()` refuses three configurations that would otherwise lose data quietly,
 and says what to do instead: a store that does not implement
-`ContentAddressableStoreInterface`, and a ledger on a different connection than
-the repository — which makes `commit()` two transactions rather than one, so a
-crash between them leaves a row with no reference or a reference with no row.
+`ContentAddressableStoreInterface`; a `BlobLedgerInterface` that is not this
+package's `DbBlobLedger`, because the guards deduplication rests on are SQL
+predicates inside the statements that act, and an implementation that keeps its
+state anywhere else cannot make the same promise; and a ledger on a different
+connection than the repository — which makes `commit()` two transactions rather
+than one, so a crash between them leaves a row with no reference or a reference
+with no row.
 
 Everything the consumer sees is unchanged. `add()` still returns a `File` with
 its own id, group, description and metadata; two uploads of the same bytes just

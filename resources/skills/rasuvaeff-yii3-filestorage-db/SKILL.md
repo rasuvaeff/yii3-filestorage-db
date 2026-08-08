@@ -2,7 +2,8 @@
 name: rasuvaeff-yii3-filestorage-db
 description: >-
   Database metadata backend for rasuvaeff/yii3-filestorage — DbRepository with
-  a mandatory tenant predicate, DbScopedFileResolver for signed downloads,
+  an optional tenant predicate
+  applied whenever a scope provider is bound, DbScopedFileResolver for signed downloads,
   DbBlobLedger implementing the deduplication state machine, DeduplicatingStorage
   with its factory and DedupScope, the filestorage:deduplicate migration command,
   table-name value objects and the bundled migrations. Use when writing,

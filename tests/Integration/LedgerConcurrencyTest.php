@@ -142,7 +142,7 @@ final class LedgerConcurrencyTest
 
         // Once the collector finishes, the same call succeeds — and creates a
         // fresh blob rather than resurrecting the deleted row.
-        Assert::true($this->alice->completeDeletion($lease ?? $this->fail()));
+        Assert::true($this->alice->completeDeletion($lease));
         $this->bob->reserve($this->blob(), self::HASH, 12, $this->at('01:20'));
         Assert::same($this->bob->find($this->blob())?->state, BlobState::Writing);
     }
@@ -184,7 +184,7 @@ final class LedgerConcurrencyTest
 
         Assert::true($first instanceof \Rasuvaeff\Yii3Filestorage\Store\BlobLease);
         Assert::null($second, 'the second collector must find nothing while the lease is live');
-        Assert::true($this->alice->completeDeletion($first ?? $this->fail()));
+        Assert::true($this->alice->completeDeletion($first));
     }
 
     /**
@@ -204,7 +204,7 @@ final class LedgerConcurrencyTest
 
         $lease = $this->bob->claimForDeletion($this->at('01:00'), $this->at('01:05'));
         Assert::true($lease instanceof \Rasuvaeff\Yii3Filestorage\Store\BlobLease);
-        Assert::true($this->bob->completeDeletion($lease ?? $this->fail()));
+        Assert::true($this->bob->completeDeletion($lease));
         Assert::same($this->blobRowCount(), 0);
     }
 
@@ -255,7 +255,7 @@ final class LedgerConcurrencyTest
             $this->alice->completeDeletion($abandoned ?? $this->fail()),
             'the abandoned lease must no longer be able to delete',
         );
-        Assert::true($this->bob->completeDeletion($stolen ?? $this->fail()));
+        Assert::true($this->bob->completeDeletion($stolen));
         Assert::same($this->blobRowCount(), 0);
     }
 

@@ -130,6 +130,10 @@ Add protocol: `reserve()` → store `putIfAbsent()` → `commit()`; on failure
 
 Implements core's `StorageInterface`. **Not bound by this package** — replacing
 `StorageInterface` is a root-application override, because core owns that key.
+The factory takes the base facade as core's concrete `Storage::class`, not as
+`StorageInterface`: the override below points that interface at the factory's own
+product, so asking for it would be a `CircularReferenceException`. Hence core
+`^0.1.1`, which is the release that added the concrete id.
 
 ```php
 StorageInterface::class => static fn (DeduplicatingStorageFactory $f): StorageInterface
@@ -143,8 +147,9 @@ StorageInterface::class => static fn (DeduplicatingStorageFactory $f): StorageIn
 ```
 
 `create()` throws `InvalidConfigException` when the store does not implement
-`ContentAddressableStoreInterface`, or when the ledger and the repository are
-on different connections (which would make `commit()` two transactions).
+`ContentAddressableStoreInterface`, when the bound `BlobLedgerInterface` is not
+this package's `DbBlobLedger`, or when the ledger and the repository are on
+different connections (which would make `commit()` two transactions).
 
 `add()`: hash → `reserve()` → `putIfAbsent()` → `commit()`; `release()` on any
 failure. `remove()` is `releaseFile()` — it never deletes bytes. Everything

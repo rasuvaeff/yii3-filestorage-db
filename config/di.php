@@ -7,7 +7,7 @@ use Psr\Http\Message\StreamFactoryInterface;
 use Rasuvaeff\Yii3Filestorage\Id\IdGeneratorInterface;
 use Rasuvaeff\Yii3Filestorage\Mime\MimeTypeDetectorInterface;
 use Rasuvaeff\Yii3Filestorage\Policy\PolicyRegistry;
-use Rasuvaeff\Yii3Filestorage\StorageInterface;
+use Rasuvaeff\Yii3Filestorage\Storage;
 use Rasuvaeff\Yii3Filestorage\Store\StoreRegistry;
 use Rasuvaeff\Yii3Filestorage\Path\ContentAddressedKeyGeneratorInterface;
 use Rasuvaeff\Yii3Filestorage\Repository\FileScopeProviderInterface;
@@ -97,8 +97,16 @@ return [
     //
     //     StorageInterface::class => static fn (DeduplicatingStorageFactory $f)
     //         => $f->create(scope: DedupScope::TenantGroup),
+    //
+    // Which is why the base facade below is asked for as `Storage`, core's
+    // concrete id, and not as `StorageInterface`. The application above has
+    // just pointed that interface at this factory's own product: resolving it
+    // here would resolve to the deduplicating storage being built, and the
+    // container answers `CircularReferenceException` naming an interface the
+    // recipe never mentions. `DeduplicatingStorageFactory` itself still accepts
+    // the interface, so a test can hand it any double.
     DeduplicatingStorageFactory::class => static fn (
-        StorageInterface $unique,
+        Storage $unique,
         StoreRegistry $stores,
         DbRepository $repository,
         BlobLedgerInterface $ledger,
