@@ -20,6 +20,7 @@ use Rasuvaeff\Yii3Filestorage\Store\StoreRegistry;
 use Rasuvaeff\Yii3Filestorage\Upload;
 use Rasuvaeff\Yii3FilestorageDb\DbRepository;
 use Rasuvaeff\Yii3FilestorageDb\DedupScope;
+use Rasuvaeff\Yii3FilestorageDb\Exception\InvalidFileRowException;
 use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputInterface;
@@ -112,7 +113,15 @@ final class DeduplicateCommand extends Command
 
         $apply = (bool) $input->getOption('apply');
         $limit = max(1, (int) $input->getOption('limit'));
-        $maxBytes = max(0, (int) $input->getOption('max-bytes'));
+        $maxBytes = $this->maxBytesOption($options);
+        if ($maxBytes === null) {
+            $io->error(
+                'The --max-bytes value must be a non-negative whole number of bytes. `100MB` is not one, and '
+                . 'reading it as zero would silently lift the limit rather than apply it.',
+            );
+
+            return Command::FAILURE;
+        }
 
         $scopeName = $this->stringOption($options, 'scope') ?? '';
         $scope = DedupScope::tryFrom($scopeName);
@@ -171,7 +180,20 @@ final class DeduplicateCommand extends Command
         $lastId = $after;
 
         while ($seen < $limit) {
-            $page = iterator_to_array($this->repository->files($lastId, min(500, $limit - $seen)), false);
+            try {
+                $page = iterator_to_array($this->repository->files($lastId, min(500, $limit - $seen)), false);
+            } catch (InvalidFileRowException $e) {
+                // files() is a generator and the mapper throws mid-iteration,
+                // so one hand-edited row used to abort the whole run before
+                // the summary and before the cursor was printed — leaving the
+                // operator with no counts and no way to resume, and no id to
+                // say which row to fix. Reported as a failure of this page.
+                $failed++;
+                $io->text(sprintf('  ! unreadable row after %s — %s', $lastId ?? '(start)', $e->getMessage()));
+
+                break;
+            }
+
             if ($page === []) {
                 break;
             }
@@ -402,6 +424,33 @@ final class DeduplicateCommand extends Command
 
     /**
      * @param array<array-key, array<array-key, mixed>|scalar|null> $options
+     *
+     * @return non-empty-string|null
+     */
+    /**
+     * @param array<array-key, mixed> $options
+     *
+     * @return int<0, max>|null Null when the value is not a number at all.
+     */
+    private function maxBytesOption(array $options): ?int
+    {
+        $value = $options['max-bytes'] ?? null;
+        if ($value === null) {
+            return 0;
+        }
+
+        // Not a cast: `(int) '100MB'` is 0, and 0 means "no limit" here — so a
+        // mistyped size silently removed the cap and made the command reread
+        // every multi-gigabyte object twice.
+        if (!\is_string($value) || preg_match('/^\d+\z/', $value) !== 1) {
+            return null;
+        }
+
+        return max(0, (int) $value);
+    }
+
+    /**
+     * @param array<array-key, mixed> $options
      *
      * @return non-empty-string|null
      */

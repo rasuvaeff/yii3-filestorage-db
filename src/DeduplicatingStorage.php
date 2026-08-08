@@ -230,7 +230,14 @@ final readonly class DeduplicatingStorage implements StorageInterface
                 groupName: $groupName,
                 relativePath: $result->relativePath,
                 originalName: $upload->originalName,
-                size: $result->size,
+                // The counted size, not the store's. On the reuse branch a
+                // content-addressable store returns the *existing* object's
+                // size and — when the upload declared none — skips the
+                // mismatch check, so a previously truncated object would put
+                // its short size on this row while the blob records the real
+                // one. Counting while hashing is the invariant this package
+                // states; the reservation already went out with this number.
+                size: $size,
                 createdAt: $now,
                 externalId: $result->externalId,
                 mimeType: $mimeType,

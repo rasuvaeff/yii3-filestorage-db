@@ -599,4 +599,39 @@ final class DeduplicateCommandTest
     {
         return new DateTimeImmutable("2026-01-01T{$time}:00.000000+00:00");
     }
+
+    /**
+     * `(int) '100MB'` is 0, and 0 means "no limit" here — so a mistyped size
+     * silently removed the cap and made the command reread every
+     * multi-gigabyte object twice, which is the opposite of what the option
+     * asks for.
+     */
+    public function aNonNumericMaxBytesIsRefusedRatherThanReadAsZero(): void
+    {
+        $this->store('a', 'hello');
+
+        $tester = $this->run(['--apply' => true, '--max-bytes' => '100MB']);
+
+        Assert::same($tester->getStatusCode(), Command::FAILURE);
+        Assert::string((string) preg_replace('/[\s!\[\]]+/u', ' ', $tester->getDisplay()))
+            ->contains('must be a non-negative whole number of bytes');
+        Assert::null($this->repository->find('a')?->contentHash, 'and nothing was migrated');
+    }
+
+    /**
+     * `files()` is a generator and the mapper throws mid-iteration, so one
+     * hand-edited row aborted the whole run before the summary and before the
+     * cursor was printed — leaving no counts and no way to resume.
+     */
+    public function anUnreadableRowIsReportedWithTheCursorRatherThanThrown(): void
+    {
+        $this->store('a', 'hello');
+        $this->database->db
+            ->createCommand("UPDATE filestorage_file SET metadata = 'not json' WHERE id = :id", [':id' => 'a'])
+            ->execute();
+
+        $tester = $this->run(['--apply' => true]);
+
+        Assert::string($tester->getDisplay())->contains('unreadable row after');
+    }
 }

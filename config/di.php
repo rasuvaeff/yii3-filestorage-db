@@ -9,6 +9,7 @@ use Rasuvaeff\Yii3Filestorage\Mime\MimeTypeDetectorInterface;
 use Rasuvaeff\Yii3Filestorage\Policy\PolicyRegistry;
 use Rasuvaeff\Yii3Filestorage\StorageInterface;
 use Rasuvaeff\Yii3Filestorage\Store\StoreRegistry;
+use Rasuvaeff\Yii3Filestorage\Path\ContentAddressedKeyGeneratorInterface;
 use Rasuvaeff\Yii3Filestorage\Repository\FileScopeProviderInterface;
 use Rasuvaeff\Yii3Filestorage\Repository\MaintenanceRepositoryInterface;
 use Rasuvaeff\Yii3Filestorage\Repository\RepositoryInterface;
@@ -106,6 +107,7 @@ return [
         PolicyRegistry $policies,
         ClockInterface $clock,
         ?FileScopeProviderInterface $scopes = null,
+        ?ContentAddressedKeyGeneratorInterface $keys = null,
     ): DeduplicatingStorageFactory => new DeduplicatingStorageFactory(
         unique: $unique,
         stores: $stores,
@@ -116,6 +118,7 @@ return [
         policies: $policies,
         clock: $clock,
         scopes: $scopes,
+        keys: $keys,
     ),
 
     // The migration for existing data. It lives here rather than in core
@@ -130,6 +133,7 @@ return [
         StreamFactoryInterface $streams,
         ClockInterface $clock,
         ?FileScopeProviderInterface $scopes = null,
+        ?ContentAddressedKeyGeneratorInterface $keys = null,
     ): DeduplicateCommand => new DeduplicateCommand(
         stores: $stores,
         repository: $repository,
@@ -137,5 +141,6 @@ return [
         streams: $streams,
         clock: $clock,
         scopes: $scopes,
+        keys: $keys,
     ),
 ];
