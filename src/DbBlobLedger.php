@@ -145,15 +145,32 @@ final readonly class DbBlobLedger implements BlobLedgerInterface
 
             $this->repository->save($file, $reservation->blob);
 
-            $this->db->createCommand()->update(
+            // Guarded and counted, like every other transition here. Without
+            // it this update cannot tell "activated" from "the blob row is
+            // gone" — and if a collector completed its deletion in between,
+            // the file row would be inserted anyway. The blob would then never
+            // be scheduled again (scheduleIfUnused() no-ops on a missing row)
+            // and the object would leak for good.
+            //
+            // The lease columns are cleared too: an active blob holding a
+            // stale lease makes find() report a lease nobody holds.
+            $activated = $this->db->createCommand()->update(
                 $this->blobs,
                 [
                     'state' => BlobState::Active->value,
                     'delete_after' => null,
+                    'lease_token' => null,
+                    'lease_expires_at' => null,
                     'updated_at' => Timestamps::toStorage($this->clock->now()),
                 ],
                 ['id' => $id],
             )->execute();
+
+            if ($activated === 0) {
+                throw new LedgerException(
+                    "Blob \"{$reservation->blob->key()}\" disappeared while its reservation was being committed",
+                );
+            }
         });
     }
 
@@ -363,7 +380,17 @@ final readonly class DbBlobLedger implements BlobLedgerInterface
         // whether anything committed is still holding it — a blob scheduled
         // for deletion while its last reference was being removed can have
         // gained one again in between.
-        $this->db->createCommand()->update(
+        //
+        // Guarded on the state we read, and the affected count is checked.
+        // The joinability decision above comes from a plain SELECT, so a
+        // collector can claim the blob between that read and this write: its
+        // `NOT EXISTS reservations` passes because this writer's reservation
+        // is not inserted yet, it moves the row to `deleting` and takes a
+        // lease. An unguarded update here would drag the row back out of
+        // `deleting`, the writer would commit a file row, and the collector —
+        // already past its own guard — would delete the bytes underneath it.
+        // That is the one outcome this class exists to make impossible.
+        $revived = $this->db->createCommand()->update(
             $this->blobs,
             [
                 'state' => $this->count($this->files, $id) > 0
@@ -372,8 +399,17 @@ final readonly class DbBlobLedger implements BlobLedgerInterface
                 'delete_after' => null,
                 'updated_at' => $now,
             ],
-            ['id' => $id],
+            ['id' => $id, 'state' => BlobState::PendingDelete->value],
         )->execute();
+
+        if ($revived === 0) {
+            // Somebody moved it while we were deciding. `deleting` is the case
+            // that matters and the only one reachable from `pending_delete`;
+            // either way the caller retries against a fresh read.
+            throw new BlobBusyException(
+                "Blob \"{$blob->key()}\" changed state while it was being joined. Retry",
+            );
+        }
     }
 
     /**

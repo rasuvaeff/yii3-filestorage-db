@@ -69,8 +69,27 @@ final readonly class DbRepository implements MaintenanceRepositoryInterface
     {
         $row = $this->mapper->toRow($file, $blob, $this->scopes?->currentScopeId());
 
+        // An update must not touch the two columns a File does not carry.
+        //
+        // `blob_id` belongs to the ledger. `RepositoryInterface::save()` takes
+        // a File and nothing else, so it is the only way an application can
+        // persist an edited description or metadata — and writing the full row
+        // there set `blob_id` to null, which makes the blob look unreferenced
+        // and lets the next `filestorage:gc` delete bytes a live row still
+        // points at.
+        //
+        // `scope_id` is the row's tenant, assigned once on insert. With no
+        // scope provider bound — the maintenance entry point this package's
+        // own commands recommend — writing it would set every touched row's
+        // scope to null.
+        $updates = $row;
+        unset($updates['scope_id']);
+        if ($blob === null) {
+            unset($updates['blob_id']);
+        }
+
         $updated = $this->db->createCommand()
-            ->update($this->table, $row, $this->scoped(['id' => $file->id]))
+            ->update($this->table, $updates, $this->scoped(['id' => $file->id]))
             ->execute();
 
         if ($updated > 0 || $this->row($file->id) !== null) {

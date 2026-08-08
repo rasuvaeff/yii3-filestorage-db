@@ -9,6 +9,7 @@ use Rasuvaeff\PropertyTesting\ArbitraryInterface;
 use Rasuvaeff\PropertyTesting\Gen;
 use Rasuvaeff\PropertyTesting\Property;
 use Rasuvaeff\Yii3Filestorage\File;
+use Rasuvaeff\Yii3Filestorage\Store\BlobId;
 use Rasuvaeff\Yii3FilestorageDb\DbRepository;
 use Rasuvaeff\Yii3FilestorageDb\Exception\InvalidFileRowException;
 use Rasuvaeff\Yii3FilestorageDb\FileTableName;
@@ -337,5 +338,59 @@ final class DbRepositoryTest
             'size' => Gen::intBetween(0, 1_000_000_000),
             'microseconds' => Gen::intBetween(0, 999_999),
         ];
+    }
+
+    /**
+     * `RepositoryInterface::save()` takes a File and nothing else, so it is the
+     * only way an application can persist an edited description — and writing
+     * the whole row there set `blob_id` back to null. A null `blob_id` makes
+     * the blob look unreferenced, and the next `filestorage:gc` deletes bytes
+     * a live row still points at.
+     */
+    public function savingAnEditedFileDoesNotDetachItFromItsBlob(): void
+    {
+        $file = SqliteDatabase::file('a');
+        $blob = BlobId::create('upload', $file->relativePath);
+
+        $this->repository->save($file, $blob);
+        $this->repository->save(File::create(
+            id: $file->id,
+            storeName: $file->storeName,
+            groupName: $file->groupName,
+            relativePath: $file->relativePath,
+            originalName: $file->originalName,
+            size: $file->size,
+            createdAt: $file->createdAt,
+            description: 'edited by the application',
+            contentHash: $file->contentHash,
+        ));
+
+        $row = $this->database->db
+            ->createCommand('SELECT blob_id, description FROM filestorage_file WHERE id = :id', [':id' => 'a'])
+            ->queryOne();
+
+        Assert::same($row['description'], 'edited by the application', 'the edit landed');
+        Assert::true($row['blob_id'] !== null, 'and the blob reference survived it');
+    }
+
+    /**
+     * The maintenance entry point this package's own commands recommend runs
+     * with no scope provider bound. Writing `scope_id` from there would set
+     * every touched row's tenant to null — a silent cross-tenant mutation
+     * needing no concurrency at all.
+     */
+    public function savingWithoutAScopeProviderDoesNotClearTheTenant(): void
+    {
+        $scoped = new DbRepository($this->database->db, scopes: new FixedScope('tenant-a'));
+        $scoped->save(SqliteDatabase::file('a'));
+
+        // Unscoped, as a maintenance command is.
+        $this->repository->save(SqliteDatabase::file('a', originalName: 'renamed.txt'));
+
+        $row = $this->database->db
+            ->createCommand('SELECT scope_id FROM filestorage_file WHERE id = :id', [':id' => 'a'])
+            ->queryOne();
+
+        Assert::same($row['scope_id'], 'tenant-a');
     }
 }
