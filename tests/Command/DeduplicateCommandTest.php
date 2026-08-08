@@ -71,8 +71,8 @@ final class DeduplicateCommandTest
 
         $tester = $this->run();
 
-        Assert::string($tester->getDisplay())->contains('Dry run');
-        Assert::string($tester->getDisplay())->contains('would move a to');
+        Assert::string($this->display($tester))->contains('Dry run');
+        Assert::string($this->display($tester))->contains('would move a to');
         Assert::same($this->repository->find('a')?->relativePath, $file->relativePath);
         Assert::null($this->ledger->find($this->blobFor('common', 'hello')));
     }
@@ -121,7 +121,11 @@ final class DeduplicateCommandTest
         $tester = $this->run(['--apply' => true]);
 
         Assert::same($this->inner->bytesAt($unique), 'hello');
-        Assert::string($tester->getDisplay())->contains('filestorage:gc --orphans --apply');
+        // Whitespace squeezed out: SymfonyStyle wraps a success block to the
+        // console width, and that width differs between runners — the command
+        // name fits one line here and straddles two on Windows.
+        Assert::string((string) preg_replace('/[\s!\[\]]+/u', ' ', $tester->getDisplay()))
+            ->contains('filestorage:gc --orphans --apply');
     }
 
     /**
@@ -155,8 +159,8 @@ final class DeduplicateCommandTest
 
         $tester = $this->run(['--apply' => true]);
 
-        Assert::string($tester->getDisplay())->contains('Migrated 0 of 1 row');
-        Assert::string($tester->getDisplay())->contains('1 already shared');
+        Assert::string($this->display($tester))->contains('Migrated 0 of 1 row');
+        Assert::string($this->display($tester))->contains('1 already shared');
         Assert::same($this->ledger->find($this->blobFor('common', 'hello'))?->referenceCount, 1);
     }
 
@@ -167,8 +171,8 @@ final class DeduplicateCommandTest
 
         $tester = $this->run(['--apply' => true, '--after' => 'a']);
 
-        Assert::string($tester->getDisplay())->contains('Migrated 1 of 1 row');
-        Assert::string($tester->getDisplay())->contains('Last id: b');
+        Assert::string($this->display($tester))->contains('Migrated 1 of 1 row');
+        Assert::string($this->display($tester))->contains('Last id: b');
         Assert::same($this->repository->find('a')?->contentHash, null, 'the row before the cursor is untouched');
     }
 
@@ -180,7 +184,7 @@ final class DeduplicateCommandTest
 
         $tester = $this->run(['--apply' => true, '--limit' => '2']);
 
-        Assert::string($tester->getDisplay())->contains('Migrated 2 of 2 rows');
+        Assert::string($this->display($tester))->contains('Migrated 2 of 2 rows');
         Assert::null($this->repository->find('c')?->contentHash);
     }
 
@@ -194,7 +198,7 @@ final class DeduplicateCommandTest
 
         $tester = $this->run(['--apply' => true, '--max-bytes' => '2']);
 
-        Assert::string($tester->getDisplay())->contains('over --max-bytes');
+        Assert::string($this->display($tester))->contains('over --max-bytes');
         Assert::same($this->repository->find('a')?->relativePath, $file->relativePath);
     }
 
@@ -205,7 +209,7 @@ final class DeduplicateCommandTest
 
         $tester = $this->run(['--apply' => true]);
 
-        Assert::string($tester->getDisplay())->contains('unreadable: a');
+        Assert::string($this->display($tester))->contains('unreadable: a');
         Assert::same($tester->getStatusCode(), Command::SUCCESS);
     }
 
@@ -221,7 +225,7 @@ final class DeduplicateCommandTest
         $tester = $this->run(['--apply' => true, '--scope' => 'per-user']);
 
         Assert::same($tester->getStatusCode(), Command::FAILURE);
-        Assert::string($tester->getDisplay())->contains('Unknown scope "per-user"');
+        Assert::string($this->display($tester))->contains('Unknown scope "per-user"');
         Assert::same($this->repository->find('a')?->relativePath, $file->relativePath);
     }
 
@@ -249,7 +253,7 @@ final class DeduplicateCommandTest
         $tester = $this->run(['--apply' => true], new StoreRegistry([$plain]));
 
         Assert::same($tester->getStatusCode(), Command::FAILURE);
-        Assert::string($tester->getDisplay())->contains('cannot deduplicate');
+        Assert::string($this->display($tester))->contains('cannot deduplicate');
     }
 
     /**
@@ -298,7 +302,7 @@ final class DeduplicateCommandTest
         ));
         $tester->execute([]);
 
-        Assert::string($tester->getDisplay())->contains('tenant tenant-a,');
+        Assert::string($this->display($tester))->contains('tenant tenant-a,');
     }
 
     /**
@@ -425,7 +429,7 @@ final class DeduplicateCommandTest
         $tester = $this->run(['--apply' => true]);
 
         Assert::same($tester->getStatusCode(), Command::FAILURE);
-        Assert::string($tester->getDisplay())->contains('1 row could not be migrated.');
+        Assert::string($this->display($tester))->contains('1 row could not be migrated.');
         Assert::same($this->ledger->find($this->blobFor('common', 'hello'))?->reservationCount, 0);
     }
 
@@ -481,7 +485,7 @@ final class DeduplicateCommandTest
 
         $tester = $this->run(['--apply' => true, '--limit' => '1']);
 
-        Assert::string($tester->getDisplay())->contains('Migrated 1 of 1 row');
+        Assert::string($this->display($tester))->contains('Migrated 1 of 1 row');
         Assert::null($this->repository->find('b')?->contentHash);
     }
 
@@ -632,6 +636,19 @@ final class DeduplicateCommandTest
 
         $tester = $this->run(['--apply' => true]);
 
-        Assert::string($tester->getDisplay())->contains('unreadable row after');
+        Assert::string($this->display($tester))->contains('unreadable row after');
+    }
+
+    /**
+     * The console output with wrapping squeezed out.
+     *
+     * SymfonyStyle wraps its blocks to the console width, and that width is not
+     * the same on every CI runner — a phrase that fits one line locally
+     * straddles two on Windows, and the assertion fails for a reason that has
+     * nothing to do with the command.
+     */
+    private function display(CommandTester $tester): string
+    {
+        return (string) preg_replace('/[\\s!\\[\\]]+/u', ' ', $tester->getDisplay());
     }
 }
