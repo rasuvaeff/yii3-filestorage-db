@@ -75,10 +75,10 @@ final class MigrationTest
         (new M260807000000CreateFilestorageFileTable())->up($this->builder);
 
         $indexes = $this->indexNames('filestorage_file');
-        Assert::true(\in_array('idx_filestorage_file_blob_id', $indexes, true));
-        Assert::true(\in_array('idx_filestorage_file_scope_id', $indexes, true));
-        Assert::true(\in_array('idx_filestorage_file_content_hash', $indexes, true));
-        Assert::true(\in_array('idx_filestorage_file_group_created', $indexes, true));
+        Assert::true(\in_array('idx_filestorage_file_blob_id', $indexes, strict: true));
+        Assert::true(\in_array('idx_filestorage_file_scope_id', $indexes, strict: true));
+        Assert::true(\in_array('idx_filestorage_file_content_hash', $indexes, strict: true));
+        Assert::true(\in_array('idx_filestorage_file_group_created', $indexes, strict: true));
     }
 
     public function theLedgerTablesCarryTheirColumnsAndIndexes(): void
@@ -109,12 +109,12 @@ final class MigrationTest
         Assert::true(\in_array(
             'idx_filestorage_blob_state_delete_after',
             $this->indexNames('filestorage_blob'),
-            true,
+            strict: true,
         ));
         Assert::true(\in_array(
             'idx_filestorage_blob_reservation_blob_id',
             $this->indexNames('filestorage_blob_reservation'),
-            true,
+            strict: true,
         ));
     }
 
@@ -150,8 +150,8 @@ final class MigrationTest
         Assert::notNull($this->db->getTableSchema('app_blobs', true));
         Assert::notNull($this->db->getTableSchema('app_claims', true));
         Assert::null($this->db->getTableSchema('filestorage_file', true));
-        Assert::true(\in_array('idx_app_files_blob_id', $this->indexNames('app_files'), true));
-        Assert::true(\in_array('idx_app_claims_blob_id', $this->indexNames('app_claims'), true));
+        Assert::true(\in_array('idx_app_files_blob_id', $this->indexNames('app_files'), strict: true));
+        Assert::true(\in_array('idx_app_claims_blob_id', $this->indexNames('app_claims'), strict: true));
     }
 
     /**

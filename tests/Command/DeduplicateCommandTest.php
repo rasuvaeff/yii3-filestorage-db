@@ -88,7 +88,7 @@ final class DeduplicateCommandTest
         Assert::same($this->repository->find('a')?->contentHash, hash('sha256', 'hello'));
         Assert::same($this->store->bytesAt($blob->relativePath()), 'hello');
         Assert::same($this->ledger->find($blob)?->referenceCount, 1);
-        Assert::same($unique === $blob->relativePath(), false);
+        Assert::same($unique === $blob->relativePath(), expected: false);
     }
 
     /**
