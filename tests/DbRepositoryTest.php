@@ -6,6 +6,7 @@ namespace Rasuvaeff\Yii3FilestorageDb\Tests;
 
 use DateTimeImmutable;
 use Rasuvaeff\PropertyTesting\ArbitraryInterface;
+use Rasuvaeff\PropertyTesting\Classify;
 use Rasuvaeff\PropertyTesting\Gen;
 use Rasuvaeff\PropertyTesting\Property;
 use Rasuvaeff\Yii3Filestorage\File;
@@ -98,10 +99,10 @@ final class DbRepositoryTest
             $this->repository->save(SqliteDatabase::file($id));
         }
 
-        $first = iterator_to_array($this->repository->files(limit: 2), false);
+        $first = iterator_to_array($this->repository->files(limit: 2), preserve_keys: false);
         Assert::same(array_map(static fn(File $f): string => $f->id, $first), ['a', 'b']);
 
-        $rest = iterator_to_array($this->repository->files(afterId: 'b'), false);
+        $rest = iterator_to_array($this->repository->files(afterId: 'b'), preserve_keys: false);
         Assert::same(array_map(static fn(File $f): string => $f->id, $rest), ['c']);
     }
 
@@ -193,7 +194,7 @@ final class DbRepositoryTest
             ->save(SqliteDatabase::file('a'));
 
         Assert::same($this->repository->find('a')?->id, 'a');
-        Assert::same(\count(iterator_to_array($this->repository->files(), false)), 1);
+        Assert::same(\count(iterator_to_array($this->repository->files(), preserve_keys: false)), 1);
     }
 
     public function aRowWrittenByAnotherTenantIsInvisible(): void
@@ -207,7 +208,7 @@ final class DbRepositoryTest
         Assert::null($scoped->find('a'));
         Assert::false($scoped->delete('a'));
         Assert::false($scoped->updateContentHash('a', SqliteDatabase::OTHER_HASH));
-        Assert::same(iterator_to_array($scoped->files(), false), []);
+        Assert::same(iterator_to_array($scoped->files(), preserve_keys: false), []);
     }
 
     public function aTenantSeesItsOwnRows(): void
@@ -217,7 +218,7 @@ final class DbRepositoryTest
         $scoped->save(SqliteDatabase::file('a'));
 
         Assert::same($scoped->find('a')?->id, 'a');
-        Assert::same(\count(iterator_to_array($scoped->files(), false)), 1);
+        Assert::same(\count(iterator_to_array($scoped->files(), preserve_keys: false)), 1);
     }
 
     /**
@@ -235,7 +236,7 @@ final class DbRepositoryTest
         $scoped->save(SqliteDatabase::file('b'));
 
         $scope->switchTo('tenant-a');
-        $rows = iterator_to_array($scoped->files(afterId: 'a'), false);
+        $rows = iterator_to_array($scoped->files(afterId: 'a'), preserve_keys: false);
 
         Assert::same(array_map(static fn(File $f): string => $f->id, $rows), ['c']);
     }
@@ -324,7 +325,29 @@ final class DbRepositoryTest
 
         $this->repository->save($file);
 
+        // A nullable column is where a round trip most often loses: an empty
+        // string written back as NULL, or NULL read back as ''. Both shapes
+        // have to occur.
+        Classify::cover($description === null, 'no description', 25.0);
+        Classify::cover($description !== null, 'a description', 25.0);
+        Classify::when($size === 0, 'a zero-byte file');
+        Classify::when($microseconds === 0, 'a timestamp on the second');
+
         Assert::same($this->repository->find('round-trip')?->toArray(), $file->toArray());
+    }
+
+    /**
+     * @return iterable<string, array{string, ?string, int, int}>
+     */
+    public static function anyFileSurvivesTheRoundTripExamples(): iterable
+    {
+        // An empty description and an absent one must stay distinguishable
+        // across the column, and a zero-microsecond timestamp is where a
+        // format string that trims trailing zeros changes the value.
+        yield 'no description, zero bytes, on the second' => ['a.txt', null, 0, 0];
+        yield 'empty description' => ['a.txt', '', 1, 0];
+        yield 'last microsecond of the second' => ['a.txt', null, 1, 999_999];
+        yield 'first microsecond of the second' => ['a.txt', null, 1, 1];
     }
 
     /**

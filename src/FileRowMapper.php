@@ -200,7 +200,7 @@ final readonly class FileRowMapper
 
         try {
             /** @var mixed $decoded */
-            $decoded = json_decode($value, true, flags: \JSON_THROW_ON_ERROR);
+            $decoded = json_decode($value, associative: true, flags: \JSON_THROW_ON_ERROR);
         } catch (\JsonException $e) {
             throw new InvalidFileRowException('Column "metadata" does not hold valid JSON', 0, $e);
         }

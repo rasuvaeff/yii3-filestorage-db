@@ -3,6 +3,7 @@
 declare(strict_types=1);
 
 use Rector\CodeQuality\Rector\Identical\FlipTypeControlToUseExclusiveTypeRector;
+use Rasuvaeff\RectorNamedLiterals\AddNameToLiteralArgumentRector;
 use Rector\Config\RectorConfig;
 
 return RectorConfig::configure()
@@ -16,4 +17,5 @@ return RectorConfig::configure()
         // Rewrites `$x === null` into `!$x instanceof Foo`, dragging
         // fully-qualified vendor names into code that already reads clearly.
         FlipTypeControlToUseExclusiveTypeRector::class,
-    ]);
+    ])
+    ->withRules([AddNameToLiteralArgumentRector::class]);

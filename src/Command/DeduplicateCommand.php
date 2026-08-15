@@ -182,7 +182,7 @@ final class DeduplicateCommand extends Command
 
         while ($seen < $limit) {
             try {
-                $page = iterator_to_array($this->repository->files($lastId, min(500, $limit - $seen)), false);
+                $page = iterator_to_array($this->repository->files($lastId, min(500, $limit - $seen)), preserve_keys: false);
             } catch (InvalidFileRowException $e) {
                 // files() is a generator and the mapper throws mid-iteration,
                 // so one hand-edited row used to abort the whole run before

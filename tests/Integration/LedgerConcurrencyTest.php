@@ -215,7 +215,7 @@ final class LedgerConcurrencyTest
 
         $this->bob->expireReservations($this->at('00:30'), $this->at('01:00'));
 
-        Assert::same(\count(iterator_to_array($this->bobFiles->files(), false)), 0);
+        Assert::same(\count(iterator_to_array($this->bobFiles->files(), preserve_keys: false)), 0);
         Assert::same($this->bob->find($this->blob())?->state, BlobState::PendingDelete);
     }
 
