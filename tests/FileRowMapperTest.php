@@ -255,4 +255,40 @@ final class FileRowMapperTest
             ...$overrides,
         ];
     }
+
+    public function wrappedFailuresKeepTheirCauseAndTheDefaultCode(): void
+    {
+        foreach (
+            [
+                ['relative_path' => '../escape'],
+                ['metadata' => '{oops'],
+            ] as $override
+        ) {
+            try {
+                $this->mapper->fromRow($this->row($override));
+                Assert::fail('Expected InvalidFileRowException');
+            } catch (InvalidFileRowException $e) {
+                Assert::same($e->getCode(), 0);
+                Assert::instanceOf($e->getPrevious(), \Throwable::class);
+            }
+        }
+    }
+
+    /**
+     * @param array<string, mixed> $row
+     */
+    #[DataProvider('blobRowIdProvider')]
+    public function readsTheBlobReferenceOnlyWhenItIsANonEmptyString(array $row, ?string $expected): void
+    {
+        Assert::same($this->mapper->blobRowId($row), $expected);
+    }
+
+    public static function blobRowIdProvider(): iterable
+    {
+        yield 'an id' => [['blob_id' => 'abc'], 'abc'];
+        yield 'empty' => [['blob_id' => ''], null];
+        yield 'a number' => [['blob_id' => 5], null];
+        yield 'null' => [['blob_id' => null], null];
+        yield 'missing' => [[], null];
+    }
 }

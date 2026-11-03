@@ -17,6 +17,7 @@ use Rasuvaeff\Yii3FilestorageDb\BlobRowId;
 use Rasuvaeff\Yii3FilestorageDb\DbBlobLedger;
 use Rasuvaeff\Yii3FilestorageDb\DbRepository;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\FixedScope;
+use Rasuvaeff\Yii3FilestorageDb\Tests\Support\InterceptingConnection;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\SqliteDatabase;
 use Testo\Assert;
 use Testo\Codecov\Covers;
@@ -25,6 +26,7 @@ use Testo\Expect;
 use Testo\Lifecycle\AfterTest;
 use Testo\Lifecycle\BeforeTest;
 use Testo\Test;
+use Yiisoft\Db\Exception\IntegrityException;
 use Yiisoft\Db\Query\Query;
 use Yiisoft\Test\Support\Clock\StaticClock;
 
@@ -720,5 +722,217 @@ final class DbBlobLedgerTest
     private function at(string $time): DateTimeImmutable
     {
         return new DateTimeImmutable("2026-01-01T{$time}:00.000000+00:00");
+    }
+
+    public function reserveRetriesOnceWhenAnotherWriterWonTheInsertRace(): void
+    {
+        $connection = new InterceptingConnection($this->database->db);
+        $calls = 0;
+        $connection->onTransaction = static function (\Closure $proceed) use (&$calls): mixed {
+            if (++$calls === 1) {
+                throw new IntegrityException('UNIQUE constraint failed');
+            }
+
+            return $proceed();
+        };
+
+        $reservation = $this->reserveWith($this->ledgerOver($connection));
+
+        Assert::same($calls, 2);
+        Assert::same($reservation->blob->key(), $this->blob()->key());
+        $record = $this->ledger->find($this->blob());
+        Assert::same($record?->state, BlobState::Writing);
+        Assert::same($record?->reservationCount, 1);
+    }
+
+    public function reserveGivesUpWithALedgerExceptionWhenTheRaceRepeats(): void
+    {
+        $connection = new InterceptingConnection($this->database->db);
+        $failures = [];
+        $connection->onTransaction = static function (\Closure $proceed) use (&$failures): never {
+            throw $failures[] = new IntegrityException('UNIQUE constraint failed #' . (\count($failures) + 1));
+        };
+
+        try {
+            $this->reserveWith($this->ledgerOver($connection));
+            Assert::fail('Expected LedgerException');
+        } catch (LedgerException $e) {
+            Assert::same($e->getMessage(), sprintf('Blob "%s" could not be reserved', $this->blob()->key()));
+            Assert::same($e->getCode(), 0);
+            Assert::count($failures, 2);
+            Assert::same($e->getPrevious(), $failures[1]);
+        }
+
+        Assert::null($this->ledger->find($this->blob()));
+    }
+
+    public function commitFailsWhenTheBlobRowVanishedBeforeActivation(): void
+    {
+        $reservation = $this->reserve();
+        $connection = new InterceptingConnection($this->database->db);
+        $connection->onTransaction = function (\Closure $proceed): mixed {
+            $this->database->db->createCommand()
+                ->delete('filestorage_blob', ['id' => BlobRowId::for($this->blob())])
+                ->execute();
+
+            return $proceed();
+        };
+
+        try {
+            $this->ledgerOver($connection)->commit($reservation, SqliteDatabase::file('a'));
+            Assert::fail('Expected LedgerException');
+        } catch (LedgerException $e) {
+            Assert::same(
+                $e->getMessage(),
+                sprintf('Blob "%s" disappeared while its reservation was being committed', $this->blob()->key()),
+            );
+        }
+
+        Assert::null($this->repository->find('a'));
+    }
+
+    public function joiningFailsAsBusyWhenACollectorMovedTheBlobMeanwhile(): void
+    {
+        $this->ledger->release($this->reserve(), $this->at('01:00'));
+        $connection = new InterceptingConnection($this->database->db);
+        $moved = false;
+        $connection->onCreateCommand = function (?string $sql, \Closure $proceed) use (&$moved) {
+            if ($sql === null && !$moved) {
+                $moved = true;
+                $this->database->db->createCommand()->update(
+                    'filestorage_blob',
+                    ['state' => BlobState::Deleting->value],
+                    ['id' => BlobRowId::for($this->blob())],
+                )->execute();
+            }
+
+            return $proceed();
+        };
+
+        try {
+            $this->reserveWith($this->ledgerOver($connection));
+            Assert::fail('Expected BlobBusyException');
+        } catch (BlobBusyException $e) {
+            Assert::same(
+                $e->getMessage(),
+                sprintf('Blob "%s" changed state while it was being joined. Retry', $this->blob()->key()),
+            );
+        }
+    }
+
+    /**
+     * Candidates are taken in id order, so two collectors scanning the same
+     * backlog contend for the same blob first instead of each other's leftovers.
+     */
+    public function collectableBlobsAreClaimedInIdOrder(): void
+    {
+        $blobs = [$this->blob(), $this->otherBlob()];
+        usort($blobs, static fn(BlobId $a, BlobId $b): int => BlobRowId::for($b) <=> BlobRowId::for($a));
+
+        foreach ($blobs as $blob) {
+            $this->ledger->release(
+                $this->ledger->reserve($blob, hash('sha256', $blob->key()), 12, $this->at('00:10')),
+                $this->at('01:00'),
+            );
+        }
+
+        $first = $this->ledger->claimForDeletion($this->at('02:00'), $this->at('02:05'));
+
+        $lowest = min(BlobRowId::for($this->blob()), BlobRowId::for($this->otherBlob()));
+        Assert::same($first === null ? null : BlobRowId::for($first->blob), $lowest);
+    }
+
+    /**
+     * @param array<string, mixed> $row
+     */
+    #[DataProvider('integerColumnProvider')]
+    public function readsAnIntegerColumnTheWayEveryDriverReturnsIt(array $row, ?int $expected): void
+    {
+        if ($expected === null) {
+            Expect::exception(LedgerException::class)
+                ->withMessage('Blob column "size" must hold a non-negative integer');
+        }
+
+        Assert::same($this->callPrivate('integer', $row, 'size'), $expected);
+    }
+
+    public static function integerColumnProvider(): iterable
+    {
+        yield 'an int' => [['size' => 12], 12];
+        yield 'zero' => [['size' => 0], 0];
+        yield 'a numeric string' => [['size' => '12'], 12];
+        yield 'a zero string' => [['size' => '0'], 0];
+        yield 'the widest digit run' => [['size' => '1234567890123456789'], 1_234_567_890_123_456_789];
+        yield 'a negative int' => [['size' => -1], null];
+        yield 'a negative string' => [['size' => '-1'], null];
+        yield 'text' => [['size' => 'abc'], null];
+        yield 'digits with a prefix' => [['size' => 'x12'], null];
+        yield 'digits with a suffix' => [['size' => '12x'], null];
+        yield 'too many digits' => [['size' => '12345678901234567890'], null];
+        yield 'a float' => [['size' => 1.5], null];
+        yield 'a bool' => [['size' => true], null];
+        yield 'null' => [['size' => null], null];
+        yield 'missing' => [[], null];
+    }
+
+    /**
+     * @param array<string, mixed> $row
+     */
+    #[DataProvider('stateColumnProvider')]
+    public function readsTheStateColumnStrictly(array $row, ?BlobState $expected): void
+    {
+        if ($expected === null) {
+            Expect::exception(LedgerException::class)->withMessage('Blob row holds an unknown state');
+        }
+
+        Assert::same($this->callPrivate('state', $row), $expected);
+    }
+
+    public static function stateColumnProvider(): iterable
+    {
+        yield 'a known state' => [['state' => 'pending_delete'], BlobState::PendingDelete];
+        yield 'an unknown state' => [['state' => 'confused'], null];
+        yield 'a number' => [['state' => 5], null];
+        yield 'null' => [['state' => null], null];
+        yield 'missing' => [[], null];
+    }
+
+    /**
+     * @param array<string, mixed> $row
+     */
+    #[DataProvider('stringColumnProvider')]
+    public function readsATextColumnStrictly(array $row, ?string $expected): void
+    {
+        if ($expected === null) {
+            Expect::exception(LedgerException::class)
+                ->withMessage('Blob column "content_hash" must hold a non-empty string');
+        }
+
+        Assert::same($this->callPrivate('string', $row, 'content_hash'), $expected);
+    }
+
+    public static function stringColumnProvider(): iterable
+    {
+        yield 'text' => [['content_hash' => 'abc'], 'abc'];
+        yield 'empty' => [['content_hash' => ''], null];
+        yield 'a number' => [['content_hash' => 5], null];
+        yield 'null' => [['content_hash' => null], null];
+        yield 'missing' => [[], null];
+    }
+
+    private function ledgerOver(InterceptingConnection $connection): DbBlobLedger
+    {
+        return new DbBlobLedger($connection, $this->repository, new StaticClock($this->at('00:00')));
+    }
+
+    /**
+     * The row readers are private and their rejection branches cannot be reached
+     * through a real driver: `yiisoft/db` typecasts on read and the columns are
+     * NOT NULL. They guard against drivers that hand back strings or nulls, so
+     * they are exercised directly.
+     */
+    private function callPrivate(string $method, mixed ...$arguments): mixed
+    {
+        return (new \ReflectionMethod(DbBlobLedger::class, $method))->invoke($this->ledger, ...$arguments);
     }
 }

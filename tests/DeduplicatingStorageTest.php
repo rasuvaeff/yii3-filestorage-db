@@ -7,10 +7,14 @@ namespace Rasuvaeff\Yii3FilestorageDb\Tests;
 use DateInterval;
 use DateTimeImmutable;
 use Nyholm\Psr7\Factory\Psr17Factory;
+use Rasuvaeff\Yii3Filestorage\Exception\AddException;
 use Rasuvaeff\Yii3Filestorage\Exception\InvalidConfigException;
 use Rasuvaeff\Yii3Filestorage\Exception\PolicyViolationException;
+use Rasuvaeff\Yii3Filestorage\Exception\RemoveException;
+use Rasuvaeff\Yii3Filestorage\Exception\StoreException;
 use Rasuvaeff\Yii3Filestorage\Id\Uuid7IdGenerator;
 use Rasuvaeff\Yii3Filestorage\Mime\FinfoMimeTypeDetector;
+use Rasuvaeff\Yii3Filestorage\Mime\MimeTypeDetectorInterface;
 use Rasuvaeff\Yii3Filestorage\Path\ContentAddressedKeyGeneratorInterface;
 use Rasuvaeff\Yii3Filestorage\Path\RandomPathGenerator;
 use Rasuvaeff\Yii3Filestorage\Policy\DeliveryPolicyRegistry;
@@ -33,6 +37,8 @@ use Rasuvaeff\Yii3FilestorageDb\DedupScope;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\ContentAddressableInMemoryStore;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\FixedKeyGenerator;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\FixedScope;
+use Rasuvaeff\Yii3FilestorageDb\Tests\Support\NoMimeTypeDetector;
+use Rasuvaeff\Yii3FilestorageDb\Tests\Support\SpyStream;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\SqliteDatabase;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\UnsizedStream;
 use Testo\Assert;
@@ -474,6 +480,7 @@ final class DeduplicatingStorageTest
         ?BlobLedgerInterface $ledger = null,
         ?ContentAddressedKeyGeneratorInterface $keys = null,
         ?PolicyRegistry $policies = null,
+        ?MimeTypeDetectorInterface $mimeTypeDetector = null,
     ): DeduplicatingStorageFactory {
         $stores ??= new StoreRegistry([$this->store]);
         $clock = new StaticClock($this->at('00:00'));
@@ -484,7 +491,7 @@ final class DeduplicatingStorageTest
             stores: $stores,
             repository: $repository,
             ledger: $ledger ?? new DbBlobLedger($this->database->db, $repository, $clock),
-            mimeTypeDetector: new FinfoMimeTypeDetector(),
+            mimeTypeDetector: $mimeTypeDetector ?? new FinfoMimeTypeDetector(),
             idGenerator: new Uuid7IdGenerator($clock),
             policies: $policies ?? new PolicyRegistry(),
             clock: $clock,
@@ -523,5 +530,73 @@ final class DeduplicatingStorageTest
     private function at(string $time): DateTimeImmutable
     {
         return new DateTimeImmutable("2026-01-01T{$time}:00.000000+00:00");
+    }
+
+    /**
+     * A store that fails mid-protocol leaves a reservation behind. It must be
+     * released (scheduled, never deleted outright) and the caller must see the
+     * documented exception with the cause attached.
+     */
+    public function aFailedWriteReleasesTheReservationAndSurfacesAnAddException(): void
+    {
+        $this->store->failNextPut();
+        $storage = $this->factory(keys: new FixedKeyGenerator('shared/one/original.bin'))->create();
+        $blob = BlobId::create('upload', 'shared/one/original.bin');
+
+        try {
+            $storage->add($this->upload('hello'));
+            Assert::fail('Expected AddException');
+        } catch (AddException $e) {
+            Assert::same($e->getMessage(), sprintf('Failed to store "%s"', $blob->key()));
+            Assert::same($e->getCode(), 0);
+            Assert::instanceOf($e->getPrevious(), StoreException::class);
+            Assert::same($this->ledger->find($blob)?->state, BlobState::PendingDelete);
+        }
+
+        Assert::same($this->store->writeCount(), 0);
+    }
+
+    public function aFailureToReleaseTheFileRowSurfacesARemoveException(): void
+    {
+        $file = $this->storage->add($this->upload('hello'));
+        $this->database->db->createCommand()->dropTable('filestorage_file')->execute();
+
+        try {
+            $this->storage->remove($file->id);
+            Assert::fail('Expected RemoveException');
+        } catch (RemoveException $e) {
+            Assert::same($e->getMessage(), sprintf('Failed to release file "%s"', $file->id));
+            Assert::same($e->getCode(), 0);
+            Assert::instanceOf($e->getPrevious(), \Throwable::class);
+        }
+    }
+
+    /**
+     * The declaration is trusted before a byte is read: an upload that claims
+     * to be over the cap is unique even when the bytes behind it are small.
+     */
+    public function aDeclaredSizeOverTheCapWinsOverTheRealBytes(): void
+    {
+        $storage = $this->factory()->create(dedupMaxBytes: 10);
+        $stream = new SpyStream($this->factory->createStream('hello'), reportedSize: 100);
+
+        $file = $storage->add(Upload::fromStream($stream, 'a.txt', $this->factory));
+
+        Assert::null($file->contentHash);
+    }
+
+    /**
+     * A body that stalls instead of reporting its end still has the bytes it
+     * delivered hashed and counted: an empty read ends the loop.
+     */
+    public function anEmptyReadEndsTheDigestEvenWhenTheStreamNeverReportsItsEnd(): void
+    {
+        $storage = $this->factory(mimeTypeDetector: new NoMimeTypeDetector())->create();
+        $stream = new SpyStream($this->factory->createStream('hello'), neverEof: true);
+
+        $file = $storage->add(Upload::fromStream($stream, 'a.txt', $this->factory));
+
+        Assert::same($file->size, 5);
+        Assert::same($file->contentHash, hash('sha256', 'hello'));
     }
 }

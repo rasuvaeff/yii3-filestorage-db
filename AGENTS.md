@@ -64,9 +64,12 @@ make release-check
 
 ## Mutation testing
 
-`minMsi` is **89, and no mutator is ignored.** The 58 survivors fall into seven
-groups, none of which a test can kill without inventing a scenario the schema
-or the driver rules out:
+`minMsi` is **89**, run with `--with-uncovered`. The only ignores are the
+template's: `PublicVisibility`/`ProtectedVisibility` off and the regex for
+`type $name = default,` signature lines. Measured as CI runs it
+(`zend.assertions=-1`): 590 mutants, 37 undetected, 6 ignored, MSI 93%. The 37
+fall into these groups, none of which a test can kill without inventing a
+scenario the schema or the driver rules out:
 
 | Group | Example | Why no test kills it |
 |---|---|---|
@@ -76,6 +79,8 @@ or the driver rules out:
 | Exception-code arguments | the `0` in `new InvalidFileRowException($m, 0, $e)` | Nothing asserts an exception code, and asserting one would pin a value that carries no meaning |
 | Page-size constants and paged-walk `continue` | the `500` in `files($after, 500)` and the `262_144` read size in `DeduplicateCommand`; the `continue` in each of its "skip this row" branches | Killing the page sizes needs 500-row fixtures, and even then a different boundary is not a different result. The `continue`s are equivalent to `break` because the cursor advances *before* the branch and the outer `while` re-pages from it |
 | Diagnostics on a path a second fault opens | the `$io->text()` naming a reservation that could not be released, in `DeduplicateCommand`'s failure arm | Reaching it needs the store to fail *and* the ledger to fail right after — the double would have to be broken in two coordinated ways, which asserts the double rather than the command. The arm itself is covered; only the message inside it is not |
+| Redundant rewinds | `$stream->rewind()` after the digest pass in `DeduplicatingStorage` and `DeduplicateCommand` | `Upload::stream()` rewinds on every access and every consumer goes through it, so a missing rewind is invisible |
+| Lines with no opcode | the continuation lines of the multi-line messages in `DeduplicatingStorageFactory` and `reclaimAdvice()`; the unreachable `return 0` of `maxBytesOption()` (the option always has a default) | pcov records no executable opcode there, so the mutant is Not Covered whatever the tests assert; the messages themselves are asserted in full |
 | Console option casts and guards | `(bool) $input->getOption('apply')` and the `isset() && is_string() && !== ''` chain in `stringOption()` | Symfony already guarantees the type, so only the `!== ''` half is reachable — and that half is tested. The rest exists so psalm can narrow without a suppression |
 
 Two shapes are worth knowing before adding tests here.

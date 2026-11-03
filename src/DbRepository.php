@@ -113,8 +113,10 @@ final readonly class DbRepository implements MaintenanceRepositoryInterface
      * @throws InvalidFileRowException
      */
     #[Override]
-    public function files(?string $afterId = null, int $limit = 1000): iterable
-    {
+    public function files(
+        ?string $afterId = null,
+        int $limit = 1000,
+    ): iterable {
         $condition = $afterId === null ? [] : ['>', 'id', $afterId];
         $condition = $this->scoped($condition);
 

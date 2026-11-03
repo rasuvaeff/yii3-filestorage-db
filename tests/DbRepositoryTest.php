@@ -416,4 +416,16 @@ final class DbRepositoryTest
 
         Assert::same($row['scope_id'], 'tenant-a');
     }
+
+    public function reportsWhetherItWritesThroughThatExactConnection(): void
+    {
+        $other = new SqliteDatabase();
+
+        try {
+            Assert::true($this->repository->usesConnection($this->database->db));
+            Assert::false($this->repository->usesConnection($other->db));
+        } finally {
+            $other->close();
+        }
+    }
 }
