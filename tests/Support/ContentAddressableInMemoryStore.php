@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Rasuvaeff\Yii3FilestorageDb\Tests\Support;
 
+use Closure;
 use DateTimeImmutable;
 use Override;
 use Psr\Http\Message\StreamInterface;
@@ -29,6 +30,13 @@ final class ContentAddressableInMemoryStore implements ContentAddressableStoreIn
 {
     private bool $failNextPut = false;
 
+    private bool $vanishAfterFirstStream = false;
+
+    private int $streamCalls = 0;
+
+    /** @var (Closure(StreamInterface): StreamInterface)|null */
+    private ?Closure $nextStreamWrapper = null;
+
     public function __construct(private readonly InMemoryStore $inner) {}
 
     /**
@@ -39,6 +47,25 @@ final class ContentAddressableInMemoryStore implements ContentAddressableStoreIn
     public function failNextPut(): void
     {
         $this->failNextPut = true;
+    }
+
+    /**
+     * The first `stream()` answers, every later one reports the object gone —
+     * a body deleted between the hashing pass and the publish.
+     */
+    public function vanishAfterFirstStream(): void
+    {
+        $this->vanishAfterFirstStream = true;
+    }
+
+    /**
+     * Wraps the stream the next `stream()` call returns, once.
+     *
+     * @param Closure(StreamInterface): StreamInterface $wrapper
+     */
+    public function wrapNextStream(Closure $wrapper): void
+    {
+        $this->nextStreamWrapper = $wrapper;
     }
 
     #[Override]
@@ -129,6 +156,17 @@ final class ContentAddressableInMemoryStore implements ContentAddressableStoreIn
     #[Override]
     public function stream(File $file): ?StreamInterface
     {
-        return $this->inner->stream($file);
+        if ($this->vanishAfterFirstStream && ++$this->streamCalls > 1) {
+            return null;
+        }
+
+        $stream = $this->inner->stream($file);
+
+        if ($stream instanceof StreamInterface && $this->nextStreamWrapper instanceof Closure) {
+            $stream = ($this->nextStreamWrapper)($stream);
+            $this->nextStreamWrapper = null;
+        }
+
+        return $stream;
     }
 }

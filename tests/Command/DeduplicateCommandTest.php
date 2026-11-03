@@ -6,22 +6,30 @@ namespace Rasuvaeff\Yii3FilestorageDb\Tests\Command;
 
 use DateTimeImmutable;
 use Nyholm\Psr7\Factory\Psr17Factory;
+use Psr\Http\Message\StreamInterface;
 use Rasuvaeff\Yii3Filestorage\File;
 use Rasuvaeff\Yii3Filestorage\Path\RandomPathGenerator;
 use Rasuvaeff\Yii3Filestorage\Path\Sha256KeyGenerator;
+use Rasuvaeff\Yii3Filestorage\Repository\FileScopeProviderInterface;
 use Rasuvaeff\Yii3Filestorage\Store\BlobId;
+use Rasuvaeff\Yii3Filestorage\Store\BlobState;
 use Rasuvaeff\Yii3Filestorage\Store\StoredObjectId;
 use Rasuvaeff\Yii3Filestorage\Store\StoreRegistry;
 use Rasuvaeff\Yii3Filestorage\Test\InMemoryStore;
 use Rasuvaeff\Yii3Filestorage\Upload;
+use Rasuvaeff\Yii3FilestorageDb\BlobRowId;
 use Rasuvaeff\Yii3FilestorageDb\Command\DeduplicateCommand;
 use Rasuvaeff\Yii3FilestorageDb\DbBlobLedger;
 use Rasuvaeff\Yii3FilestorageDb\DbRepository;
 use Rasuvaeff\Yii3FilestorageDb\DedupScope;
+use Rasuvaeff\Yii3FilestorageDb\FileRowMapper;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\ContentAddressableInMemoryStore;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\FixedKeyGenerator;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\FixedScope;
+use Rasuvaeff\Yii3FilestorageDb\Tests\Support\InterceptingConnection;
+use Rasuvaeff\Yii3FilestorageDb\Tests\Support\SpyStream;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\SqliteDatabase;
+use Rasuvaeff\Yii3FilestorageDb\Timestamps;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Tester\CommandTester;
 use Testo\Assert;
@@ -33,6 +41,12 @@ use Yiisoft\Test\Support\Clock\StaticClock;
 
 #[Test]
 #[Covers(DeduplicateCommand::class)]
+#[Covers(DbBlobLedger::class)]
+#[Covers(DbRepository::class)]
+#[Covers(DedupScope::class)]
+#[Covers(FileRowMapper::class)]
+#[Covers(Timestamps::class)]
+#[Covers(BlobRowId::class)]
 final class DeduplicateCommandTest
 {
     private SqliteDatabase $database;
@@ -272,9 +286,11 @@ final class DeduplicateCommandTest
             createdAt: $this->at('00:00'),
         ));
 
-        $this->run(['--apply' => true]);
+        $display = $this->display($this->run(['--apply' => true]));
 
         Assert::same($this->repository->find('a')?->relativePath, 'ab/cd/ef/original.bin');
+        Assert::string($display)->contains('Migrated 0 of 1 row; 0 already shared, 1 skipped, 0 failed.');
+        Assert::string($display)->notContains('unreadable');
     }
 
 
@@ -574,12 +590,15 @@ final class DeduplicateCommandTest
         Assert::same($this->ledger->find($this->blobFor('common', $contents))?->size, 700_000);
     }
 
-    private function run(array $arguments = [], ?StoreRegistry $stores = null): CommandTester
-    {
+    private function run(
+        array $arguments = [],
+        ?StoreRegistry $stores = null,
+        ?DbBlobLedger $ledger = null,
+    ): CommandTester {
         $tester = new CommandTester(new DeduplicateCommand(
             stores: $stores ?? new StoreRegistry([$this->store]),
             repository: $this->repository,
-            ledger: $this->ledger,
+            ledger: $ledger ?? $this->ledger,
             streams: $this->factory,
             clock: new StaticClock($this->at('01:00')),
         ));
@@ -691,5 +710,159 @@ final class DeduplicateCommandTest
     private function display(CommandTester $tester): string
     {
         return (string) preg_replace('/[\\s!\\[\\]]+/u', ' ', $tester->getDisplay());
+    }
+
+    public function theMaxBytesRefusalExplainsWhyZeroIsNotAnAnswer(): void
+    {
+        $this->store('a', 'hello');
+
+        Assert::string($this->display($this->run(['--max-bytes' => '100MB'])))->contains(
+            'The --max-bytes value must be a non-negative whole number of bytes. `100MB` is not one, and '
+            . 'reading it as zero would silently lift the limit rather than apply it.',
+        );
+    }
+
+    public function theScopeRefusalExplainsWhichValueToUse(): void
+    {
+        Assert::string($this->display($this->run(['--scope' => 'per-user'])))->contains(
+            'Unknown scope "per-user". Use one of: '
+            . implode(', ', array_column(DedupScope::cases(), 'value'))
+            . '. It must be the same value the application passes to DeduplicatingStorageFactory::create(), '
+            . 'or migrated rows land on keys future uploads never join.',
+        );
+    }
+
+    public function theMultiTenantAdviceSaysWhyTheSweepRefusesUnderAScope(): void
+    {
+        $this->store('a', 'hello');
+        $tester = new CommandTester(new DeduplicateCommand(
+            stores: new StoreRegistry([$this->store]),
+            repository: $this->repository,
+            ledger: $this->ledger,
+            streams: $this->factory,
+            clock: new StaticClock($this->at('01:00')),
+            scopes: new FixedScope('tenant-a'),
+        ));
+        $tester->execute(['--apply' => true]);
+
+        Assert::string($this->display($tester))->contains(
+            '`filestorage:gc --orphans --apply` run from a maintenance entry point that leaves '
+            . FileScopeProviderInterface::class
+            . ' unbound — the sweep refuses under a bound scope provider, because a tenant-filtered set of rows '
+            . 'cannot prove an object unreferenced',
+        );
+    }
+
+    public function aSecondRunCountsEveryRowAsAlreadyShared(): void
+    {
+        $this->store('a', 'hello');
+        $this->run(['--apply' => true]);
+
+        $display = $this->display($this->run(['--apply' => true]));
+
+        Assert::string($display)->contains('Migrated 0 of 1 row; 1 already shared, 0 skipped, 0 failed.');
+    }
+
+    public function anUnreadableRowFailsTheRunAndNamesTheRowBeforeIt(): void
+    {
+        $this->store('a', 'hello');
+        $this->store('b', 'world');
+        $this->database->db
+            ->createCommand("UPDATE filestorage_file SET metadata = 'not json' WHERE id = :id", [':id' => 'b'])
+            ->execute();
+
+        $afterA = $this->run(['--apply' => true, '--after' => 'a']);
+        $display = $this->display($afterA);
+
+        Assert::same($afterA->getStatusCode(), Command::FAILURE);
+        Assert::string($display)->contains('unreadable row after a — ');
+        Assert::string($display)->contains('Migrated 0 of 0 rows; 0 already shared, 0 skipped, 1 failed.');
+        Assert::string($display)->contains('1 row could not be migrated.');
+
+        $fromStart = $this->display($this->run(['--apply' => true]));
+        Assert::string($fromStart)->contains('unreadable row after (start) — ');
+    }
+
+    public function aRowOverTheCapIsSkippedBeforeItIsRead(): void
+    {
+        $this->store('a', 'hello');
+
+        $display = $this->display($this->run(['--apply' => true, '--max-bytes' => '2']));
+
+        Assert::string($display)->contains('skipping a: 5 bytes is over --max-bytes');
+        Assert::string($display)->notContains('bytes counted');
+    }
+
+    public function aFailedRowNamesItselfAndTheCause(): void
+    {
+        $this->store('a', 'hello');
+        $this->store->failNextPut();
+
+        $display = $this->display($this->run(['--apply' => true]));
+
+        Assert::string($display)->contains('failed a: Store is unavailable while writing');
+    }
+
+    public function anObjectThatVanishesBetweenHashingAndPublishingFailsTheRowAndReleasesIt(): void
+    {
+        $this->store('a', 'hello');
+        $this->store->vanishAfterFirstStream();
+
+        $tester = $this->run(['--apply' => true]);
+
+        Assert::same($tester->getStatusCode(), Command::FAILURE);
+        Assert::string($this->display($tester))
+            ->contains('failed a: Object for "a" disappeared while it was being migrated');
+        Assert::same($this->ledger->find($this->blobFor('common', 'hello'))?->reservationCount, 0);
+        Assert::same($this->ledger->find($this->blobFor('common', 'hello'))?->state, BlobState::PendingDelete);
+    }
+
+    /**
+     * The release is what a database outage breaks next, and it must not take
+     * the run with it: the summary and the resume cursor still print, and the
+     * operator is told which reservation is left to expire.
+     */
+    public function aReleaseThatFailsTooIsNamedInsteadOfAbortingTheRun(): void
+    {
+        $this->store('a', 'hello');
+        $this->store->failNextPut();
+        $connection = new InterceptingConnection($this->database->db);
+        $transactions = 0;
+        $connection->onTransaction = static function (\Closure $proceed) use (&$transactions): mixed {
+            if (++$transactions === 2) {
+                throw new \RuntimeException('database went away');
+            }
+
+            return $proceed();
+        };
+        $ledger = new DbBlobLedger($connection, $this->repository, new StaticClock($this->at('00:00')));
+
+        $tester = $this->run(['--apply' => true], ledger: $ledger);
+        $display = $this->display($tester);
+
+        Assert::same($tester->getStatusCode(), Command::FAILURE);
+        Assert::string($display)->contains(
+            'could not release the reservation for a (database went away) — it expires on its own, and '
+            . '`filestorage:gc --apply` sweeps it',
+        );
+        Assert::string($display)->contains('Last id: a — resume with --after=a');
+    }
+
+    /**
+     * A stalled body is read until it stops delivering, not until it claims to
+     * be finished.
+     */
+    public function anEmptyReadEndsTheHashingPassOfAStalledBody(): void
+    {
+        $this->store('a', 'hello');
+        $this->store->wrapNextStream(
+            fn(StreamInterface $stream): StreamInterface => new SpyStream($stream, neverEof: true),
+        );
+
+        $this->run(['--apply' => true]);
+
+        $record = $this->ledger->find($this->blobFor('common', 'hello'));
+        Assert::same($record?->size, 5);
+        Assert::same($this->repository->find('a')?->contentHash, hash('sha256', 'hello'));
     }
 }

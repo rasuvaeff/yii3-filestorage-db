@@ -166,4 +166,49 @@ final class MigrationTest
 
         return $names;
     }
+
+    /**
+     * Index columns matter as much as index names: the composite orders are the
+     * ones the ledger and the repository filter and sort on.
+     */
+    public function everyIndexCoversTheColumnsItsQueryFiltersOn(): void
+    {
+        (new M260807000000CreateFilestorageFileTable())->up($this->builder);
+        (new M260807000001CreateFilestorageBlobTables())->up($this->builder);
+
+        Assert::same($this->indexColumns('filestorage_file', 'idx_filestorage_file_scope_id'), ['scope_id', 'id']);
+        Assert::same(
+            $this->indexColumns('filestorage_file', 'idx_filestorage_file_group_created'),
+            ['group_name', 'created_at'],
+        );
+        Assert::same($this->indexColumns('filestorage_file', 'idx_filestorage_file_content_hash'), ['content_hash']);
+        Assert::same($this->indexColumns('filestorage_file', 'idx_filestorage_file_blob_id'), ['blob_id']);
+        Assert::same(
+            $this->indexColumns('filestorage_blob', 'idx_filestorage_blob_state_delete_after'),
+            ['state', 'delete_after'],
+        );
+        Assert::same($this->indexColumns('filestorage_blob', 'idx_filestorage_blob_content_hash'), ['content_hash']);
+        Assert::same(
+            $this->indexColumns('filestorage_blob_reservation', 'idx_filestorage_blob_reservation_blob_id'),
+            ['blob_id'],
+        );
+        Assert::same(
+            $this->indexColumns('filestorage_blob_reservation', 'idx_filestorage_blob_reservation_expires_at'),
+            ['expires_at'],
+        );
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function indexColumns(string $table, string $index): array
+    {
+        foreach ($this->db->getSchema()->getTableIndexes($table, true) as $candidate) {
+            if ($candidate->name === $index) {
+                return array_values($candidate->columnNames);
+            }
+        }
+
+        return [];
+    }
 }
