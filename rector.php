@@ -2,8 +2,8 @@
 
 declare(strict_types=1);
 
-use Rector\CodeQuality\Rector\Identical\FlipTypeControlToUseExclusiveTypeRector;
 use Rasuvaeff\RectorNamedLiterals\AddNameToLiteralArgumentRector;
+use Rector\CodeQuality\Rector\If_\ExplicitNullableObjectInstanceRector;
 use Rector\Config\RectorConfig;
 
 return RectorConfig::configure()
@@ -14,8 +14,8 @@ return RectorConfig::configure()
     ->withPhpSets(php83: true)
     ->withPreparedSets(deadCode: true, codeQuality: true)
     ->withSkip([
-        // Rewrites `$x === null` into `!$x instanceof Foo`, dragging
-        // fully-qualified vendor names into code that already reads clearly.
-        FlipTypeControlToUseExclusiveTypeRector::class,
+        // `$x === null` reads clearer than `!$x instanceof Some\Long\ClassName`
+        // when the declared type already names the class.
+        ExplicitNullableObjectInstanceRector::class,
     ])
     ->withRules([AddNameToLiteralArgumentRector::class]);
