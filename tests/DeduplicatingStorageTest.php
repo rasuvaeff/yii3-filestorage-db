@@ -47,6 +47,7 @@ use Rasuvaeff\Yii3FilestorageDb\Tests\Support\FixedIdGenerator;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\FixedKeyGenerator;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\FixedScope;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\NoMimeTypeDetector;
+use Rasuvaeff\Yii3FilestorageDb\Tests\Support\SlashRefusingKeyGenerator;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\SpyStream;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\SqliteDatabase;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\UnsizedStream;
@@ -666,6 +667,14 @@ final class DeduplicatingStorageTest
         )->create();
     }
 
+    public function aGeneratorRefusingTheTenantProbeIsAConfigurationError(): void
+    {
+        Expect::exception(InvalidConfigException::class)
+            ->withMessageContaining(SlashRefusingKeyGenerator::class . ' refused a probe key: Nested scope');
+
+        $this->factory(scopes: new FixedScope('tenant-a'), keys: new SlashRefusingKeyGenerator())->create();
+    }
+
     public function aGeneratorThatIgnoresTheTenantIsAcceptedUnderTheGlobalScopeOrWithoutAProvider(): void
     {
         $stores = $this->flatStores();
@@ -712,7 +721,8 @@ final class DeduplicatingStorageTest
 
             Assert::same($first->relativePath, $path);
             Assert::same($second->relativePath, $path);
-            Assert::same(glob("{$root}/blobs/*/*/*"), ["{$root}/{$path}"]);
+            Assert::true(is_file("{$root}/{$path}"));
+            Assert::same($this->filesUnder("{$root}/blobs"), 1);
             Assert::same($public->publicUrl($second), "/uploads/{$path}");
             Assert::same((string) $storage->stream($second), 'hello');
 
@@ -722,7 +732,7 @@ final class DeduplicatingStorageTest
             Assert::same($this->ledger->find(BlobId::create('upload', $path))?->state, BlobState::PendingDelete);
             Assert::true(is_file("{$root}/{$path}"), 'only a collector deletes shared bytes');
         } finally {
-            exec('rm -rf ' . escapeshellarg($root));
+            $this->removeTree($root);
         }
     }
 
@@ -770,6 +780,30 @@ final class DeduplicatingStorageTest
             clock: $clock,
             defaultUrlTtl: new DateInterval('PT1H'),
         );
+    }
+
+    private function filesUnder(string $directory): int
+    {
+        return iterator_count(new \RecursiveIteratorIterator(
+            new \RecursiveDirectoryIterator($directory, \FilesystemIterator::SKIP_DOTS),
+        ));
+    }
+
+    private function removeTree(string $directory): void
+    {
+        if (!is_dir($directory)) {
+            return;
+        }
+
+        $entries = new \RecursiveIteratorIterator(
+            new \RecursiveDirectoryIterator($directory, \FilesystemIterator::SKIP_DOTS),
+            \RecursiveIteratorIterator::CHILD_FIRST,
+        );
+        foreach ($entries as $entry) {
+            \assert($entry instanceof \SplFileInfo);
+            $entry->isDir() ? rmdir($entry->getPathname()) : unlink($entry->getPathname());
+        }
+        rmdir($directory);
     }
 
     /**
