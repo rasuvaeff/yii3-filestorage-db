@@ -19,6 +19,7 @@ use Rasuvaeff\Yii3Filestorage\Store\BlobState;
 use Rasuvaeff\Yii3Filestorage\Store\BlobToken;
 use Yiisoft\Db\Connection\ConnectionInterface;
 use Yiisoft\Db\Exception\IntegrityException;
+use Yiisoft\Db\Expression\Expression;
 use Yiisoft\Db\Query\Query;
 
 /**
@@ -166,7 +167,13 @@ final readonly class DbBlobLedger implements BlobLedgerInterface
                 ['id' => $id],
             )->execute();
 
-            if ($activated === 0) {
+            // MySQL reports *changed* rows, not matched ones (CLIENT_FOUND_ROWS
+            // is off by default, and the connection is the application's). A
+            // second commit joining an active blob at the same instant writes
+            // only values the row already holds and reads 0 there. The re-read
+            // runs inside this transaction, after the UPDATE has locked the
+            // row, so 0 plus a present row means "unchanged", not "gone".
+            if ($activated === 0 && $this->blobRow($id) === null) {
                 throw new LedgerException(
                     "Blob \"{$reservation->blob->key()}\" disappeared while its reservation was being committed",
                 );
@@ -504,10 +511,13 @@ final readonly class DbBlobLedger implements BlobLedgerInterface
      */
     private function unusedCondition(string $id): array
     {
+        // an Expression, not '1': yiisoft/db quotes a string select as a column
+        // name, and MySQL and PostgreSQL reject a column named "1" (SQLite
+        // accepts it, which is how this shipped)
         return [
             'and',
-            ['not exists', (new Query($this->db))->select('1')->from($this->files)->where(['blob_id' => $id])],
-            ['not exists', (new Query($this->db))->select('1')->from($this->reservations)->where(['blob_id' => $id])],
+            ['not exists', (new Query($this->db))->select(new Expression('1'))->from($this->files)->where(['blob_id' => $id])],
+            ['not exists', (new Query($this->db))->select(new Expression('1'))->from($this->reservations)->where(['blob_id' => $id])],
         ];
     }
 

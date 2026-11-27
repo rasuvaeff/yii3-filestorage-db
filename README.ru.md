@@ -331,6 +331,16 @@ make mutation
 make release-check
 ```
 
+`make test-integration` гоняет SQLite. Тот же suite идёт на MySQL или
+PostgreSQL, если `FILESTORAGE_TEST_DB` называет сервер (CI гоняет оба); образу
+нужны `pdo_mysql`/`pdo_pgsql`, которых в `composer:2` нет:
+
+```bash
+docker run --rm --network host -v "$PWD":/app -w /app \
+  -e FILESTORAGE_TEST_DB=mysql -e FILESTORAGE_TEST_MYSQL_PORT=3306 \
+  <php-image-with-pdo_mysql-and-pdo_pgsql> vendor/bin/testo --suite=Integration
+```
+
 ## Лицензия
 
 BSD-3-Clause. См. [LICENSE.md](LICENSE.md).

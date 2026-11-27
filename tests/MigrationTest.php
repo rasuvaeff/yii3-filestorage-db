@@ -66,6 +66,27 @@ final class MigrationTest
     }
 
     /**
+     * MySQL and MariaDB reject a literal `DEFAULT` on a TEXT column (1101), and
+     * `migrate:up` then creates nothing; SQLite accepts it. No column here needs
+     * a default, so none may carry one — the cheap half of the regression, run
+     * on every PR without a database server.
+     */
+    public function noColumnCarriesADefault(): void
+    {
+        (new M260807000000CreateFilestorageFileTable())->up($this->builder);
+        (new M260807000001CreateFilestorageBlobTables())->up($this->builder);
+
+        foreach (['filestorage_file', 'filestorage_blob', 'filestorage_blob_reservation'] as $table) {
+            $columns = $this->db->getTableSchema($table, true)?->getColumns() ?? [];
+            Assert::true($columns !== [], "{$table} has no columns");
+
+            foreach ($columns as $name => $column) {
+                Assert::null($column->getDefaultValue(), "{$table}.{$name} carries a default");
+            }
+        }
+    }
+
+    /**
      * The ledger asks "does anything still reference this blob?" on every
      * release and every collection pass. Without this index that question is
      * a full scan of the largest table in the schema.
