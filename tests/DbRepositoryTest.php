@@ -253,6 +253,13 @@ final class DbRepositoryTest
 
         Assert::same($this->repository->referencedPaths('upload', ['a_b']), ['a_b/original']);
         Assert::same($this->repository->referencedPaths('upload', ['50%']), []);
+
+        // `!` is the escape character the statement declares, so it is
+        // escaped too
+        $this->repository->save(SqliteDatabase::file('d', relativePath: 'x!_y/original'));
+        $this->repository->save(SqliteDatabase::file('e', relativePath: 'x!zy/original'));
+        Assert::same($this->repository->referencedPaths('upload', ['x!_y']), ['x!_y/original']);
+        Assert::same($this->repository->referencedPaths('upload', ['x!']), []);
     }
 
     /**

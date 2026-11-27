@@ -12,10 +12,8 @@ use Rasuvaeff\Yii3Filestorage\Store\BlobId;
 use Rasuvaeff\Yii3FilestorageDb\Exception\InvalidFileRowException;
 use Rasuvaeff\Yii3FilestorageDb\Exception\MissingScopeException;
 use Yiisoft\Db\Connection\ConnectionInterface;
+use Yiisoft\Db\Expression\Expression;
 use Yiisoft\Db\Query\Query;
-use Yiisoft\Db\QueryBuilder\Condition\Like;
-use Yiisoft\Db\QueryBuilder\Condition\LikeConjunction;
-use Yiisoft\Db\QueryBuilder\Condition\LikeMode;
 
 /**
  * File metadata in a database table.
@@ -168,8 +166,8 @@ final readonly class DbRepository implements MaintenanceRepositoryInterface
     }
 
     /**
-     * One statement per batch of directories: `relative_path LIKE '<dir>/%'`
-     * for rows below a directory, `relative_path IN (...)` for root-level
+     * One statement per batch of directories: `relative_path LIKE '<dir>/%'
+     * ESCAPE '!'` for rows below a directory, `relative_path IN (...)` for root-level
      * rows, which are their own directory.
      *
      * The database only narrows; the answer is decided here. `LIKE 'd/%'` also
@@ -188,8 +186,6 @@ final readonly class DbRepository implements MaintenanceRepositoryInterface
         $seen = [];
 
         foreach (array_chunk(array_values(array_unique($directories)), self::DIRECTORY_BATCH) as $batch) {
-            $prefixes = array_map(static fn(string $directory): string => $directory . '/', $batch);
-
             /** @var list<array<string, mixed>> $rows */
             $rows = (new Query($this->db))
                 ->select(['store_name', 'relative_path'])
@@ -197,16 +193,7 @@ final readonly class DbRepository implements MaintenanceRepositoryInterface
                 ->where($this->scoped([
                     'and',
                     ['store_name' => $storeName],
-                    [
-                        'or',
-                        new Like(
-                            column: 'relative_path',
-                            value: $prefixes,
-                            mode: LikeMode::StartsWith,
-                            conjunction: LikeConjunction::Or,
-                        ),
-                        ['in', 'relative_path', $batch],
-                    ],
+                    ['or', ...$this->startsWithAny($batch), ['in', 'relative_path', $batch]],
                 ]))
                 ->all();
 
@@ -282,6 +269,38 @@ final readonly class DbRepository implements MaintenanceRepositoryInterface
             ->one();
 
         return $row;
+    }
+
+    /**
+     * `relative_path LIKE '<dir>/%' ESCAPE '!'`, one per directory.
+     *
+     * Not `yiisoft/db`'s `Like` condition: it escapes with a backslash, and
+     * its MySQL builder emits no `ESCAPE` clause, so the backslash only works
+     * while it is MySQL's default escape character. Under
+     * `sql_mode=NO_BACKSLASH_ESCAPES` there is none — `\_` is then a literal
+     * backslash followed by a wildcard, a directory with `_` in its name
+     * matches nothing, and the orphan sweep quarantines bytes live rows point
+     * at. `!` declared as the escape in the statement means the same thing on
+     * every engine and in every mode.
+     *
+     * @param list<string> $directories
+     *
+     * @return list<Expression>
+     */
+    private function startsWithAny(array $directories): array
+    {
+        $column = $this->db->getQuoter()->quoteColumnName('relative_path');
+        $conditions = [];
+
+        foreach ($directories as $i => $directory) {
+            $parameter = ":fs_dir_{$i}";
+            $conditions[] = new Expression(
+                "{$column} LIKE {$parameter} ESCAPE '!'",
+                [$parameter => strtr($directory . '/', ['!' => '!!', '%' => '!%', '_' => '!_']) . '%'],
+            );
+        }
+
+        return $conditions;
     }
 
     /**

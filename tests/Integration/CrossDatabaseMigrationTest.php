@@ -97,6 +97,15 @@ final class CrossDatabaseMigrationTest
             $this->deduplicatedAddsAndRemoves($db);
             $this->reservationsAndCollection($db);
             $this->referencedPaths($db);
+            if ($database === 'mysql') {
+                // `LIKE` without `ESCAPE` on MySQL relies on the backslash
+                // being the escape character, which this mode switches off:
+                // a directory with `_` then found nothing, and the orphan
+                // sweep quarantined bytes live rows point at
+                $db->createCommand("SET SESSION sql_mode = CONCAT(@@sql_mode, ',NO_BACKSLASH_ESCAPES')")->execute();
+                $this->referencedPaths($db);
+                $db->createCommand('SET SESSION sql_mode = DEFAULT')->execute();
+            }
 
             $storePath->down($builder);
             Assert::false(
@@ -222,6 +231,9 @@ final class CrossDatabaseMigrationTest
             'r4' => 'G/AB/CD/K1/original',
             'r5' => 'a_b/original',
             'r6' => 'axb/original',
+            'r9' => 'user_avatars/ab/cd/k1/original',
+            'r10' => '50%!/x',
+            'r11' => '50x!/x',
             'r7' => 'root.txt',
             'r8' => $long . '/original',
         ];
@@ -237,10 +249,21 @@ final class CrossDatabaseMigrationTest
             ));
         }
 
-        $paths = $repository->referencedPaths('upload', ['g/ab/cd/k1', 'a_b', 'root.txt', $long]);
+        $paths = $repository->referencedPaths(
+            'upload',
+            ['g/ab/cd/k1', 'a_b', 'root.txt', $long, 'user_avatars/ab/cd/k1', '50%!'],
+        );
         sort($paths);
 
-        $expected = ['a_b/original', 'g/ab/cd/k1/original', 'g/ab/cd/k1/thumb.webp', $long . '/original', 'root.txt'];
+        $expected = [
+            'a_b/original',
+            'g/ab/cd/k1/original',
+            'g/ab/cd/k1/thumb.webp',
+            $long . '/original',
+            'root.txt',
+            'user_avatars/ab/cd/k1/original',
+            '50%!/x',
+        ];
         sort($expected);
 
         Assert::same($paths, $expected);
