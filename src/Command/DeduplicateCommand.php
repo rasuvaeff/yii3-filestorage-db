@@ -329,12 +329,14 @@ final class DeduplicateCommand extends Command
 
         $blob = BlobId::create(
             $store->name(),
+            // Positional on purpose: an injected generator may name its
+            // parameters differently, and named arguments bind to those names.
             ($this->keys ?? new Sha256KeyGenerator())->generate(
-                scope: $scope->keyFor($file->groupName, $this->scopes?->currentScopeId()),
-                sha256: $hash,
+                $scope->keyFor($file->groupName, $this->scopes?->currentScopeId()),
+                $hash,
                 // the row records the type detected at add time, so this is the
                 // extension the live path chose for the same bytes
-                extension: ($this->extensions ?? new ExtensionMap())->extensionFor($file->mimeType),
+                ($this->extensions ?? new ExtensionMap())->extensionFor($file->mimeType),
             ),
         );
 

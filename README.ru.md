@@ -67,7 +67,12 @@ return [
 `(store_name, relative_path)` для зачистки сирот (`M261127000000…`, добавлен в
 0.3.0 — существующая установка получит его при следующем `migrate:up`). На
 MySQL он индексирует первые 191 символ пути, на PostgreSQL использует
-`varchar_pattern_ops`, чтобы `LIKE 'dir/%'` мог по нему идти.
+`varchar_pattern_ops`, чтобы `LIKE 'dir/%'` мог по нему идти. MySQL 8 строит его
+без блокировки записи; на PostgreSQL обычный `CREATE INDEX` блокирует запись на
+время построения, поэтому для большой нагруженной таблицы создайте его заранее:
+`CREATE INDEX CONCURRENTLY idx_filestorage_file_store_path ON filestorage_file
+(store_name, relative_path varchar_pattern_ops)` — миграция использует
+`IF NOT EXISTS` и тогда только отметит себя применённой.
 
 > **`yiisoft/db-migration` ^2.1 — жёсткое требование.** На 2.0.x ровно эта
 > регистрация молча не находила ничего: резолв namespace принимал *соседний*

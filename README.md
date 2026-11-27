@@ -65,7 +65,11 @@ Three tables: `filestorage_file`, `filestorage_blob` and
 `(store_name, relative_path)` for the orphan sweep (`M261127000000…`, added in
 0.3.0 — an existing installation picks it up with the next `migrate:up`). On
 MySQL it indexes the first 191 characters of the path, on PostgreSQL it uses
-`varchar_pattern_ops` so that `LIKE 'dir/%'` can use it.
+`varchar_pattern_ops` so that `LIKE 'dir/%'` can use it. MySQL 8 builds it online; on
+PostgreSQL a plain `CREATE INDEX` blocks writes while it builds, so for a large
+busy table create it first with `CREATE INDEX CONCURRENTLY idx_filestorage_file_store_path
+ON filestorage_file (store_name, relative_path varchar_pattern_ops)` — the
+migration uses `IF NOT EXISTS` and then only records itself.
 
 > **`yiisoft/db-migration` ^2.1 is a hard requirement.** On 2.0.x this exact
 > registration silently found nothing: namespace resolution matched a

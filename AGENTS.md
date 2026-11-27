@@ -194,7 +194,8 @@ MSI without any test getting worse.
   because a numeric path used as an array key becomes an int.
 - **The store/path index differs per engine, deliberately.**
   `M261127000000AddFilestorageFileStorePathIndex` indexes `relative_path(191)`
-  on MySQL (the 767-byte column limit of `COMPACT`) and uses
+  on MySQL (the 767-byte *per-column prefix* limit of `COMPACT`; the composite
+  key may exceed it — verified on MySQL 8.4 `ROW_FORMAT=COMPACT`) and uses
   `varchar_pattern_ops` on PostgreSQL — under any non-`C` collation a plain
   btree is not used for `LIKE 'x%'`. Verified with `EXPLAIN` on MySQL 8.4 and
   PostgreSQL 17 (`en_US.utf8`): both answer the lookup by range scans on this

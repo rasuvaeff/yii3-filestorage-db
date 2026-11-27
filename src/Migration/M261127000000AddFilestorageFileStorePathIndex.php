@@ -53,7 +53,7 @@ final readonly class M261127000000AddFilestorageFileStorePathIndex implements
         match ($b->getDb()->getDriverName()) {
             'mysql' => $b->createIndex($table, $index, ['store_name', 'relative_path(191)']),
             'pgsql' => $b->execute(sprintf(
-                'CREATE INDEX %s ON %s (%s, %s varchar_pattern_ops)',
+                'CREATE INDEX IF NOT EXISTS %s ON %s (%s, %s varchar_pattern_ops)',
                 $b->getDb()->getQuoter()->quoteTableName($index),
                 $b->getDb()->getQuoter()->quoteTableName($table),
                 $b->getDb()->getQuoter()->quoteColumnName('store_name'),

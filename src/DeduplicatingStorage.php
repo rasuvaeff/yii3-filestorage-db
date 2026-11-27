@@ -126,12 +126,14 @@ final readonly class DeduplicatingStorage implements StorageInterface
         [$hash, $size] = $digest;
         $blob = BlobId::create(
             $this->store->name(),
+            // Positional on purpose: the generator is an injected interface, and
+            // PHP binds named arguments to the implementation's parameter names.
             $this->keys->generate(
-                scope: $this->scope->keyFor($groupName, $this->scopes?->currentScopeId()),
-                sha256: $hash,
+                $this->scope->keyFor($groupName, $this->scopes?->currentScopeId()),
+                $hash,
                 // what the base facade would name the same file — and what
                 // `filestorage:deduplicate` derives from the type the row records
-                extension: $this->extensions->extensionFor($mimeType),
+                $this->extensions->extensionFor($mimeType),
             ),
         );
 
