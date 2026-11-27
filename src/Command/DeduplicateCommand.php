@@ -111,7 +111,7 @@ final class DeduplicateCommand extends Command
         $io = new SymfonyStyle($input, $output);
         $options = $input->getOptions();
 
-        $apply = $input->getOption('apply') === true;
+        $apply = (bool) ($input->getOptions()['apply'] ?? false);
         $limit = max(1, (int) $input->getOption('limit'));
         $maxBytes = $this->maxBytesOption($options);
         if ($maxBytes === null) {
