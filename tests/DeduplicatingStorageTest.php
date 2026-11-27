@@ -39,6 +39,7 @@ use Rasuvaeff\Yii3FilestorageDb\DeduplicatingStorageFactory;
 use Rasuvaeff\Yii3FilestorageDb\DedupScope;
 use Rasuvaeff\Yii3FilestorageDb\Exception\MissingScopeException;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\ContentAddressableInMemoryStore;
+use Rasuvaeff\Yii3FilestorageDb\Tests\Support\FixedIdGenerator;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\FixedKeyGenerator;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\FixedScope;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\NoMimeTypeDetector;
@@ -609,6 +610,7 @@ final class DeduplicatingStorageTest
         ?PolicyRegistry $policies = null,
         ?MimeTypeDetectorInterface $mimeTypeDetector = null,
         ?ExtensionMap $extensions = null,
+        ?\Rasuvaeff\Yii3Filestorage\Id\IdGeneratorInterface $idGenerator = null,
     ): DeduplicatingStorageFactory {
         $stores ??= new StoreRegistry([$this->store]);
         $clock = new StaticClock($this->at('00:00'));
@@ -620,7 +622,7 @@ final class DeduplicatingStorageTest
             repository: $repository,
             ledger: $ledger ?? new DbBlobLedger($this->database->db, $repository, $clock),
             mimeTypeDetector: $mimeTypeDetector ?? new FinfoMimeTypeDetector(),
-            idGenerator: new Uuid7IdGenerator($clock),
+            idGenerator: $idGenerator ?? new Uuid7IdGenerator($clock),
             policies: $policies ?? new PolicyRegistry(),
             clock: $clock,
             scopes: $scopes,
@@ -790,5 +792,54 @@ final class DeduplicatingStorageTest
         }
 
         Assert::same($this->store->writeCount(), 0);
+    }
+
+    /**
+     * Same ordering bug as core's review A2: the row was only built after
+     * the bytes were published, so metadata `File::create()` refuses — or an
+     * id generator or clock that fails — left a reserved, written blob behind
+     * for the collector. Everything the caller supplied is validated first.
+     */
+    public function invalidMetadataIsRefusedBeforeAnythingIsReservedOrWritten(): void
+    {
+        $refused = false;
+
+        try {
+            $this->storage->add($this->upload('hello'), metadata: ['nested' => ['not' => 'scalar']]);
+        } catch (\InvalidArgumentException) {
+            $refused = true;
+        }
+
+        Assert::true($refused);
+        Assert::same($this->store->writeCount(), 0);
+        Assert::same((new \Yiisoft\Db\Query\Query($this->database->db))->from('filestorage_blob')->count(), 0);
+    }
+
+    /**
+     * After the write, a failure is the add-failure path: the reservation is
+     * released (scheduled, never deleted — the bytes may already be shared)
+     * and the caller gets `AddException`.
+     */
+    public function aFailureAfterTheWriteReleasesTheReservation(): void
+    {
+        // the id is taken by another tenant's row: the scoped update finds
+        // nothing and the insert collides on the primary key — after the bytes
+        // were published
+        (new DbRepository($this->database->db, scopes: new FixedScope('tenant-b')))->save(SqliteDatabase::file('taken'));
+        $storage = $this->factory(scopes: new FixedScope('tenant-a'), idGenerator: new FixedIdGenerator('taken'))->create();
+
+        try {
+            $storage->add($this->upload('hello'));
+            Assert::fail('Expected AddException');
+        } catch (AddException) {
+        }
+
+        $blob = $this->blobOf((new \Rasuvaeff\Yii3Filestorage\Path\Sha256KeyGenerator())->generate(
+            DedupScope::TenantGroup->keyFor('common', 'tenant-a'),
+            hash('sha256', 'hello'),
+        ));
+        Assert::same($this->store->writeCount(), 1);
+        Assert::same($this->ledger->find($blob)?->reservationCount, 0, 'the reservation must be released');
+        Assert::same($this->ledger->find($blob)?->state, BlobState::PendingDelete);
     }
 }

@@ -119,7 +119,8 @@ final readonly class DbRepository implements MaintenanceRepositoryInterface
     }
 
     /**
-     * Replaces the row with this id, or inserts it.
+     * Replaces the row with this id, or inserts it — an upsert by id, with
+     * `scope_id` assigned once, on insert, and never rewritten by a replace.
      *
      * Deliberately not an `upsert`. An upsert matches on the primary key
      * alone, so a row belonging to another tenant would be silently taken

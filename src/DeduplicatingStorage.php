@@ -312,6 +312,31 @@ final readonly class DeduplicatingStorage implements StorageInterface
     ): File {
         $now = $this->clock->now();
 
+        // Built before anything is reserved or written, so metadata the row
+        // refuses — or an id generator or clock that fails — leaves no blob
+        // behind (core's review A2, same ordering). Only what the store
+        // answers is filled in after the write.
+        $draft = File::create(
+            id: $this->idGenerator->generate(),
+            storeName: $blob->storeName,
+            groupName: $groupName,
+            relativePath: $blob->relativePath(),
+            originalName: $upload->originalName,
+            // The counted size, not the store's. On the reuse branch a
+            // content-addressable store returns the *existing* object's size
+            // and — when the upload declared none — skips the mismatch check,
+            // so a previously truncated object would put its short size on
+            // this row while the blob records the real one. Counting while
+            // hashing is the invariant this package states; the reservation
+            // goes out with this number.
+            size: $size,
+            createdAt: $now,
+            mimeType: $mimeType,
+            description: $description,
+            contentHash: $hash,
+            metadata: $metadata,
+        );
+
         $reservation = $this->ledger->reserve(
             blob: $blob,
             contentHash: $hash,
@@ -322,27 +347,22 @@ final readonly class DeduplicatingStorage implements StorageInterface
         try {
             $result = $this->store->putIfAbsent($upload, new StoredObjectId($blob->relativePath()), $maxBytes);
 
-            $file = File::create(
-                id: $this->idGenerator->generate(),
-                storeName: $blob->storeName,
-                groupName: $groupName,
-                relativePath: $result->relativePath,
-                originalName: $upload->originalName,
-                // The counted size, not the store's. On the reuse branch a
-                // content-addressable store returns the *existing* object's
-                // size and — when the upload declared none — skips the
-                // mismatch check, so a previously truncated object would put
-                // its short size on this row while the blob records the real
-                // one. Counting while hashing is the invariant this package
-                // states; the reservation already went out with this number.
-                size: $size,
-                createdAt: $now,
-                externalId: $result->externalId,
-                mimeType: $mimeType,
-                description: $description,
-                contentHash: $hash,
-                metadata: $metadata,
-            );
+            $file = $result->relativePath === $draft->relativePath && $result->externalId === null
+                ? $draft
+                : File::create(
+                    id: $draft->id,
+                    storeName: $draft->storeName,
+                    groupName: $draft->groupName,
+                    relativePath: $result->relativePath,
+                    originalName: $draft->originalName,
+                    size: $draft->size,
+                    createdAt: $draft->createdAt,
+                    externalId: $result->externalId,
+                    mimeType: $draft->mimeType,
+                    description: $draft->description,
+                    contentHash: $draft->contentHash,
+                    metadata: $draft->metadata,
+                );
 
             $this->ledger->commit($reservation, $file);
         } catch (Throwable $e) {

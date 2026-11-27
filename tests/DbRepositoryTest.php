@@ -629,6 +629,50 @@ final class DbRepositoryTest
         Assert::same($row['scope_id'], 'tenant-a');
     }
 
+    /**
+     * `RepositoryInterface::save()` is an upsert by id, and the scope is
+     * assigned once, on insert (core review B7 states it in the interface).
+     * Pinned here for this implementation: a replace by the owning tenant
+     * keeps the tenant, a replace from another tenant cannot take the row
+     * over, and a global-access replace keeps it too.
+     */
+    public function saveIsAnUpsertWhoseScopeIsAssignedOnlyOnInsert(): void
+    {
+        $scope = new FixedScope('tenant-a');
+        $scoped = new DbRepository($this->database->db, scopes: $scope);
+
+        $scoped->save(SqliteDatabase::file('a', originalName: 'first.txt'));
+        $scoped->save(SqliteDatabase::file('a', originalName: 'second.txt'));
+        Assert::same($scoped->find('a')?->originalName, 'second.txt');
+        Assert::same($this->scopeOf('a'), 'tenant-a');
+
+        $scope->switchTo('tenant-b');
+        $takenOver = true;
+
+        try {
+            $scoped->save(SqliteDatabase::file('a', originalName: 'hijacked.txt'));
+        } catch (\Throwable) {
+            $takenOver = false;
+        }
+
+        Assert::false($takenOver, 'another tenant must collide on the primary key, not replace');
+
+        $scope->switchTo(null);
+        (new DbRepository($this->database->db, scopes: $scope, allowGlobalAccess: true))
+            ->save(SqliteDatabase::file('a', originalName: 'third.txt'));
+
+        Assert::same($this->scopeOf('a'), 'tenant-a');
+        Assert::same($this->repository->find('a')?->originalName, 'third.txt');
+        Assert::same((new Query($this->database->db))->from('filestorage_file')->count(), 1);
+    }
+
+    private function scopeOf(string $id): mixed
+    {
+        return $this->database->db
+            ->createCommand('SELECT scope_id FROM filestorage_file WHERE id = :id', [':id' => $id])
+            ->queryScalar();
+    }
+
     public function reportsWhetherItWritesThroughThatExactConnection(): void
     {
         $other = new SqliteDatabase();
