@@ -10,6 +10,7 @@ use Rasuvaeff\Yii3Filestorage\Store\BlobId;
 use Rasuvaeff\Yii3Filestorage\Store\BlobState;
 use Rasuvaeff\Yii3FilestorageDb\DbBlobLedger;
 use Rasuvaeff\Yii3FilestorageDb\DbRepository;
+use Rasuvaeff\Yii3FilestorageDb\Tests\Support\ServerDatabase;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\SqliteDatabase;
 use Testo\Assert;
 use Testo\Codecov\CoversNothing;
@@ -34,6 +35,15 @@ use Yiisoft\Test\Support\Clock\StaticClock;
  *
  * A separate suite because it is slower and because `composer test` runs Unit
  * only; CI invokes it explicitly.
+ *
+ * On SQLite by default, which serialises every write on the whole database —
+ * so the snapshot rules that actually differ between engines (PostgreSQL READ
+ * COMMITTED, InnoDB locking reads in DML subqueries) are only exercised when
+ * `FILESTORAGE_TEST_DB` names a server: then the two workers are two
+ * connections to MySQL or PostgreSQL, and on MySQL both run under an unusual
+ * `sql_mode`. The cases stay sequential interleavings of committed
+ * statements; one worker blocking on the other's lock would hang a
+ * single-process suite.
  */
 #[Test]
 #[CoversNothing]
@@ -41,7 +51,8 @@ final class LedgerConcurrencyTest
 {
     private const string HASH = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
 
-    private SqliteDatabase $database;
+    private ?SqliteDatabase $database = null;
+    private ConnectionInterface $first;
     private ConnectionInterface $second;
 
     /** Two ledgers, two connections, one database — as if two workers. */
@@ -53,20 +64,33 @@ final class LedgerConcurrencyTest
     #[BeforeTest]
     public function setUp(): void
     {
-        $this->database = new SqliteDatabase(shared: true);
-        $this->second = $this->database->connect();
+        $engine = ServerDatabase::engine();
+        if ($engine === null) {
+            $this->database = new SqliteDatabase(shared: true);
+            $this->first = $this->database->db;
+            $this->second = $this->database->connect();
+        } else {
+            $this->first = ServerDatabase::connect($engine, ServerDatabase::UNUSUAL_SQL_MODE);
+            $this->second = ServerDatabase::connect($engine, ServerDatabase::UNUSUAL_SQL_MODE);
+            ServerDatabase::reset($this->first);
+        }
 
-        $this->aliceFiles = new DbRepository($this->database->db);
+        $this->aliceFiles = new DbRepository($this->first);
         $this->bobFiles = new DbRepository($this->second);
-        $this->alice = $this->ledgerOn($this->database->db, $this->aliceFiles);
+        $this->alice = $this->ledgerOn($this->first, $this->aliceFiles);
         $this->bob = $this->ledgerOn($this->second, $this->bobFiles);
     }
 
     #[AfterTest]
     public function tearDown(): void
     {
+        if ($this->database === null) {
+            ServerDatabase::drop($this->first);
+            $this->first->close();
+        } else {
+            $this->database->close();
+        }
         $this->second->close();
-        $this->database->close();
     }
 
     /**
@@ -260,6 +284,74 @@ final class LedgerConcurrencyTest
     }
 
     /**
+     * A collector died under its lease and the lease ran out before the next
+     * `gc`. A writer on the other connection joins instead of being told to
+     * retry until then, and the dead collector's lease can no longer delete.
+     */
+    public function aWriterJoinsOnceADeadCollectorsLeaseRanOut(): void
+    {
+        $this->alice->release(
+            $this->alice->reserve($this->blob(), self::HASH, 12, $this->at('00:10')),
+            $this->at('01:00'),
+        );
+        $abandoned = $this->alice->claimForDeletion($this->at('01:00'), $this->at('01:05'));
+
+        $bob = $this->ledgerOn($this->second, $this->bobFiles, '01:06');
+        $bob->commit($bob->reserve($this->blob(), self::HASH, 12, $this->at('01:20')), SqliteDatabase::file('b'));
+
+        Assert::false($this->alice->completeDeletion($abandoned ?? $this->fail()));
+        Assert::same($this->alice->find($this->blob())?->state, BlobState::Active);
+        Assert::same($this->bobFiles->find('b')?->id, 'b');
+    }
+
+    /**
+     * The race the grace period alone used to cover, on the engine where it
+     * is reachable: PostgreSQL READ COMMITTED. Bob joins an active blob and
+     * has not committed his reservation; Alice removes the last reference
+     * (no grace) and her collector, which cannot see Bob's uncommitted
+     * reservation, claims the blob. Bob's commit must then refuse rather than
+     * activate a blob under a deletion lease.
+     *
+     * Not reachable on SQLite (one writer per database) or InnoDB, whose
+     * `NOT EXISTS` in an `UPDATE` is a locking read that waits for Bob — a
+     * single-process test would hang there instead of racing.
+     */
+    public function aCommitRefusesABlobClaimedBehindAnUncommittedReservation(): void
+    {
+        if (ServerDatabase::engine() !== 'pgsql') {
+            Assert::true(true, 'reachable on PostgreSQL only');
+
+            return;
+        }
+
+        $this->alice->commit(
+            $this->alice->reserve($this->blob(), self::HASH, 12, $this->at('00:10')),
+            SqliteDatabase::file('a'),
+        );
+
+        $transaction = $this->second->beginTransaction();
+        $reservation = $this->bob->reserve($this->blob(), self::HASH, 12, $this->at('00:10'));
+
+        Assert::true($this->alice->releaseFile('a', $this->at('00:00')));
+        $lease = $this->alice->claimForDeletion($this->at('00:00'), $this->at('00:05'));
+        Assert::true($lease instanceof \Rasuvaeff\Yii3Filestorage\Store\BlobLease, 'the collector cannot see the reservation yet');
+
+        $transaction->commit();
+
+        $refused = false;
+
+        try {
+            $this->bob->commit($reservation, SqliteDatabase::file('b'));
+        } catch (\Rasuvaeff\Yii3Filestorage\Exception\LedgerException) {
+            $refused = true;
+        }
+
+        Assert::true($refused, 'a commit must not activate a blob under a deletion lease');
+        Assert::null($this->aliceFiles->find('b'));
+        Assert::same($this->alice->find($this->blob())?->state, BlobState::Deleting);
+    }
+
+    /**
      * Interleaved adds and removes on one blob, run through both connections.
      * The property being checked is the invariant itself: at no point does a
      * committed row exist while the blob it names does not.
@@ -309,18 +401,18 @@ final class LedgerConcurrencyTest
         }
     }
 
-    private function ledgerOn(ConnectionInterface $db, DbRepository $repository): DbBlobLedger
+    private function ledgerOn(ConnectionInterface $db, DbRepository $repository, string $time = '00:00'): DbBlobLedger
     {
         return new DbBlobLedger(
             db: $db,
             repository: $repository,
-            clock: new StaticClock($this->at('00:00')),
+            clock: new StaticClock($this->at($time)),
         );
     }
 
     private function blobRowCount(): int
     {
-        return (int) (new \Yiisoft\Db\Query\Query($this->database->db))->from('filestorage_blob')->count();
+        return (int) (new \Yiisoft\Db\Query\Query($this->first))->from('filestorage_blob')->count();
     }
 
     private function blob(): BlobId

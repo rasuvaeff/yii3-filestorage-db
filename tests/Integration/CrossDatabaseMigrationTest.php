@@ -30,19 +30,14 @@ use Rasuvaeff\Yii3FilestorageDb\Migration\M261127000000AddFilestorageFileStorePa
 use Rasuvaeff\Yii3FilestorageDb\Migration\M261128000000MakeFilestorageFileScopeIdCaseSensitive;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\ContentAddressableInMemoryStore;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\FixedScope;
+use Rasuvaeff\Yii3FilestorageDb\Tests\Support\ServerDatabase;
 use Testo\Assert;
 use Testo\Codecov\CoversNothing;
 use Testo\Test;
-use Yiisoft\Db\Cache\SchemaCache;
 use Yiisoft\Db\Connection\ConnectionInterface;
 use Yiisoft\Db\Migration\Informer\NullMigrationInformer;
 use Yiisoft\Db\Migration\MigrationBuilder;
-use Yiisoft\Db\Mysql\Connection as MysqlConnection;
-use Yiisoft\Db\Mysql\Driver as MysqlDriver;
-use Yiisoft\Db\Pgsql\Connection as PgsqlConnection;
-use Yiisoft\Db\Pgsql\Driver as PgsqlDriver;
 use Yiisoft\Test\Support\Clock\StaticClock;
-use Yiisoft\Test\Support\SimpleCache\MemorySimpleCache;
 
 /**
  * The migrations and the whole ledger lifecycle on MySQL and PostgreSQL.
@@ -75,8 +70,7 @@ final class CrossDatabaseMigrationTest
             return;
         }
 
-        $db = $this->connection($database);
-        $db->open();
+        $db = ServerDatabase::connect($database);
 
         try {
             $this->dropTables($db);
@@ -366,30 +360,5 @@ final class CrossDatabaseMigrationTest
     private function at(string $time): DateTimeImmutable
     {
         return new DateTimeImmutable("2026-01-01T{$time}:00.000000+00:00");
-    }
-
-    private function connection(string $database): ConnectionInterface
-    {
-        $cache = new SchemaCache(psrCache: new MemorySimpleCache());
-        $mysqlPort = getenv('FILESTORAGE_TEST_MYSQL_PORT') ?: '3306';
-        $pgsqlPort = getenv('FILESTORAGE_TEST_PGSQL_PORT') ?: '5432';
-
-        return $database === 'mysql'
-            ? new MysqlConnection(
-                driver: new MysqlDriver(
-                    dsn: sprintf('mysql:host=127.0.0.1;port=%s;dbname=filestorage;charset=utf8mb4', $mysqlPort),
-                    username: 'root',
-                    password: 'filestorage',
-                ),
-                schemaCache: $cache,
-            )
-            : new PgsqlConnection(
-                driver: new PgsqlDriver(
-                    dsn: sprintf('pgsql:host=127.0.0.1;port=%s;dbname=filestorage', $pgsqlPort),
-                    username: 'postgres',
-                    password: 'filestorage',
-                ),
-                schemaCache: $cache,
-            );
     }
 }
