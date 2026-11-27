@@ -111,7 +111,7 @@ final class DbScopedFileResolverTest
         $refused = false;
 
         try {
-            (new DbRepository($this->database->db, scopes: new FixedScope(null)))->find('a');
+            (new DbRepository($this->database->db, scopes: new FixedScope()))->find('a');
         } catch (MissingScopeException) {
             $refused = true;
         }

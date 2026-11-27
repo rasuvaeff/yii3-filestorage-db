@@ -258,7 +258,7 @@ final class DeduplicatingStorageTest
      */
     public function aBoundProviderReturningNullIsRefusedBeforeAnythingIsWritten(): void
     {
-        $storage = $this->factory(scopes: new FixedScope(null))->create();
+        $storage = $this->factory(scopes: new FixedScope())->create();
 
         $refused = false;
 

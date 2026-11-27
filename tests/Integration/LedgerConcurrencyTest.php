@@ -319,7 +319,7 @@ final class LedgerConcurrencyTest
     public function aCommitRefusesABlobClaimedBehindAnUncommittedReservation(): void
     {
         if (ServerDatabase::engine() !== 'pgsql') {
-            Assert::true(true, 'reachable on PostgreSQL only');
+            Assert::true(actual: true, message: 'reachable on PostgreSQL only');
 
             return;
         }

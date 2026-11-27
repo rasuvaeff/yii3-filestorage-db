@@ -418,7 +418,7 @@ final class DbRepositoryTest
 
     public function findManyRefusesANullScopeFromABoundProvider(): void
     {
-        $scoped = new DbRepository($this->database->db, scopes: new FixedScope(null));
+        $scoped = new DbRepository($this->database->db, scopes: new FixedScope());
 
         Assert::true($this->refusedForMissingScope(static fn(): mixed => $scoped->findMany(['a'])));
     }

@@ -363,7 +363,7 @@ final class DeduplicateCommandTest
     {
         $file = $this->store('a', 'hello');
         $writes = $this->store->writeCount();
-        $scopes = new FixedScope(null);
+        $scopes = new FixedScope();
 
         $tester = new CommandTester(new DeduplicateCommand(
             stores: new StoreRegistry([$this->store]),
