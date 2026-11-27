@@ -39,7 +39,9 @@ claiming one is a `Duplicate key` error by design.
    *through the repository* rather than issuing its own SQL, precisely because
    its own `DELETE ... WHERE id = :id` would be a cross-tenant delete. A signed
    download uses `DbScopedFileResolver`; turning the filter off for downloads
-   reads any file whose id leaks.
+   reads any file whose id leaks. A bound provider returning null is refused
+   (`MissingScopeException`), never read as "no predicate"; the one global
+   path is the explicit `allowGlobalAccess` maintenance opt-in.
 4. **Preserve the public contract.** Update `README.md` **and `README.ru.md`**,
    `llms.txt` and the tests with any API change.
 
