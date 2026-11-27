@@ -13,6 +13,7 @@ use Rasuvaeff\Yii3Filestorage\File;
 use Rasuvaeff\Yii3Filestorage\Store\BlobId;
 use Rasuvaeff\Yii3FilestorageDb\DbRepository;
 use Rasuvaeff\Yii3FilestorageDb\Exception\InvalidFileRowException;
+use Rasuvaeff\Yii3FilestorageDb\Exception\MissingScopeException;
 use Rasuvaeff\Yii3FilestorageDb\FileTableName;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\FixedScope;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\SqliteDatabase;
@@ -309,6 +310,72 @@ final class DbRepositoryTest
         Assert::same($scoped->referencedPaths('upload', ['g']), []);
     }
 
+    /**
+     * The probe from the 1.0 review (`nullscope.php`): a bound provider that
+     * returns null used to drop the tenant predicate, so `find()` and
+     * `delete()` reached every tenant's rows. Bound means multi-tenant; a null
+     * there is a tenant that did not resolve, and it is refused.
+     */
+    public function aBoundProviderReturningNullIsRefusedRatherThanWidened(): void
+    {
+        $scope = new FixedScope('tenant-a');
+        $scoped = new DbRepository($this->database->db, scopes: $scope);
+        $scoped->save(SqliteDatabase::file('a', relativePath: 'g/original'));
+
+        $scope->switchTo(null);
+
+        $calls = [
+            'find' => static fn(): mixed => $scoped->find('a'),
+            'delete' => static fn(): mixed => $scoped->delete('a'),
+            'files' => static fn(): mixed => iterator_to_array($scoped->files(), preserve_keys: false),
+            'updateContentHash' => static fn(): mixed => $scoped->updateContentHash('a', SqliteDatabase::OTHER_HASH),
+            'referencedPaths' => static fn(): mixed => $scoped->referencedPaths('upload', ['g']),
+            'findBlobRowId' => static fn(): mixed => $scoped->findBlobRowId('a'),
+            'save (update)' => static fn(): mixed => $scoped->save(SqliteDatabase::file('a', relativePath: 'g/original')),
+            'save (insert)' => static fn(): mixed => $scoped->save(SqliteDatabase::file('new')),
+        ];
+        foreach ($calls as $name => $call) {
+            Assert::true($this->refusedForMissingScope($call), "{$name} must refuse a null scope");
+        }
+
+        $scope->switchTo('tenant-a');
+        Assert::same($scoped->find('a')?->id, 'a', 'nothing may have been deleted');
+        Assert::null((new DbRepository($this->database->db))->find('new'), 'nothing may have been inserted');
+    }
+
+    /**
+     * The opt-in for a maintenance entry point that shares the application's
+     * provider: a null scope then means every tenant — for reads, updates and
+     * deletes. A new row still needs a tenant.
+     */
+    public function globalAccessIsAnExplicitOptIn(): void
+    {
+        $scope = new FixedScope('tenant-a');
+        (new DbRepository($this->database->db, scopes: $scope))->save(SqliteDatabase::file('a', relativePath: 'g/original'));
+        $scope->switchTo('tenant-b');
+        (new DbRepository($this->database->db, scopes: $scope))->save(SqliteDatabase::file('b', relativePath: 'g/other'));
+
+        $scope->switchTo(null);
+        $maintenance = new DbRepository($this->database->db, scopes: $scope, allowGlobalAccess: true);
+
+        Assert::same(\count(iterator_to_array($maintenance->files(), preserve_keys: false)), 2);
+        Assert::same($maintenance->find('a')?->id, 'a');
+        $paths = $maintenance->referencedPaths('upload', ['g']);
+        sort($paths);
+        Assert::same($paths, ['g/original', 'g/other']);
+        Assert::true($maintenance->updateContentHash('a', SqliteDatabase::OTHER_HASH));
+        $maintenance->save(SqliteDatabase::file('b', relativePath: 'g/other', originalName: 'renamed.txt'));
+        Assert::true($this->refusedForMissingScope(
+            static fn(): mixed => $maintenance->save(SqliteDatabase::file('new')),
+        ), 'a new row without a tenant must still be refused');
+        Assert::true($maintenance->delete('a'));
+
+        // the tenant survives a global update, and a resolved scope still filters
+        $scope->switchTo('tenant-b');
+        Assert::same($maintenance->find('b')?->originalName, 'renamed.txt');
+        Assert::same(iterator_to_array($maintenance->files(), preserve_keys: false)[0]->id ?? null, 'b');
+    }
+
     public function aTenantSeesItsOwnRows(): void
     {
         $scope = new FixedScope('tenant-a');
@@ -525,5 +592,19 @@ final class DbRepositoryTest
         } finally {
             $other->close();
         }
+    }
+
+    /**
+     * @param \Closure(): mixed $call
+     */
+    private function refusedForMissingScope(\Closure $call): bool
+    {
+        try {
+            $call();
+        } catch (MissingScopeException) {
+            return true;
+        }
+
+        return false;
     }
 }

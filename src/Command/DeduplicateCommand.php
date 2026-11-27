@@ -138,6 +138,21 @@ final class DeduplicateCommand extends Command
             return Command::FAILURE;
         }
 
+        // The content key mixes the tenant in, and the rows come from the
+        // repository. A bound provider with no tenant would key every row into
+        // the `shared` pool — and under the repository's global opt-in, page
+        // every tenant's rows into it.
+        if ($this->scopes instanceof FileScopeProviderInterface && $this->scopes->currentScopeId() === null) {
+            $io->error(sprintf(
+                '%s is bound but returned no scope. This command keys rows by the tenant in force, so establish '
+                    . 'the tenant first and run it once per tenant — or, for a single-tenant installation, leave '
+                    . 'the provider unbound.',
+                FileScopeProviderInterface::class,
+            ));
+
+            return Command::FAILURE;
+        }
+
         $store = $this->stores->get($this->stringOption($options, 'store'));
         if (!$store instanceof ContentAddressableStoreInterface) {
             $io->error(sprintf(

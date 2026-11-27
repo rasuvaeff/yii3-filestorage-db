@@ -10,6 +10,7 @@ use Rasuvaeff\Yii3Filestorage\Repository\FileScopeProviderInterface;
 use Rasuvaeff\Yii3Filestorage\Repository\MaintenanceRepositoryInterface;
 use Rasuvaeff\Yii3Filestorage\Store\BlobId;
 use Rasuvaeff\Yii3FilestorageDb\Exception\InvalidFileRowException;
+use Rasuvaeff\Yii3FilestorageDb\Exception\MissingScopeException;
 use Yiisoft\Db\Connection\ConnectionInterface;
 use Yiisoft\Db\Query\Query;
 use Yiisoft\Db\QueryBuilder\Condition\Like;
@@ -30,6 +31,13 @@ use Yiisoft\Db\QueryBuilder\Condition\LikeMode;
  * added and `scope_id` stays null. That is a deliberate absence rather than a
  * predicate on null, so a single-tenant installation pays nothing.
  *
+ * A *bound* provider that returns null is a tenant that did not resolve, and
+ * every method refuses it with {@see MissingScopeException} rather than
+ * dropping the predicate. The one way to act on every tenant with a provider
+ * bound is the explicit `allowGlobalAccess` opt-in, meant for maintenance entry
+ * points; even then a new row is not written without a tenant. Null is never a
+ * wildcard by accident, which is also how {@see DbScopedFileResolver} treats it.
+ *
  * @api
  */
 final readonly class DbRepository implements MaintenanceRepositoryInterface
@@ -43,10 +51,18 @@ final readonly class DbRepository implements MaintenanceRepositoryInterface
     private string $table;
     private FileRowMapper $mapper;
 
+    /**
+     * @param bool $allowGlobalAccess With a provider bound, let a null scope
+     *        mean "every tenant" for reads, updates and deletes instead of
+     *        refusing. For a maintenance entry point that shares the
+     *        application's provider — never for a request path, where a null
+     *        is a tenant that failed to resolve.
+     */
     public function __construct(
         private ConnectionInterface $db,
         FileTableName $table = new FileTableName(),
         private ?FileScopeProviderInterface $scopes = null,
+        private bool $allowGlobalAccess = false,
     ) {
         $this->table = $table->value;
         $this->mapper = new FileRowMapper();
@@ -76,7 +92,12 @@ final readonly class DbRepository implements MaintenanceRepositoryInterface
     #[Override]
     public function save(File $file, ?BlobId $blob = null): void
     {
-        $row = $this->mapper->toRow($file, $blob, $this->scopes?->currentScopeId());
+        $scopeId = $this->scopeId();
+        // only reachable under the global opt-in: updating any tenant's row is
+        // what it is for, inserting a row that belongs to no tenant is not
+        $tenantless = $scopeId === null && $this->scopes instanceof FileScopeProviderInterface;
+
+        $row = $this->mapper->toRow($file, $blob, $scopeId);
 
         // An update must not touch the two columns a File does not carry.
         //
@@ -103,6 +124,10 @@ final readonly class DbRepository implements MaintenanceRepositoryInterface
 
         if ($updated > 0 || $this->row($file->id) !== null) {
             return;
+        }
+
+        if ($tenantless) {
+            throw $this->missingScope('insert a new row');
         }
 
         $this->db->createCommand()->insert($this->table, $row)->execute();
@@ -270,15 +295,51 @@ final readonly class DbRepository implements MaintenanceRepositoryInterface
     }
 
     /**
+     * The scope every statement filters by: null when no provider is bound,
+     * or under the explicit global opt-in.
+     *
+     * @return non-empty-string|null
+     *
+     * @throws MissingScopeException
+     */
+    private function scopeId(): ?string
+    {
+        if (!$this->scopes instanceof FileScopeProviderInterface) {
+            return null;
+        }
+
+        $scopeId = $this->scopes->currentScopeId();
+        if ($scopeId === null && !$this->allowGlobalAccess) {
+            throw $this->missingScope('run a statement');
+        }
+
+        return $scopeId;
+    }
+
+    private function missingScope(string $action): MissingScopeException
+    {
+        return new MissingScopeException(sprintf(
+            '%s is bound but returned no scope, so this repository will not %s without a tenant predicate. '
+            . 'Establish the tenant first. A maintenance entry point that must see every tenant constructs '
+            . '%s with allowGlobalAccess: true, or leaves the provider unbound',
+            FileScopeProviderInterface::class,
+            $action,
+            self::class,
+        ));
+    }
+
+    /**
      * Adds the mandatory tenant predicate, when there is one.
      *
      * @param array<mixed> $condition
      *
      * @return array<mixed>
+     *
+     * @throws MissingScopeException
      */
     private function scoped(array $condition): array
     {
-        $scopeId = $this->scopes?->currentScopeId();
+        $scopeId = $this->scopeId();
         if ($scopeId === null) {
             return $condition;
         }

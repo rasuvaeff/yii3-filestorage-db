@@ -14,6 +14,11 @@ return [
         // prepended to every name above; set it once to keep every rasuvaeff
         // table out of the way of your application's own
         'tablePrefix' => '',
+        // With a FileScopeProviderInterface bound, a null scope is refused.
+        // true lets a null scope mean "every tenant" for reads, updates and
+        // deletes — set it only in a maintenance entry point's own params,
+        // never where requests are served.
+        'allowGlobalAccess' => false,
     ],
     'yiisoft/yii-console' => [
         'commands' => [

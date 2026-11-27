@@ -27,6 +27,7 @@ use Rasuvaeff\Yii3FilestorageDb\DbScopedFileResolver;
 use Rasuvaeff\Yii3FilestorageDb\DeduplicatingStorage;
 use Rasuvaeff\Yii3FilestorageDb\DeduplicatingStorageFactory;
 use Rasuvaeff\Yii3FilestorageDb\DedupScope;
+use Rasuvaeff\Yii3FilestorageDb\Exception\MissingScopeException;
 use Rasuvaeff\Yii3FilestorageDb\FileTableName;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\ContentAddressableInMemoryStore;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\FixedScope;
@@ -229,6 +230,34 @@ final class ConfigWiringTest
     }
 
     /**
+     * The global opt-in is off by default — a bound provider returning null
+     * is refused — and the parameter is what turns it on for a maintenance
+     * entry point.
+     */
+    public function aNullScopeIsRefusedUnlessTheParameterOptsIn(): void
+    {
+        $scope = new FixedScope('tenant-a');
+        $provider = [FileScopeProviderInterface::class => static fn(): FileScopeProviderInterface => $scope];
+        $this->container($provider)->get(RepositoryInterface::class)->save(SqliteDatabase::file('a'));
+        $scope->switchTo(null);
+
+        $refused = false;
+
+        try {
+            $this->container($provider)->get(RepositoryInterface::class)->find('a');
+        } catch (MissingScopeException) {
+            $refused = true;
+        }
+
+        Assert::true($refused);
+        Assert::same(
+            $this->container($provider, params: ['allowGlobalAccess' => true])
+                ->get(RepositoryInterface::class)->find('a')?->id,
+            'a',
+        );
+    }
+
+    /**
      * The migration for existing data lives here rather than in core because it
      * has to produce byte-identical content keys to the storage the application
      * configured — same `DedupScope`, same scope provider.
@@ -251,7 +280,7 @@ final class ConfigWiringTest
     {
         $own = $this->params()['rasuvaeff/yii3-filestorage-db'];
 
-        foreach (['fileTable', 'blobTable', 'blobReservationTable', 'tablePrefix'] as $key) {
+        foreach (['fileTable', 'blobTable', 'blobReservationTable', 'tablePrefix', 'allowGlobalAccess'] as $key) {
             Assert::true(\array_key_exists($key, $own), "params is missing \"{$key}\"");
         }
     }

@@ -36,7 +36,8 @@ use Yiisoft\Db\Connection\ConnectionInterface;
 //
 // FileScopeProviderInterface is not bound here either: only the application
 // knows what a tenant is. Left unbound, the repository adds no predicate and
-// the installation is single-tenant.
+// the installation is single-tenant. Bound and returning null, it is refused
+// unless `allowGlobalAccess` is set for a maintenance entry point.
 return [
     // the migrations resolve these by type through Injector::make(), so the
     // repository, the ledger and the schema can never disagree about a name
@@ -59,7 +60,12 @@ return [
         ConnectionInterface $db,
         FileTableName $table,
         ?FileScopeProviderInterface $scopes = null,
-    ): DbRepository => new DbRepository(db: $db, table: $table, scopes: $scopes),
+    ): DbRepository => new DbRepository(
+        db: $db,
+        table: $table,
+        scopes: $scopes,
+        allowGlobalAccess: (bool) ($params['rasuvaeff/yii3-filestorage-db']['allowGlobalAccess'] ?? false),
+    ),
 
     // one implementation, both contracts: M5's operations commands resolve the
     // maintenance one, and a second instance would be a second connection

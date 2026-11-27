@@ -353,6 +353,33 @@ final class DeduplicateCommandTest
     }
 
     /**
+     * The content key mixes the tenant in, and the rows come from the
+     * repository. A bound provider returning null would key every row into
+     * the `shared` pool — and under the repository's global opt-in, page every
+     * tenant's rows into it, merging tenants. Refused before anything is read.
+     */
+    public function aBoundProviderReturningNullIsRefusedBeforeAnythingIsRead(): void
+    {
+        $file = $this->store('a', 'hello');
+        $writes = $this->store->writeCount();
+        $scopes = new FixedScope(null);
+
+        $tester = new CommandTester(new DeduplicateCommand(
+            stores: new StoreRegistry([$this->store]),
+            repository: new DbRepository($this->database->db, scopes: $scopes, allowGlobalAccess: true),
+            ledger: $this->ledger,
+            streams: $this->factory,
+            clock: new StaticClock($this->at('01:00')),
+            scopes: $scopes,
+        ));
+
+        Assert::same($tester->execute(['--apply' => true]), Command::FAILURE);
+        Assert::string($this->display($tester))->contains('returned no scope');
+        Assert::same($this->repository->find('a')?->relativePath, $file->relativePath);
+        Assert::same($this->store->writeCount(), $writes);
+    }
+
+    /**
      * The refusal has to say which values are acceptable, or the operator's next
      * move is another guess.
      */

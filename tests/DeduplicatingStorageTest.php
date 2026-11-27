@@ -36,6 +36,7 @@ use Rasuvaeff\Yii3FilestorageDb\DbRepository;
 use Rasuvaeff\Yii3FilestorageDb\DeduplicatingStorage;
 use Rasuvaeff\Yii3FilestorageDb\DeduplicatingStorageFactory;
 use Rasuvaeff\Yii3FilestorageDb\DedupScope;
+use Rasuvaeff\Yii3FilestorageDb\Exception\MissingScopeException;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\ContentAddressableInMemoryStore;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\FixedKeyGenerator;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\FixedScope;
@@ -203,6 +204,32 @@ final class DeduplicatingStorageTest
 
         Assert::true($first->relativePath !== $second->relativePath);
         Assert::same($this->store->writeCount(), 2);
+    }
+
+    /**
+     * The content key mixes the tenant in. A bound provider returning null
+     * used to key the upload into the `shared` pool — every unresolved tenant's
+     * uploads joining one another's blobs — before the repository was even
+     * asked. Refused before anything is read or reserved.
+     */
+    public function aBoundProviderReturningNullIsRefusedBeforeAnythingIsWritten(): void
+    {
+        $storage = $this->factory(scopes: new FixedScope(null))->create();
+
+        $refused = false;
+
+        try {
+            $storage->add($this->upload('hello'));
+        } catch (MissingScopeException) {
+            $refused = true;
+        }
+
+        Assert::true($refused);
+        Assert::same($this->store->writeCount(), 0);
+        Assert::null($this->ledger->find($this->blobOf((new \Rasuvaeff\Yii3Filestorage\Path\Sha256KeyGenerator())->generate(
+            DedupScope::TenantGroup->keyFor('common', null),
+            hash('sha256', 'hello'),
+        ))));
     }
 
     public function aGlobalScopeSharesAcrossTenants(): void

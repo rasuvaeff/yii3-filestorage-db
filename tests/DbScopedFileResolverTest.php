@@ -6,6 +6,7 @@ namespace Rasuvaeff\Yii3FilestorageDb\Tests;
 
 use Rasuvaeff\Yii3FilestorageDb\DbRepository;
 use Rasuvaeff\Yii3FilestorageDb\DbScopedFileResolver;
+use Rasuvaeff\Yii3FilestorageDb\Exception\MissingScopeException;
 use Rasuvaeff\Yii3FilestorageDb\FileTableName;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\FixedScope;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\SqliteDatabase;
@@ -94,9 +95,38 @@ final class DbScopedFileResolverTest
         Assert::null($this->resolver->findInScope('a', null));
     }
 
+    /**
+     * The repository and the resolver read a null scope the same way: never
+     * as "every tenant". The resolver matches `scope_id IS NULL`; a repository
+     * whose bound provider returns null refuses outright. Before 1.0 the
+     * repository dropped its predicate there, so the same null meant "nobody"
+     * to one class and "everybody" to the other.
+     */
+    public function aNullScopeIsNeverAWildcardInEitherClass(): void
+    {
+        $this->saveAs('tenant-a', 'a');
+
+        Assert::null($this->resolver->findInScope('a', null));
+
+        $refused = false;
+
+        try {
+            (new DbRepository($this->database->db, scopes: new FixedScope(null)))->find('a');
+        } catch (MissingScopeException) {
+            $refused = true;
+        }
+
+        Assert::true($refused);
+    }
+
+    /**
+     * A null scope writes through an unbound repository: that is what an
+     * unscoped application's rows look like. A bound provider returning null
+     * is refused, so it cannot produce one.
+     */
     private function saveAs(?string $scopeId, string $id): void
     {
-        (new DbRepository($this->database->db, scopes: new FixedScope($scopeId)))
+        (new DbRepository($this->database->db, scopes: $scopeId === null ? null : new FixedScope($scopeId)))
             ->save(SqliteDatabase::file($id));
     }
 }

@@ -25,6 +25,7 @@ use Rasuvaeff\Yii3Filestorage\Store\BlobLedgerInterface;
 use Rasuvaeff\Yii3Filestorage\Store\ContentAddressableStoreInterface;
 use Rasuvaeff\Yii3Filestorage\Store\StoredObjectId;
 use Rasuvaeff\Yii3Filestorage\Upload;
+use Rasuvaeff\Yii3FilestorageDb\Exception\MissingScopeException;
 use Throwable;
 
 /**
@@ -104,6 +105,8 @@ final readonly class DeduplicatingStorage implements StorageInterface
             throw new \InvalidArgumentException("Invalid group name \"{$groupName}\"");
         }
 
+        $scopeId = $this->scopeId();
+
         // A store name that is not this one means the caller wants a specific
         // physical target, and this class only knows how to share into its own.
         if ($storeName !== null && $storeName !== $this->store->name()) {
@@ -129,7 +132,7 @@ final readonly class DeduplicatingStorage implements StorageInterface
             // Positional on purpose: the generator is an injected interface, and
             // PHP binds named arguments to the implementation's parameter names.
             $this->keys->generate(
-                $this->scope->keyFor($groupName, $this->scopes?->currentScopeId()),
+                $this->scope->keyFor($groupName, $scopeId),
                 $hash,
                 // what the base facade would name the same file — and what
                 // `filestorage:deduplicate` derives from the type the row records
@@ -200,6 +203,29 @@ final readonly class DeduplicatingStorage implements StorageInterface
     public function content(File $file): ?string
     {
         return $this->unique->content($file);
+    }
+
+    /**
+     * The tenant the content key is built for: null only when no provider is
+     * bound. A bound provider returning null is a tenant that did not resolve,
+     * and keying its upload into the `shared` pool would join it to every
+     * other unresolved upload's blobs.
+     *
+     * @return non-empty-string|null
+     *
+     * @throws MissingScopeException
+     */
+    private function scopeId(): ?string
+    {
+        if (!$this->scopes instanceof FileScopeProviderInterface) {
+            return null;
+        }
+
+        return $this->scopes->currentScopeId() ?? throw new MissingScopeException(sprintf(
+            '%s is bound but returned no scope, and the content key of a deduplicated upload is built from the '
+            . 'tenant. Establish the tenant before adding files',
+            FileScopeProviderInterface::class,
+        ));
     }
 
     /**
