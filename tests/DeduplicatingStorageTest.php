@@ -232,6 +232,27 @@ final class DeduplicatingStorageTest
         ))));
     }
 
+    /**
+     * @return iterable<string, array{string, string}>
+     */
+    public static function zeroIntervalProvider(): iterable
+    {
+        yield 'zero grace' => ['deleteGracePeriod', 'PT0S'];
+        yield 'zero reservation ttl' => ['reservationTtl', 'PT0S'];
+    }
+
+    /**
+     * A zero grace period makes "scheduled" and "collectable" one instant,
+     * and a zero reservation TTL lets the sweep drop a claim mid-upload.
+     */
+    #[DataProvider('zeroIntervalProvider')]
+    public function anIntervalThatIsNotPositiveIsRefused(string $name, string $interval): void
+    {
+        Expect::exception(\InvalidArgumentException::class)->withMessageContaining($name);
+
+        $this->factory()->create(...[$name => new DateInterval($interval)]);
+    }
+
     public function aGlobalScopeSharesAcrossTenants(): void
     {
         $scopes = new FixedScope('tenant-a');

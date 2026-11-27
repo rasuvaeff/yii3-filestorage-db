@@ -44,6 +44,7 @@ use Symfony\Component\Console\Tester\CommandTester;
 use Testo\Assert;
 use Testo\Codecov\Covers;
 use Testo\Data\DataProvider;
+use Testo\Expect;
 use Testo\Lifecycle\AfterTest;
 use Testo\Lifecycle\BeforeTest;
 use Testo\Test;
@@ -377,6 +378,34 @@ final class DeduplicateCommandTest
         Assert::string($this->display($tester))->contains('returned no scope');
         Assert::same($this->repository->find('a')?->relativePath, $file->relativePath);
         Assert::same($this->store->writeCount(), $writes);
+    }
+
+    public function aZeroGracePeriodIsRefused(): void
+    {
+        Expect::exception(\InvalidArgumentException::class)->withMessageContaining('deleteGracePeriod');
+
+        new DeduplicateCommand(
+            stores: new StoreRegistry([$this->store]),
+            repository: $this->repository,
+            ledger: $this->ledger,
+            streams: $this->factory,
+            clock: new StaticClock($this->at('01:00')),
+            deleteGracePeriod: new DateInterval('PT0S'),
+        );
+    }
+
+    public function aZeroReservationTtlIsRefused(): void
+    {
+        Expect::exception(\InvalidArgumentException::class)->withMessageContaining('reservationTtl');
+
+        new DeduplicateCommand(
+            stores: new StoreRegistry([$this->store]),
+            repository: $this->repository,
+            ledger: $this->ledger,
+            streams: $this->factory,
+            clock: new StaticClock($this->at('01:00')),
+            reservationTtl: new DateInterval('PT0S'),
+        );
     }
 
     /**

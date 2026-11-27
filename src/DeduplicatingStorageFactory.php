@@ -57,6 +57,8 @@ final readonly class DeduplicatingStorageFactory
      * @param non-empty-string|null $storeName Defaults to the registry's default store.
      *
      * @throws InvalidConfigException When the store cannot deduplicate safely.
+     * @throws \InvalidArgumentException When `reservationTtl` or
+     *         `deleteGracePeriod` is not a positive interval.
      */
     public function create(
         DedupScope $scope = DedupScope::TenantGroup,

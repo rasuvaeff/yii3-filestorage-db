@@ -71,8 +71,13 @@ final readonly class DeduplicatingStorage implements StorageInterface
      *        would mean "hash everything", which is why it is not the default.
      * @param DateInterval $reservationTtl How long an uncommitted write keeps
      *        the blob alive. Long enough for the slowest upload you accept.
+     *        Must be positive.
      * @param DateInterval $deleteGracePeriod How long an unreferenced blob
-     *        waits before a collector may take it.
+     *        waits before a collector may take it. Must be positive: the join
+     *        of a blob that is losing its last reference is only safe against
+     *        a concurrent claim while the two are apart in time.
+     *
+     * @throws \InvalidArgumentException When an interval is not positive.
      */
     public function __construct(
         private StorageInterface $unique,
@@ -90,7 +95,10 @@ final readonly class DeduplicatingStorage implements StorageInterface
         private string $defaultGroup = 'common',
         private ?FileScopeProviderInterface $scopes = null,
         private ExtensionMap $extensions = new ExtensionMap(),
-    ) {}
+    ) {
+        PositiveInterval::require($reservationTtl, 'reservationTtl');
+        PositiveInterval::require($deleteGracePeriod, 'deleteGracePeriod');
+    }
 
     #[Override]
     public function add(

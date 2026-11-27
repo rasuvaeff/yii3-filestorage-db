@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Rasuvaeff\Yii3FilestorageDb;
 
+use DateInterval;
 use DateTimeImmutable;
 use Override;
 use Psr\Clock\ClockInterface;
@@ -53,6 +54,13 @@ final readonly class DbBlobLedger implements BlobLedgerInterface
     private string $blobs;
     private string $reservations;
 
+    /**
+     * @param DateInterval $deleteGracePeriod How long a blob that `commit()`
+     *        repointed a row away from waits before a collector may take it —
+     *        readers may still hold its old path. Must be positive.
+     *
+     * @throws \InvalidArgumentException When the grace period is not positive.
+     */
     public function __construct(
         private ConnectionInterface $db,
         private DbRepository $repository,
@@ -60,7 +68,9 @@ final readonly class DbBlobLedger implements BlobLedgerInterface
         FileTableName $fileTable = new FileTableName(),
         BlobTableName $blobTable = new BlobTableName(),
         BlobReservationTableName $reservationTable = new BlobReservationTableName(),
+        private DateInterval $deleteGracePeriod = new DateInterval('PT1H'),
     ) {
+        PositiveInterval::require($deleteGracePeriod, 'deleteGracePeriod');
         $this->files = $fileTable->value;
         $this->blobs = $blobTable->value;
         $this->reservations = $reservationTable->value;
@@ -144,6 +154,14 @@ final readonly class DbBlobLedger implements BlobLedgerInterface
                 throw new LedgerException("Unknown reservation for blob \"{$reservation->blob->key()}\"");
             }
 
+            // The blob this row pointed at before, read through the scoped
+            // repository like everything else. A row repointed to another
+            // content key — `filestorage:deduplicate` with another scope, key
+            // generator or extension map — leaves that blob behind, and
+            // nothing else would ever schedule it: it stayed `active` with no
+            // reference, invisible to the collector and to the orphan sweep.
+            $previous = $this->repository->findBlobRowId($file->id);
+
             $this->repository->save($file, $reservation->blob);
 
             // Guarded and counted, like every other transition here. Without
@@ -152,6 +170,11 @@ final readonly class DbBlobLedger implements BlobLedgerInterface
             // the file row would be inserted anyway. The blob would then never
             // be scheduled again (scheduleIfUnused() no-ops on a missing row)
             // and the object would leak for good.
+            //
+            // Not from `deleting` either. The join reads the state with a plain
+            // SELECT, so a collector whose snapshot did not yet see this
+            // writer's reservation can have claimed the blob since; activating
+            // it then erased the lease while the collector deleted the bytes.
             //
             // The lease columns are cleared too: an active blob holding a
             // stale lease makes find() report a lease nobody holds.
@@ -164,19 +187,33 @@ final readonly class DbBlobLedger implements BlobLedgerInterface
                     'lease_expires_at' => null,
                     'updated_at' => Timestamps::toStorage($this->clock->now()),
                 ],
-                ['id' => $id],
+                ['and', ['id' => $id], ['not', ['state' => BlobState::Deleting->value]]],
             )->execute();
 
             // MySQL reports *changed* rows, not matched ones (CLIENT_FOUND_ROWS
             // is off by default, and the connection is the application's). A
             // second commit joining an active blob at the same instant writes
-            // only values the row already holds and reads 0 there. The re-read
-            // runs inside this transaction, after the UPDATE has locked the
-            // row, so 0 plus a present row means "unchanged", not "gone".
-            if ($activated === 0 && $this->blobRow($id) === null) {
-                throw new LedgerException(
-                    "Blob \"{$reservation->blob->key()}\" disappeared while its reservation was being committed",
-                );
+            // only values the row already holds and reads 0 there. So a 0 is
+            // settled by reading the row again — with a locking read: on MySQL
+            // under REPEATABLE READ a plain SELECT answers from the snapshot
+            // the transaction started with, which still shows the state the
+            // guard just failed on.
+            if ($activated === 0) {
+                $current = $this->currentBlobRow($id);
+                if ($current === null) {
+                    throw new LedgerException(
+                        "Blob \"{$reservation->blob->key()}\" disappeared while its reservation was being committed",
+                    );
+                }
+                if ($this->state($current) === BlobState::Deleting) {
+                    throw new LedgerException(
+                        "Blob \"{$reservation->blob->key()}\" is being deleted; its reservation cannot be committed",
+                    );
+                }
+            }
+
+            if ($previous !== null && $previous !== $id) {
+                $this->scheduleIfUnused($previous, $this->clock->now()->add($this->deleteGracePeriod));
             }
         });
     }
@@ -364,11 +401,6 @@ final readonly class DbBlobLedger implements BlobLedgerInterface
         string $now,
     ): void {
         $state = $this->state($row);
-        if (!$state->isJoinable()) {
-            throw new BlobBusyException(
-                "Blob \"{$blob->key()}\" is being deleted. Retry once the deletion lease expires",
-            );
-        }
 
         $storedHash = $this->string($row, 'content_hash');
         $storedSize = $this->integer($row, 'size');
@@ -377,6 +409,12 @@ final readonly class DbBlobLedger implements BlobLedgerInterface
                 "Blob \"{$blob->key()}\" already holds different content"
                 . " (hash {$storedHash}, {$storedSize} bytes)",
             );
+        }
+
+        if ($state === BlobState::Deleting) {
+            $this->joinExpiredDeletion($id, $blob, $now);
+
+            return;
         }
 
         if ($state !== BlobState::PendingDelete) {
@@ -415,6 +453,51 @@ final readonly class DbBlobLedger implements BlobLedgerInterface
             // either way the caller retries against a fresh read.
             throw new BlobBusyException(
                 "Blob \"{$blob->key()}\" changed state while it was being joined. Retry",
+            );
+        }
+    }
+
+    /**
+     * Takes a `deleting` blob back from a collector whose lease has run out.
+     *
+     * A collector that died between its claim and its delete leaves the row
+     * `deleting` until the next `filestorage:gc`, and refusing every writer of
+     * that content until then turned one crashed run into an outage of the
+     * content. Joining is safe since the collector deletes through the
+     * quarantine: the writer re-publishes with `putIfAbsent()`, a stale
+     * collector's `completeDeletion()` is refused because its token is gone,
+     * and it restores — keeping the bytes the writer put back.
+     *
+     * Guarded on the expiry in the statement itself; a live lease, or a row
+     * another writer or collector changed first, is still busy.
+     *
+     * @param non-empty-string $id
+     */
+    private function joinExpiredDeletion(string $id, BlobId $blob, string $now): void
+    {
+        $joined = $this->db->createCommand()->update(
+            $this->blobs,
+            [
+                // a row saved against the blob after the claim keeps it active,
+                // exactly as on the revival from `pending_delete`
+                'state' => $this->count($this->files, $id) > 0
+                    ? BlobState::Active->value
+                    : BlobState::Writing->value,
+                'delete_after' => null,
+                'lease_token' => null,
+                'lease_expires_at' => null,
+                'updated_at' => $now,
+            ],
+            [
+                'and',
+                ['id' => $id, 'state' => BlobState::Deleting->value],
+                ['<=', 'lease_expires_at', $now],
+            ],
+        )->execute();
+
+        if ($joined === 0) {
+            throw new BlobBusyException(
+                "Blob \"{$blob->key()}\" is being deleted. Retry once the deletion lease expires",
             );
         }
     }
@@ -544,6 +627,31 @@ final readonly class DbBlobLedger implements BlobLedgerInterface
     {
         /** @var array<string, mixed>|null $row */
         $row = (new Query($this->db))->from($this->blobs)->where(['id' => $id])->one();
+
+        return $row;
+    }
+
+    /**
+     * The blob row as it is now, not as this transaction's snapshot saw it.
+     *
+     * `FOR UPDATE` on MySQL and PostgreSQL: on MySQL under REPEATABLE READ a
+     * plain SELECT inside a transaction answers from the snapshot taken at its
+     * first read. SQLite has no `FOR` clause and needs none — it serialises
+     * writers on the whole database.
+     *
+     * @param non-empty-string $id
+     *
+     * @return array<string, mixed>|null
+     */
+    private function currentBlobRow(string $id): ?array
+    {
+        $query = (new Query($this->db))->from($this->blobs)->where(['id' => $id]);
+        if ($this->db->getDriverName() !== 'sqlite') {
+            $query->for('UPDATE');
+        }
+
+        /** @var array<string, mixed>|null $row */
+        $row = $query->one();
 
         return $row;
     }

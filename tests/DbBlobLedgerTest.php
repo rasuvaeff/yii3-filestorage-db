@@ -16,6 +16,7 @@ use Rasuvaeff\Yii3Filestorage\Store\BlobToken;
 use Rasuvaeff\Yii3FilestorageDb\BlobRowId;
 use Rasuvaeff\Yii3FilestorageDb\DbBlobLedger;
 use Rasuvaeff\Yii3FilestorageDb\DbRepository;
+use Rasuvaeff\Yii3FilestorageDb\PositiveInterval;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\FixedScope;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\InterceptingConnection;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\SqliteDatabase;
@@ -33,6 +34,7 @@ use Yiisoft\Test\Support\Clock\StaticClock;
 #[Test]
 #[Covers(DbBlobLedger::class)]
 #[Covers(BlobRowId::class)]
+#[Covers(PositiveInterval::class)]
 final class DbBlobLedgerTest
 {
     private SqliteDatabase $database;
@@ -491,6 +493,140 @@ final class DbBlobLedgerTest
     }
 
     /**
+     * The probe from the 1.0 review (`remigrate.php`): `filestorage:deduplicate`
+     * repointing a row that already shared a blob — another `--scope`, another
+     * key generator — left the old blob `active` with no reference, where
+     * neither the blob collector nor the orphan sweep would ever take it.
+     */
+    public function repointingACommittedRowSchedulesTheBlobItLeft(): void
+    {
+        $this->ledger->commit($this->reserve(), SqliteDatabase::file('a'));
+        $this->ledger->commit($this->reserveOther(), $this->fileOnOtherBlob('a'));
+
+        $left = $this->ledger->find($this->blob());
+        Assert::same($left?->state, BlobState::PendingDelete);
+        Assert::same($left?->referenceCount, 0);
+        Assert::same($left?->deleteAfter?->format('H:i'), '01:00');
+        Assert::same($this->ledger->find($this->otherBlob())?->state, BlobState::Active);
+        Assert::true($this->ledger->claimForDeletion($this->at('01:00'), $this->at('01:05')) instanceof BlobLease);
+    }
+
+    public function repointingLeavesABlobOtherRowsStillReferenceActive(): void
+    {
+        $this->ledger->commit($this->reserve(), SqliteDatabase::file('a'));
+        $this->ledger->commit($this->reserve(), SqliteDatabase::file('b'));
+        $this->ledger->commit($this->reserveOther(), $this->fileOnOtherBlob('a'));
+
+        Assert::same($this->ledger->find($this->blob())?->state, BlobState::Active);
+        Assert::same($this->ledger->find($this->blob())?->referenceCount, 1);
+    }
+
+    public function recommittingARowToTheSameBlobDoesNotScheduleIt(): void
+    {
+        $this->ledger->commit($this->reserve(), SqliteDatabase::file('a'));
+        $this->ledger->commit($this->reserve(), SqliteDatabase::file('a'));
+
+        Assert::same($this->ledger->find($this->blob())?->state, BlobState::Active);
+        Assert::null($this->ledger->find($this->blob())?->deleteAfter);
+    }
+
+    /**
+     * A collector that died between its claim and its delete leaves the row
+     * `deleting` until the next `gc`. Once the lease has expired a writer
+     * joins rather than failing until then: since 0.9 the collector deletes
+     * through the quarantine, a stale collector's `completeDeletion()` is
+     * refused, and it restores — keeping the bytes the writer re-published.
+     */
+    public function aWriterJoinsABlobWhoseDeletionLeaseExpired(): void
+    {
+        $this->ledger->release($this->reserve(), $this->at('01:00'));
+        $lease = $this->ledger->claimForDeletion($this->at('01:00'), $this->at('01:05'));
+
+        $later = $this->ledgerAt('01:05');
+        $reservation = $later->reserve($this->blob(), SqliteDatabase::HASH, 12, $this->at('01:20'));
+
+        $record = $later->find($this->blob());
+        Assert::same($record?->state, BlobState::Writing);
+        Assert::null($record?->leaseExpiresAt);
+        Assert::false($this->ledger->completeDeletion($lease ?? $this->forgedLease()), 'the stale lease must not delete');
+        Assert::false($this->ledger->abandonDeletion($lease ?? $this->forgedLease(), $this->at('02:00')));
+
+        $later->commit($reservation, SqliteDatabase::file('a'));
+        Assert::same($later->find($this->blob())?->state, BlobState::Active);
+    }
+
+    /**
+     * The join and the claim are not serialised by a lock: a writer can read
+     * an `active` blob, and a collector with a snapshot that does not see the
+     * writer's uncommitted reservation can claim it after the last reference
+     * goes. `commit()` used to activate that `deleting` row regardless,
+     * erasing the lease while the collector deleted the bytes.
+     */
+    public function commitRefusesABlobAClaimTookAfterTheReservation(): void
+    {
+        $reservation = $this->reserve();
+        $this->database->db->createCommand()->update(
+            'filestorage_blob',
+            ['state' => BlobState::Deleting->value, 'lease_token' => 'cafebabecafebabe', 'lease_expires_at' => '2026-01-01T01:05:00.000000+00:00'],
+            ['id' => BlobRowId::for($this->blob())],
+        )->execute();
+
+        try {
+            $this->ledger->commit($reservation, SqliteDatabase::file('a'));
+            Assert::fail('Expected LedgerException');
+        } catch (LedgerException $e) {
+            Assert::string($e->getMessage())->contains('is being deleted');
+        }
+
+        $record = $this->ledger->find($this->blob());
+        Assert::same($record?->state, BlobState::Deleting);
+        Assert::same($record?->reservationCount, 1, 'the reservation is rolled back, not consumed');
+        Assert::null($this->repository->find('a'));
+        Assert::true($this->ledger->completeDeletion(new BlobLease($this->blob(), new BlobToken('cafebabecafebabe'), $this->at('01:05'))) === false);
+    }
+
+    /**
+     * @return iterable<string, array{string}>
+     */
+    public static function nonPositiveIntervalProvider(): iterable
+    {
+        yield 'zero' => ['PT0S'];
+        yield 'zero days' => ['P0D'];
+    }
+
+    /**
+     * A zero grace period makes "scheduled" and "collectable" the same
+     * instant, and the join ↔ claim race above stops being theoretical.
+     */
+    #[DataProvider('nonPositiveIntervalProvider')]
+    public function aGracePeriodThatIsNotPositiveIsRefused(string $interval): void
+    {
+        Expect::exception(\InvalidArgumentException::class)->withMessageContaining('deleteGracePeriod');
+
+        new DbBlobLedger(
+            db: $this->database->db,
+            repository: $this->repository,
+            clock: new StaticClock($this->at('00:00')),
+            deleteGracePeriod: new \DateInterval($interval),
+        );
+    }
+
+    public function anInvertedGracePeriodIsRefused(): void
+    {
+        $interval = new \DateInterval('PT1H');
+        $interval->invert = 1;
+
+        Expect::exception(\InvalidArgumentException::class)->withMessageContaining('deleteGracePeriod');
+
+        new DbBlobLedger(
+            db: $this->database->db,
+            repository: $this->repository,
+            clock: new StaticClock($this->at('00:00')),
+            deleteGracePeriod: $interval,
+        );
+    }
+
+    /**
      * Two blobs with the same content in different stores are two rows. A
      * ledger keyed by hash would have merged them, and a delete in one store
      * would have removed what the other still points at.
@@ -918,6 +1054,11 @@ final class DbBlobLedgerTest
         yield 'a number' => [['content_hash' => 5], null];
         yield 'null' => [['content_hash' => null], null];
         yield 'missing' => [[], null];
+    }
+
+    private function ledgerAt(string $time): DbBlobLedger
+    {
+        return new DbBlobLedger($this->database->db, $this->repository, new StaticClock($this->at($time)));
     }
 
     private function ledgerOver(InterceptingConnection $connection): DbBlobLedger

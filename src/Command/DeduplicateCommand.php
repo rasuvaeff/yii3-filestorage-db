@@ -22,6 +22,7 @@ use Rasuvaeff\Yii3Filestorage\Upload;
 use Rasuvaeff\Yii3FilestorageDb\DbRepository;
 use Rasuvaeff\Yii3FilestorageDb\DedupScope;
 use Rasuvaeff\Yii3FilestorageDb\Exception\InvalidFileRowException;
+use Rasuvaeff\Yii3FilestorageDb\PositiveInterval;
 use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputInterface;
@@ -80,6 +81,8 @@ final class DeduplicateCommand extends Command
         private readonly DateInterval $deleteGracePeriod = new DateInterval('PT1H'),
         private readonly ?ExtensionMap $extensions = null,
     ) {
+        PositiveInterval::require($reservationTtl, 'reservationTtl');
+        PositiveInterval::require($deleteGracePeriod, 'deleteGracePeriod');
         parent::__construct();
     }
 
