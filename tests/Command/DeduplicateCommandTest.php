@@ -34,6 +34,7 @@ use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Tester\CommandTester;
 use Testo\Assert;
 use Testo\Codecov\Covers;
+use Testo\Data\DataProvider;
 use Testo\Lifecycle\AfterTest;
 use Testo\Lifecycle\BeforeTest;
 use Testo\Test;
@@ -103,6 +104,27 @@ final class DeduplicateCommandTest
         Assert::same($this->store->bytesAt($blob->relativePath()), 'hello');
         Assert::same($this->ledger->find($blob)?->referenceCount, 1);
         Assert::same($unique === $blob->relativePath(), expected: false);
+    }
+
+    /**
+     * `ArrayInput` keeps `1` and `'1'` on an option that takes no value; read
+     * strictly, a migration started from code would silently stay a dry run.
+     */
+    #[DataProvider('truthyFlagProvider')]
+    public function aTruthyApplyIsReadAsSet(int|string $flag): void
+    {
+        $this->store('a', 'hello');
+        $blob = $this->blobFor('common', 'hello');
+
+        Assert::same($this->run(['--apply' => $flag])->getStatusCode(), Command::SUCCESS);
+
+        Assert::same($this->repository->find('a')?->relativePath, $blob->relativePath());
+    }
+
+    public static function truthyFlagProvider(): iterable
+    {
+        yield 'integer one' => [1];
+        yield 'string one' => ['1'];
     }
 
     /**

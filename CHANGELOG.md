@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- `--apply` of the deduplicate command stays on when an input built in code (`ArrayInput`) passes `1` or `'1'`. A change on `master` after 0.1.0 had made it a dry run; no release carried it.
 - `composer mutation` now runs Infection with `--with-uncovered`, so code the tests execute without naming it in `#[Covers]` is mutated and counted (overall MSI was 83% when measured this way, now 93% against `minMsi` 89). Added tests for the add failure path (`AddException`, release of the reservation), `remove()` failures, the digest pass (declared size over the cap, a stalled body), the ledger's insert-race retry, the lost-activation and busy-revive races (a `ConnectionInterface` decorator injects them), the ledger row readers, index columns of the migrations, claim order, and the command's failure, advice and summary messages. `infection.json5` gained the template's signature-default ignore regex and disabled `PublicVisibility`/`ProtectedVisibility`. `DbRepository::files()` now lists its parameters one per line (no behaviour change) so the ignore regex matches its default.
 
 ## 0.1.0 — 2026-08-08
