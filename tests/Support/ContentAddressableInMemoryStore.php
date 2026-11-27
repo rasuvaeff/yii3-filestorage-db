@@ -38,6 +38,9 @@ final class ContentAddressableInMemoryStore implements ContentAddressableStoreIn
     /** @var (Closure(StreamInterface): StreamInterface)|null */
     private ?Closure $nextStreamWrapper = null;
 
+    /** @var int<0, max>|null */
+    private ?int $reuseSize = null;
+
     public function __construct(private readonly InMemoryStore $inner) {}
 
     /**
@@ -45,6 +48,18 @@ final class ContentAddressableInMemoryStore implements ContentAddressableStoreIn
      * protocol is the case the reservation and its release exist for, and it
      * cannot be produced any other way in a single process.
      */
+    /**
+     * Reports this size for an existing object instead of its real one — a
+     * real store that skips the size check on reuse when the upload declared
+     * none would hand back whatever a truncated object measures.
+     *
+     * @param int<0, max> $size
+     */
+    public function misreportReuseSize(int $size): void
+    {
+        $this->reuseSize = $size;
+    }
+
     public function failNextPut(): void
     {
         $this->failNextPut = true;
@@ -90,7 +105,7 @@ final class ContentAddressableInMemoryStore implements ContentAddressableStoreIn
 
             return new StoreResult(
                 relativePath: $object->relativePath,
-                size: \strlen($existing),
+                size: $this->reuseSize ?? \strlen($existing),
                 created: false,
             );
         }

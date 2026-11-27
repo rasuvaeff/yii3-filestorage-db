@@ -12,6 +12,7 @@ use Psr\Http\Message\StreamInterface;
 use Rasuvaeff\Yii3Filestorage\Exception\AddException;
 use Rasuvaeff\Yii3Filestorage\Exception\BlobBusyException;
 use Rasuvaeff\Yii3Filestorage\Exception\RemoveException;
+use Rasuvaeff\Yii3Filestorage\Exception\UploadSizeException;
 use Rasuvaeff\Yii3Filestorage\File;
 use Rasuvaeff\Yii3Filestorage\Id\IdGeneratorInterface;
 use Rasuvaeff\Yii3Filestorage\Mime\ExtensionMap;
@@ -24,6 +25,7 @@ use Rasuvaeff\Yii3Filestorage\Store\BlobId;
 use Rasuvaeff\Yii3Filestorage\Store\BlobLedgerInterface;
 use Rasuvaeff\Yii3Filestorage\Store\ContentAddressableStoreInterface;
 use Rasuvaeff\Yii3Filestorage\Store\StoredObjectId;
+use Rasuvaeff\Yii3Filestorage\Store\StoreRegistry;
 use Rasuvaeff\Yii3Filestorage\Upload;
 use Rasuvaeff\Yii3FilestorageDb\Exception\MissingScopeException;
 use Throwable;
@@ -53,9 +55,11 @@ use Throwable;
  * 5. **Release on any failure.** Which schedules the blob rather than deleting
  *    it: another writer may be holding the same bytes right now.
  *
- * `remove()` never deletes bytes either. It drops the row and the reference;
- * the collector does the rest, after a grace period. That asymmetry — writes
- * are eager, deletes are deferred — is the whole safety argument.
+ * `remove()` never deletes shared bytes either. It drops the row and the
+ * reference; the collector does the rest, after a grace period. That asymmetry
+ * — writes are eager, deletes are deferred — is the whole safety argument. A
+ * row on the unique path (too large to hash, or in another store) owns its
+ * object outright, and its bytes go with it, as with the base facade.
  *
  * @api
  */
@@ -77,6 +81,11 @@ final readonly class DeduplicatingStorage implements StorageInterface
      *        of a blob that is losing its last reference is only safe against
      *        a concurrent claim while the two are apart in time.
      *
+     * @param StoreRegistry|null $stores Where `remove()` deletes the object
+     *        of a unique-path row. Without it only rows in this class's own
+     *        store get their bytes deleted; the others are left to
+     *        `filestorage:gc --orphans`.
+     *
      * @throws \InvalidArgumentException When an interval is not positive.
      */
     public function __construct(
@@ -95,6 +104,7 @@ final readonly class DeduplicatingStorage implements StorageInterface
         private string $defaultGroup = 'common',
         private ?FileScopeProviderInterface $scopes = null,
         private ExtensionMap $extensions = new ExtensionMap(),
+        private ?StoreRegistry $stores = null,
     ) {
         PositiveInterval::require($reservationTtl, 'reservationTtl');
         PositiveInterval::require($deleteGracePeriod, 'deleteGracePeriod');
@@ -125,13 +135,24 @@ final readonly class DeduplicatingStorage implements StorageInterface
         $mimeType = $this->mimeTypeDetector->detect($upload);
         $policy->assertAcceptable($upload, $mimeType);
 
-        $digest = $this->digestWithinLimit($upload);
+        try {
+            $digest = $this->digestWithinLimit($upload, $policy->maxBytes);
+        } catch (UploadSizeException $e) {
+            throw $e;
+        } catch (Throwable $e) {
+            // A body that cannot be read to the end, or rewound after it was,
+            // is this add failing — and `add()` promises AddException for
+            // that, not the stream's own exception.
+            throw new AddException('Failed to read the upload while hashing it', 0, $e);
+        }
+
         if ($digest === null) {
             // Too large to address by content. A unique object is the honest
-            // outcome, and the caller cannot tell the difference. The store
-            // name is this one or null, both of which the base facade resolves
-            // to the same physical target.
-            return $this->unique->add($upload, $groupName, null, $description, $metadata);
+            // outcome, and the caller cannot tell the difference — in this
+            // store, named explicitly: left null, the base facade picks the
+            // registry's default, which is a different physical target
+            // whenever deduplication was configured for another store.
+            return $this->unique->add($upload, $groupName, $this->store->name(), $description, $metadata);
         }
 
         [$hash, $size] = $digest;
@@ -165,10 +186,43 @@ final readonly class DeduplicatingStorage implements StorageInterface
     public function remove(string $id): bool
     {
         try {
-            return $this->ledger->releaseFile($id, $this->clock->now()->add($this->deleteGracePeriod));
+            $file = $this->unique->find($id);
+            $released = $this->ledger->releaseFile($id, $this->clock->now()->add($this->deleteGracePeriod));
         } catch (Throwable $e) {
             throw new RemoveException("Failed to release file \"{$id}\"", 0, $e);
         }
+
+        if (!$released || !$file instanceof File) {
+            return $released;
+        }
+
+        // Decided on the path the row was read with. A shared row's path is a
+        // ledger blob, and those bytes belong to the collector. A row that
+        // `filestorage:deduplicate` repointed between the read and the
+        // release was read at its old unique path — an orphan from that moment
+        // on, so deleting it is what the sweep would have done later.
+        if ($this->ledger->find(BlobId::create($file->storeName, $file->relativePath)) !== null) {
+            return true;
+        }
+
+        $store = $this->stores?->get($file->storeName)
+            ?? ($file->storeName === $this->store->name() ? $this->store : null);
+        if ($store === null) {
+            return true;
+        }
+
+        try {
+            $store->delete($file);
+        } catch (Throwable $e) {
+            throw new RemoveException(
+                "Removed metadata for \"{$id}\" but could not delete \"{$file->relativePath}\" "
+                . "from store \"{$file->storeName}\"; it is now an orphan for filestorage:gc",
+                0,
+                $e,
+            );
+        }
+
+        return true;
     }
 
     #[Override]
@@ -309,14 +363,20 @@ final readonly class DeduplicatingStorage implements StorageInterface
      * The complete SHA-256 and the byte count, or null when the upload is
      * larger than dedup is willing to read twice.
      *
+     * Also stops at the group's `maxBytes`, with the exception the base facade
+     * throws for it: a body that declares no length passes the policy check
+     * unmeasured, and the policy limit is usually far below `dedupMaxBytes`.
+     *
      * Stops at the limit rather than hashing to the end and then discarding
      * the answer: the point of the cap is not to read the tail at all. The size
      * comes from this pass because `Upload::size()` is null for a body that
      * never declares its length.
      *
      * @return array{non-empty-string, int<0, max>}|null
+     *
+     * @throws UploadSizeException
      */
-    private function digestWithinLimit(Upload $upload): ?array
+    private function digestWithinLimit(Upload $upload, int $maxBytes): ?array
     {
         $declared = $upload->size();
         if ($declared !== null && $declared > $this->dedupMaxBytes) {
@@ -335,6 +395,9 @@ final readonly class DeduplicatingStorage implements StorageInterface
 
 
             $read += \strlen($chunk);
+            if ($maxBytes > 0 && $read > $maxBytes) {
+                throw new UploadSizeException("Upload exceeds the {$maxBytes} byte limit for this group");
+            }
             if ($read > $this->dedupMaxBytes) {
                 $stream->rewind();
 

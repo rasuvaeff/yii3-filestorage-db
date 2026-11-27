@@ -113,6 +113,7 @@ final readonly class DeduplicatingStorageFactory
             defaultGroup: $defaultGroup,
             scopes: $this->scopes,
             extensions: $this->extensions ?? new ExtensionMap(),
+            stores: $this->stores,
         );
     }
 }

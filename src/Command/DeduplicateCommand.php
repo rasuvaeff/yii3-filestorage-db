@@ -423,7 +423,9 @@ final class DeduplicateCommand extends Command
                 groupName: $file->groupName,
                 relativePath: $result->relativePath,
                 originalName: $file->originalName,
-                size: $result->size,
+                // the counted size, which the reservation went out with — on
+                // the reuse branch the store measures the existing object
+                size: $size,
                 createdAt: $file->createdAt,
                 externalId: $result->externalId,
                 mimeType: $file->mimeType,

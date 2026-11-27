@@ -12,6 +12,7 @@ use Rasuvaeff\Yii3Filestorage\Exception\InvalidConfigException;
 use Rasuvaeff\Yii3Filestorage\Exception\PolicyViolationException;
 use Rasuvaeff\Yii3Filestorage\Exception\RemoveException;
 use Rasuvaeff\Yii3Filestorage\Exception\StoreException;
+use Rasuvaeff\Yii3Filestorage\Exception\UploadSizeException;
 use Rasuvaeff\Yii3Filestorage\Id\Uuid7IdGenerator;
 use Rasuvaeff\Yii3Filestorage\Mime\ExtensionMap;
 use Rasuvaeff\Yii3Filestorage\Mime\FinfoMimeTypeDetector;
@@ -186,6 +187,49 @@ final class DeduplicatingStorageTest
         Assert::same($this->store->writeCount(), 2);
         Assert::null($this->ledger->find($this->blobOf($first->relativePath)));
         Assert::null($first->contentHash, 'the unique path does not hash unless asked to');
+    }
+
+    /**
+     * The probe from the 1.0 review (`unique.php`): a file above the cap took
+     * the unique path, and removing it dropped the row and left the bytes —
+     * where the base facade deletes them. The consumer must not see a
+     * difference.
+     */
+    public function removingAFileOnTheUniquePathDeletesItsBytes(): void
+    {
+        $storage = $this->factory()->create(dedupMaxBytes: 4);
+        $file = $storage->add($this->upload('hello'));
+
+        Assert::true($storage->remove($file->id));
+
+        Assert::null($this->store->bytesAt($file->relativePath));
+        Assert::null($this->repository->find($file->id));
+    }
+
+    public function removingAFileInAnotherStoreDeletesItsBytesThere(): void
+    {
+        $other = new InMemoryStore('archive', $this->factory, new StaticClock($this->at('00:00')));
+        $storage = $this->factory(stores: new StoreRegistry([$this->store, $other]))->create();
+        $file = $storage->add($this->upload('hello'), storeName: 'archive');
+
+        Assert::true($storage->remove($file->id));
+
+        Assert::false($other->exists($file));
+    }
+
+    /**
+     * A shared row's path is a ledger blob, and those bytes are only ever
+     * deleted by a collector. Checked against the path the row was read
+     * with, so a row repointed in between can only make an orphan go, never
+     * a blob.
+     */
+    public function removingASharedRowNeverDeletesItsBytes(): void
+    {
+        $file = $this->storage->add($this->upload('hello'));
+
+        Assert::true($this->storage->remove($file->id));
+
+        Assert::same($this->store->bytesAt($file->relativePath), 'hello');
     }
 
     /**
@@ -683,5 +727,68 @@ final class DeduplicatingStorageTest
 
         Assert::same($file->size, 5);
         Assert::same($file->contentHash, hash('sha256', 'hello'));
+    }
+
+    /**
+     * Too large to hash, so the unique path — but in the store deduplication
+     * was configured for, not the registry's default. The two used to be
+     * assumed to be one physical target.
+     */
+    public function anUploadTooLargeToHashStaysInTheDeduplicatingStore(): void
+    {
+        $other = new InMemoryStore('archive', $this->factory, new StaticClock($this->at('00:00')));
+        $storage = $this->factory(stores: new StoreRegistry([$other, $this->store], 'archive'))
+            ->create(storeName: 'upload', dedupMaxBytes: 4);
+
+        $file = $storage->add($this->upload('hello'));
+
+        Assert::same($file->storeName, 'upload');
+        Assert::same($this->store->bytesAt($file->relativePath), 'hello');
+    }
+
+    /**
+     * A body that does not declare its length is bounded by the group's
+     * `maxBytes` while it is hashed, not only by `dedupMaxBytes` — the policy
+     * limit is usually far smaller, and reading 100 MB to refuse 1 MB is the
+     * cost the policy exists to avoid. The base facade's exception, before
+     * anything is reserved.
+     */
+    public function anUndeclaredBodyOverThePolicyLimitIsRefusedWhileHashing(): void
+    {
+        $storage = $this->factory(policies: PolicyRegistry::fromArray(['*' => ['maxBytes' => 300_000]]))->create();
+        $stream = new SpyStream($this->factory->createStream(str_repeat('x', 900_000)));
+
+        try {
+            $storage->add(Upload::fromStream(new UnsizedStream($stream), 'a.txt', $this->factory));
+            Assert::fail('Expected UploadSizeException');
+        } catch (UploadSizeException $e) {
+            Assert::string($e->getMessage())->contains('300000 byte limit');
+        }
+
+        Assert::same($this->store->writeCount(), 0);
+        Assert::same((new \Yiisoft\Db\Query\Query($this->database->db))->from('filestorage_blob_reservation')->count(), 0);
+        Assert::true($stream->tell() < 900_000, 'the tail must not have been read');
+    }
+
+    /**
+     * A stream that cannot be rewound after hashing is the add failing, and
+     * the caller is promised an `AddException` for that — not the stream's
+     * own exception.
+     */
+    public function aStreamThatCannotBeRewoundIsAnAddException(): void
+    {
+        $stream = new SpyStream($this->factory->createStream('hello'), rewindFailsAfterRead: true);
+        // no detector: it reads the head and rewinds too, exactly as in the
+        // base facade, and this is about the hashing pass
+        $storage = $this->factory(mimeTypeDetector: new NoMimeTypeDetector())->create();
+
+        try {
+            $storage->add(Upload::fromStream($stream, 'a.txt', $this->factory));
+            Assert::fail('Expected AddException');
+        } catch (AddException $e) {
+            Assert::instanceOf($e->getPrevious(), \RuntimeException::class);
+        }
+
+        Assert::same($this->store->writeCount(), 0);
     }
 }

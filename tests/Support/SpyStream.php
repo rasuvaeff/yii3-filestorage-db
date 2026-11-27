@@ -27,6 +27,7 @@ final class SpyStream implements StreamInterface
         private readonly StreamInterface $inner,
         private readonly ?int $reportedSize = null,
         private readonly bool $neverEof = false,
+        private readonly bool $rewindFailsAfterRead = false,
     ) {}
 
     #[Override]
@@ -81,6 +82,9 @@ final class SpyStream implements StreamInterface
     public function rewind(): void
     {
         $this->events[] = 'rewind';
+        if ($this->rewindFailsAfterRead && $this->hasRead) {
+            throw new \RuntimeException('Stream is not seekable');
+        }
         $this->stallEnded = $this->stallEnded || $this->hasRead;
         $this->inner->rewind();
     }

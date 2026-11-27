@@ -496,6 +496,24 @@ final class DeduplicateCommandTest
         Assert::same($tester->getStatusCode(), Command::SUCCESS);
     }
 
+    /**
+     * The row gets the size counted while hashing — the number the ledger was
+     * given — not the store's answer on the reuse branch, which measures the
+     * object already there. The live `add()` does the same for the same
+     * reason.
+     */
+    public function theRowGetsTheCountedSizeNotTheReusedObjects(): void
+    {
+        $this->store('a', 'hello');
+        $this->store('b', 'hello');
+        $this->run(['--apply' => true, '--limit' => '1']);
+        $this->store->misreportReuseSize(3);
+
+        $this->run(['--apply' => true, '--after' => 'a']);
+
+        Assert::same($this->repository->find('b')?->size, 5);
+    }
+
     public function theSkipMessageNamesTheRowAndItsSize(): void
     {
         $this->store('a', 'hello');
