@@ -10,6 +10,7 @@ use Rasuvaeff\Yii3FilestorageDb\FileTableName;
 use Rasuvaeff\Yii3FilestorageDb\Migration\M260807000000CreateFilestorageFileTable;
 use Rasuvaeff\Yii3FilestorageDb\Migration\M260807000001CreateFilestorageBlobTables;
 use Rasuvaeff\Yii3FilestorageDb\Migration\M261127000000AddFilestorageFileStorePathIndex;
+use Rasuvaeff\Yii3FilestorageDb\Migration\M261128000000MakeFilestorageFileScopeIdCaseSensitive;
 use Testo\Assert;
 use Testo\Codecov\Covers;
 use Testo\Lifecycle\AfterTest;
@@ -27,6 +28,7 @@ use Yiisoft\Test\Support\SimpleCache\MemorySimpleCache;
 #[Covers(M260807000000CreateFilestorageFileTable::class)]
 #[Covers(M260807000001CreateFilestorageBlobTables::class)]
 #[Covers(M261127000000AddFilestorageFileStorePathIndex::class)]
+#[Covers(M261128000000MakeFilestorageFileScopeIdCaseSensitive::class)]
 final class MigrationTest
 {
     private ConnectionInterface $db;
@@ -195,6 +197,23 @@ final class MigrationTest
         $index->down($this->builder);
         Assert::false(\in_array('idx_filestorage_file_store_path', $this->indexNames('filestorage_file'), strict: true));
         Assert::notNull($this->db->getTableSchema('filestorage_file', true));
+    }
+
+    /**
+     * SQLite compares `=` byte for byte already; the collation change is a
+     * MySQL statement, and anywhere else up and down leave the column alone.
+     * The MySQL leg of the cross-database suite runs the real thing.
+     */
+    public function theScopeCollationMigrationLeavesOtherEnginesAlone(): void
+    {
+        (new M260807000000CreateFilestorageFileTable())->up($this->builder);
+        $before = $this->db->getTableSchema('filestorage_file', true)?->getColumn('scope_id')?->getDbType();
+
+        $migration = new M261128000000MakeFilestorageFileScopeIdCaseSensitive();
+        $migration->up($this->builder);
+        $migration->down($this->builder);
+
+        Assert::same($this->db->getTableSchema('filestorage_file', true)?->getColumn('scope_id')?->getDbType(), $before);
     }
 
     public function theStorePathIndexFollowsTheTableName(): void

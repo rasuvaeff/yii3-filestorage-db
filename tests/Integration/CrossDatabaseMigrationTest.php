@@ -21,12 +21,15 @@ use Rasuvaeff\Yii3Filestorage\Test\InMemoryStore;
 use Rasuvaeff\Yii3Filestorage\Upload;
 use Rasuvaeff\Yii3FilestorageDb\DbBlobLedger;
 use Rasuvaeff\Yii3FilestorageDb\DbRepository;
+use Rasuvaeff\Yii3FilestorageDb\DbScopedFileResolver;
 use Rasuvaeff\Yii3FilestorageDb\DeduplicatingStorage;
 use Rasuvaeff\Yii3FilestorageDb\DeduplicatingStorageFactory;
 use Rasuvaeff\Yii3FilestorageDb\Migration\M260807000000CreateFilestorageFileTable;
 use Rasuvaeff\Yii3FilestorageDb\Migration\M260807000001CreateFilestorageBlobTables;
 use Rasuvaeff\Yii3FilestorageDb\Migration\M261127000000AddFilestorageFileStorePathIndex;
+use Rasuvaeff\Yii3FilestorageDb\Migration\M261128000000MakeFilestorageFileScopeIdCaseSensitive;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\ContentAddressableInMemoryStore;
+use Rasuvaeff\Yii3FilestorageDb\Tests\Support\FixedScope;
 use Testo\Assert;
 use Testo\Codecov\CoversNothing;
 use Testo\Test;
@@ -82,9 +85,11 @@ final class CrossDatabaseMigrationTest
             $files = new M260807000000CreateFilestorageFileTable();
             $blobs = new M260807000001CreateFilestorageBlobTables();
             $storePath = new M261127000000AddFilestorageFileStorePathIndex();
+            $scopeCase = new M261128000000MakeFilestorageFileScopeIdCaseSensitive();
             $files->up($builder);
             $blobs->up($builder);
             $storePath->up($builder);
+            $scopeCase->up($builder);
 
             foreach (self::TABLES as $table) {
                 Assert::notNull($db->getTableSchema($table, true), "{$table} was not created");
@@ -96,6 +101,7 @@ final class CrossDatabaseMigrationTest
 
             $this->deduplicatedAddsAndRemoves($db);
             $this->reservationsAndCollection($db);
+            $this->tenantsDifferingOnlyInCaseAreApart($db);
             $this->referencedPaths($db);
             if ($database === 'mysql') {
                 // `LIKE` without `ESCAPE` on MySQL relies on the backslash
@@ -107,6 +113,7 @@ final class CrossDatabaseMigrationTest
                 $db->createCommand('SET SESSION sql_mode = DEFAULT')->execute();
             }
 
+            $scopeCase->down($builder);
             $storePath->down($builder);
             Assert::false(
                 \in_array('idx_filestorage_file_store_path', $this->indexNames($db), strict: true),
@@ -273,6 +280,37 @@ final class CrossDatabaseMigrationTest
         foreach (array_keys($rows) as $id) {
             $repository->delete($id);
         }
+    }
+
+    /**
+     * MySQL's default collation compares `Acme` and `acme` — and `acme` and
+     * `acmé` — as equal, which made two tenants one for every scoped
+     * statement. The scope column is compared byte for byte.
+     */
+    private function tenantsDifferingOnlyInCaseAreApart(ConnectionInterface $db): void
+    {
+        $scope = new FixedScope('Acme');
+        $repository = new DbRepository($db, scopes: $scope);
+        $repository->save(File::create(
+            id: 'tenant-row',
+            storeName: 'upload',
+            groupName: 'common',
+            relativePath: 'g/tenant-row',
+            originalName: 'a.txt',
+            size: 1,
+            createdAt: $this->at('00:00'),
+        ));
+
+        foreach (['acme', 'ACME', 'Acmé'] as $other) {
+            $scope->switchTo($other);
+            Assert::null($repository->find('tenant-row'), "tenant \"{$other}\" must not see the row of \"Acme\"");
+            Assert::false($repository->delete('tenant-row'));
+        }
+
+        Assert::null((new DbScopedFileResolver($db))->findInScope('tenant-row', 'acme'));
+
+        $scope->switchTo('Acme');
+        Assert::true($repository->delete('tenant-row'));
     }
 
     /**

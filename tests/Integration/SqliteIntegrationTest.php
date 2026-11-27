@@ -15,6 +15,7 @@ use Rasuvaeff\Yii3FilestorageDb\FileTableName;
 use Rasuvaeff\Yii3FilestorageDb\Migration\M260807000000CreateFilestorageFileTable;
 use Rasuvaeff\Yii3FilestorageDb\Migration\M260807000001CreateFilestorageBlobTables;
 use Rasuvaeff\Yii3FilestorageDb\Migration\M261127000000AddFilestorageFileStorePathIndex;
+use Rasuvaeff\Yii3FilestorageDb\Migration\M261128000000MakeFilestorageFileScopeIdCaseSensitive;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\SqliteDatabase;
 use Testo\Assert;
 use Testo\Codecov\CoversNothing;
@@ -99,6 +100,7 @@ final class SqliteIntegrationTest
             M260807000000CreateFilestorageFileTable::class,
             M260807000001CreateFilestorageBlobTables::class,
             M261127000000AddFilestorageFileStorePathIndex::class,
+            M261128000000MakeFilestorageFileScopeIdCaseSensitive::class,
         ]);
     }
 
