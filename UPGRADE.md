@@ -24,3 +24,11 @@
    tenant into one pool): run it once per tenant, as before.
 4. `DeduplicatingStorageFactory::create()`, `DeduplicatingStorage`, `DeduplicateCommand` and `DbBlobLedger` refuse a
    zero or negative `reservationTtl`/`deleteGracePeriod`.
+5. **Requires `rasuvaeff/yii3-filestorage` ^0.10.** `DeduplicatingStorageFactory::create()` and
+   `filestorage:deduplicate` now refuse (`InvalidConfigException` / command failure) a content-key generator whose keys
+   the store's layout cannot delete one by one — `FlatSha256KeyGenerator` needs `FlatSiblingLayout` on the store — and,
+   with a `FileScopeProviderInterface` bound and a scope other than `Global`, a generator that leaves the tenant out of
+   the key (`FlatSha256KeyGenerator(prefix: …)`). A configuration that boots on 0.3 may stop booting: fix the pair, it
+   was deleting neighbouring blobs or sharing bytes across tenants.
+6. **`filestorage:deduplicate` with no provider bound** now refuses while any row carries a `scope_id`. Run it per
+   tenant with the provider bound, or pass `--scope=global` if pooling every tenant is intended.

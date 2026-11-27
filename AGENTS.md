@@ -16,8 +16,8 @@ Public API: `DbRepository` (core's `RepositoryInterface` +
 `Command\DeduplicateCommand`, the
 table-name value objects `FileTableName` / `BlobTableName` /
 `BlobReservationTableName`, the migrations under `src/Migration/`, and
-`Exception\InvalidFileRowException`. `FileRowMapper`, `Timestamps` and
-`BlobRowId` are `@internal`.
+`Exception\InvalidFileRowException`. `FileRowMapper`, `Timestamps`,
+`BlobRowId`, `PositiveInterval` and `ContentKeyCheck` are `@internal`.
 
 DI wiring: `config/di.php` binds the four contracts above, the three table
 names, `DeduplicatingStorageFactory` and `Command\DeduplicateCommand`;
@@ -172,7 +172,9 @@ MSI without any test getting worse.
   in core is how the two drift.
 - **A deletion lease is exclusive and expiring.** Expiry is not a detail: it is
   the entire recovery story for a worker that dies mid-delete. `reserve()`
-  refuses a `deleting` blob with `BlobBusyException` rather than joining it.
+  refuses a `deleting` blob whose lease is live with `BlobBusyException`, and
+  joins one whose lease has expired (the stale collector's `completeDeletion()`
+  then fails on its token).
 - **Timestamps are text, UTC, with microseconds.** The ledger compares
   deadlines with `<=` against a stored string, and lexicographic order only
   agrees with chronological order when every row carries the same offset.
@@ -209,6 +211,15 @@ MSI without any test getting worse.
   the row records what was detected. Both take core's DI-bound `ExtensionMap`
   so `extensionOverrides` apply to both; `aFileTheLivePathSharedIsAlreadyWhereTheCommandWouldPutIt`
   pins the parity with `FlatSha256KeyGenerator`.
+- **The factory and the command refuse the same key generators, through one
+  class.** `ContentKeyCheck` runs core's `LayoutCompatibility::assertContentKeys()`
+  (flat keys under `DirectoryLayout` delete their `ab/cd/` neighbours) and, with
+  a provider bound and a scope other than `Global`, probes two tenants with one
+  digest — equal keys mean the generator drops the tenant and the scope's
+  separation is fake. Without a provider the command also refuses a table with
+  tenant rows (`DbRepository::hasTenantRows()`): it cannot see `scope_id`, and
+  would pool every tenant. Tests that use flat keys need a `FlatSiblingLayout`
+  store.
 - **A malformed row is `InvalidFileRowException`, never a coerced `File`.**
   Coercing until `File::create()` stops refusing turns a corrupted row into a
   plausible record pointing at the wrong object.

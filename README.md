@@ -23,7 +23,7 @@ packages are built against it.
 
 - PHP 8.3+
 - `ext-json`
-- `rasuvaeff/yii3-filestorage` ^0.9
+- `rasuvaeff/yii3-filestorage` ^0.10
 - `yiisoft/db` ^2.0 (plus a driver: `yiisoft/db-sqlite`, `-mysql`, `-pgsql`, …)
 - `symfony/console` ^6.4 || ^7.0 || ^8.0, `psr/http-factory` ^1.0 and
   `psr/http-message` ^2.0 — for `filestorage:deduplicate`, which reads objects
@@ -268,7 +268,7 @@ otherwise): with zero grace "scheduled" and "collectable" are one instant, and a
 writer joining a blob that is losing its last reference races the collector
 instead of being ahead of it.
 
-`create()` refuses three configurations that would otherwise lose data quietly,
+`create()` refuses five configurations that would otherwise lose data quietly,
 and says what to do instead: a store that does not implement
 `ContentAddressableStoreInterface`; a `BlobLedgerInterface` that is not this
 package's `DbBlobLedger`, because the guards deduplication rests on are SQL
@@ -276,7 +276,11 @@ predicates inside the statements that act, and an implementation that keeps its
 state anywhere else cannot make the same promise; and a ledger on a different
 connection than the repository — which makes `commit()` two transactions rather
 than one, so a crash between them leaves a row with no reference or a reference
-with no row.
+with no row; content keys the store's layout cannot delete one by one (core's
+`LayoutCompatibility`, below); and — with a `FileScopeProviderInterface` bound
+and a scope other than `Global` — a key generator that leaves the tenant out of
+the key, which would share bytes across tenants under a scope that promises
+not to.
 
 The content key comes from core's `ContentAddressedKeyGeneratorInterface`
 (`Sha256KeyGenerator` unless one is bound), and it is given the extension of
@@ -284,9 +288,12 @@ the *detected* media type through core's `ExtensionMap` — the same one, with t
 same `extensionOverrides`, that names unique files. `Sha256KeyGenerator` ignores
 it, so existing keys do not move. For a flat tree such as
 `sha/ab/cd/<sha>.<ext>`, bind core's `FlatSha256KeyGenerator` and give the
-store `FlatSiblingLayout` — **both, always**. The pair is not checked yet: with
-the default `DirectoryLayout` a collected blob takes its whole `ab/cd/`
-directory, and with it every other blob that shares the first four hex digits:
+store `FlatSiblingLayout` — **both, always**. With the default
+`DirectoryLayout` a collected blob would take its whole `ab/cd/` directory, and
+with it every other blob that shares the first four hex digits, so `create()`
+and `filestorage:deduplicate` check the pair with core's
+`LayoutCompatibility::assertContentKeys()` and refuse a mismatch
+(`InvalidConfigException`) before anything is written:
 
 ```php
 use Rasuvaeff\Yii3Filestorage\Path\ContentAddressedKeyGeneratorInterface;
@@ -296,6 +303,35 @@ return [
     ContentAddressedKeyGeneratorInterface::class => FlatSha256KeyGenerator::class,
 ];
 ```
+
+Since core 0.10 the local stores — `FileSystemStore` and
+`PublicFileSystemStore` — are content-addressable, so `create()` accepts them
+too. A single-tenant site that keeps one flat pool under its web root:
+
+```php
+use Rasuvaeff\Yii3Filestorage\Path\FlatSha256KeyGenerator;
+use Rasuvaeff\Yii3Filestorage\Store\FileSystem\FileSystemStore;
+use Rasuvaeff\Yii3Filestorage\Store\FileSystem\PublicFileSystemStore;
+use Rasuvaeff\Yii3Filestorage\Store\Layout\FlatSiblingLayout;
+
+$store = new PublicFileSystemStore(
+    new FileSystemStore(
+        name: 'public',
+        rootPath: '/app/public/uploads',
+        streamFactory: $streams,
+        quarantinePath: '/app/runtime/quarantine',
+        layout: new FlatSiblingLayout(),
+        ownedPrefixes: ['blobs', 'avatars'],
+    ),
+    baseUrl: '/uploads',
+    webRoot: '/app/public',
+);
+// bound as ContentAddressedKeyGeneratorInterface: keys become blobs/ab/cd/<sha>.<ext>
+$keys = new FlatSha256KeyGenerator(prefix: 'blobs');
+```
+
+The prefix replaces the scope, tenant included — which is why it is refused
+once a `FileScopeProviderInterface` is bound (see the table below).
 
 `filestorage:deduplicate` takes the same generator and the same `ExtensionMap`,
 and derives the extension from the media type the row records — the one
@@ -316,8 +352,7 @@ is hashed, with the base facade's `UploadSizeException`.
 
 | Expectation | Reality | Instead |
 |---|---|---|
-| A local directory store with deduplication | Core's `FileSystemStore` and `PublicFileSystemStore` do not implement `ContentAddressableStoreInterface`; `create()` refuses them | `FlysystemContentAddressableStore` from `-flysystem`, also over a local adapter |
-| Existing `blobs/ab/cd/<sha>.<ext>` addresses kept | `DedupScope::keyFor()` always prefixes `sha`, `sha/<tenant>` or `sha/<tenant>/<group>`, and `FlatSha256KeyGenerator` requires that prefix | Your own `ContentAddressedKeyGeneratorInterface` that ignores the prefix, with `DedupScope::Global` and `FlatSiblingLayout` |
+| Existing `blobs/ab/cd/<sha>.<ext>` addresses kept by a multi-tenant installation | `new FlatSha256KeyGenerator(prefix: 'blobs')` replaces the `sha/<tenant>/<group>` prefix, and with it the tenant — refused under a bound provider unless the scope is `Global` | Single-tenant (no provider bound): the prefixed generator with `FlatSiblingLayout`. Otherwise a generator that keeps the tenant in the key |
 | Adopting objects already at their content key without copying | There is no `filestorage:adopt`; `filestorage:deduplicate` reads, hashes and re-publishes every row | Planned. Until then, `filestorage:deduplicate` |
 | Equal bytes shared across groups | The default `TenantGroup` puts the group into the key | `DedupScope::Global` (or `Tenant`), see below |
 
@@ -377,7 +412,9 @@ mixes that same scope in — so a multi-tenant installation runs this once per
 tenant, with the tenant established the way its other CLI jobs establish it. The
 scope in force is printed before any work starts, and a bound provider with no
 tenant is refused — even under `allowGlobalAccess`, which would page every
-tenant's rows into one pool.
+tenant's rows into one pool. With **no** provider bound the command cannot tell
+tenants apart, so it refuses while any row carries a `scope_id`
+(`DbRepository::hasTenantRows()`), unless `--scope=global` pools them on purpose.
 
 **Under tenancy the reclaim step moves.** `filestorage:gc --orphans` refuses
 while a `FileScopeProviderInterface` is bound — a tenant-filtered set of rows

@@ -24,7 +24,7 @@ Flysystem и web.
 
 - PHP 8.3+
 - `ext-json`
-- `rasuvaeff/yii3-filestorage` ^0.9
+- `rasuvaeff/yii3-filestorage` ^0.10
 - `yiisoft/db` ^2.0 (плюс драйвер: `yiisoft/db-sqlite`, `-mysql`, `-pgsql`, …)
 - `symfony/console` ^6.4 || ^7.0 || ^8.0, `psr/http-factory` ^1.0 и
   `psr/http-message` ^2.0 — для `filestorage:deduplicate`, которая читает
@@ -273,14 +273,18 @@ return [
 — один момент, и писатель, присоединяющийся к blob, теряющему последнюю ссылку,
 гоняется со сборщиком, а не опережает его.
 
-`create()` отклоняет три конфигурации, которые иначе тихо теряют данные, и
+`create()` отклоняет пять конфигураций, которые иначе тихо теряют данные, и
 говорит, что делать вместо: хранилище без `ContentAddressableStoreInterface`;
 реализацию `BlobLedgerInterface`, отличную от `DbBlobLedger` этого пакета, —
 гарантии дедупликации держатся на SQL-предикатах внутри действующих операторов,
 и реализация, хранящая состояние где-то ещё, того же обещать не может; и реестр
 на соединении, отличном от репозитория, — из-за чего `commit()` становится двумя
 транзакциями вместо одной, и падение между ними оставляет строку без ссылки либо
-ссылку без строки.
+ссылку без строки; content-ключи, которые раскладка хранилища не умеет удалять
+по одному (`LayoutCompatibility` ядра, см. ниже); и — при привязанном
+`FileScopeProviderInterface` и области, отличной от `Global`, — генератор
+ключей, выбрасывающий арендатора из ключа: он разделил бы байты между
+арендаторами в области, которая обещает этого не делать.
 
 Ключ содержимого строит `ContentAddressedKeyGeneratorInterface` ядра
 (`Sha256KeyGenerator`, если ничего не привязано), и он получает расширение
@@ -288,9 +292,12 @@ return [
 `extensionOverrides`, что именует уникальные файлы. `Sha256KeyGenerator` его
 игнорирует, так что существующие ключи не сдвигаются. Для плоского дерева вида
 `sha/ab/cd/<sha>.<ext>` привяжите `FlatSha256KeyGenerator` ядра и дайте
-хранилищу `FlatSiblingLayout` — **оба, всегда**. Пара пока не проверяется: с
-`DirectoryLayout` по умолчанию собранный blob уносит весь каталог `ab/cd/`, а с
-ним и все blob'ы с теми же первыми четырьмя hex-символами:
+хранилищу `FlatSiblingLayout` — **оба, всегда**. С `DirectoryLayout` по
+умолчанию собранный blob унёс бы весь каталог `ab/cd/`, а с ним и все blob'ы с
+теми же первыми четырьмя hex-символами, поэтому `create()` и
+`filestorage:deduplicate` проверяют пару через
+`LayoutCompatibility::assertContentKeys()` ядра и отклоняют несовпадение
+(`InvalidConfigException`) до того, как что-либо записано:
 
 ```php
 use Rasuvaeff\Yii3Filestorage\Path\ContentAddressedKeyGeneratorInterface;
@@ -300,6 +307,35 @@ return [
     ContentAddressedKeyGeneratorInterface::class => FlatSha256KeyGenerator::class,
 ];
 ```
+
+С ядра 0.10 локальные хранилища — `FileSystemStore` и `PublicFileSystemStore` —
+content-addressable, и `create()` принимает их тоже. Однотенантный сайт с одним
+плоским пулом внутри web-root:
+
+```php
+use Rasuvaeff\Yii3Filestorage\Path\FlatSha256KeyGenerator;
+use Rasuvaeff\Yii3Filestorage\Store\FileSystem\FileSystemStore;
+use Rasuvaeff\Yii3Filestorage\Store\FileSystem\PublicFileSystemStore;
+use Rasuvaeff\Yii3Filestorage\Store\Layout\FlatSiblingLayout;
+
+$store = new PublicFileSystemStore(
+    new FileSystemStore(
+        name: 'public',
+        rootPath: '/app/public/uploads',
+        streamFactory: $streams,
+        quarantinePath: '/app/runtime/quarantine',
+        layout: new FlatSiblingLayout(),
+        ownedPrefixes: ['blobs', 'avatars'],
+    ),
+    baseUrl: '/uploads',
+    webRoot: '/app/public',
+);
+// привязан как ContentAddressedKeyGeneratorInterface: ключи вида blobs/ab/cd/<sha>.<ext>
+$keys = new FlatSha256KeyGenerator(prefix: 'blobs');
+```
+
+Префикс заменяет область целиком, вместе с арендатором, — поэтому при
+привязанном `FileScopeProviderInterface` он отклоняется (см. таблицу ниже).
 
 `filestorage:deduplicate` берёт тот же генератор и тот же `ExtensionMap` и
 выводит расширение из медиатипа, записанного в строке, — определённого при
@@ -320,8 +356,7 @@ return [
 
 | Ожидание | На деле | Вместо этого |
 |---|---|---|
-| Локальное файловое хранилище с дедупликацией | `FileSystemStore` и `PublicFileSystemStore` ядра не реализуют `ContentAddressableStoreInterface`; `create()` их отклоняет | `FlysystemContentAddressableStore` из `-flysystem`, в том числе поверх локального адаптера |
-| Существующие адреса `blobs/ab/cd/<sha>.<ext>` сохраняются | `DedupScope::keyFor()` всегда добавляет префикс `sha`, `sha/<tenant>` или `sha/<tenant>/<group>`, и `FlatSha256KeyGenerator` этот префикс требует | Свой `ContentAddressedKeyGeneratorInterface`, игнорирующий префикс, с `DedupScope::Global` и `FlatSiblingLayout` |
+| Существующие адреса `blobs/ab/cd/<sha>.<ext>` сохраняются в multi-tenant установке | `new FlatSha256KeyGenerator(prefix: 'blobs')` заменяет префикс `sha/<tenant>/<group>`, а с ним и арендатора — при привязанном провайдере это отклоняется, если область не `Global` | Однотенантная установка (провайдер не привязан): генератор с префиксом и `FlatSiblingLayout`. Иначе — генератор, сохраняющий арендатора в ключе |
 | Принять объекты, уже лежащие на своём content-ключе, без копирования | Команды `filestorage:adopt` нет; `filestorage:deduplicate` читает, хеширует и заново публикует каждую строку | В планах. Пока — `filestorage:deduplicate` |
 | Одинаковые байты делятся между группами | `TenantGroup` по умолчанию кладёт группу в ключ | `DedupScope::Global` (или `Tenant`), см. ниже |
 
@@ -382,7 +417,10 @@ content-ключе, распознаётся и пропускается. Про
 разу на арендатора, устанавливая арендатора так же, как это делают остальные её
 CLI-задачи. Действующая область печатается до начала работы, а привязанный
 провайдер без тенанта получает отказ — даже при `allowGlobalAccess`, который
-слил бы строки всех тенантов в один пул.
+слил бы строки всех тенантов в один пул. Если провайдер **не** привязан, команда
+не различает арендаторов, поэтому отказывается, пока хоть одна строка несёт
+`scope_id` (`DbRepository::hasTenantRows()`), — кроме `--scope=global`, который
+объединяет их намеренно.
 
 **При аренде шаг уборки переезжает.** `filestorage:gc --orphans` отказывается
 работать, пока привязан `FileScopeProviderInterface`: строки, отфильтрованные по

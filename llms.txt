@@ -178,8 +178,11 @@ StorageInterface::class => static fn (DeduplicatingStorageFactory $f): StorageIn
 `create()` throws `InvalidConfigException` when the store does not implement
 `ContentAddressableStoreInterface`, when the bound `BlobLedgerInterface` is not
 this package's `DbBlobLedger`, or when the ledger and the repository are on
-different connections (which would make `commit()` two transactions);
-`InvalidArgumentException` for a zero or negative `reservationTtl` /
+different connections (which would make `commit()` two transactions), when
+the key generator's keys do not fit the store's layout (core's
+`LayoutCompatibility::assertContentKeys()`), or when a scope provider is bound,
+the scope is not `Global` and the generator leaves the tenant out of the key
+(`FlatSha256KeyGenerator` with a prefix); `InvalidArgumentException` for a zero or negative `reservationTtl` /
 `deleteGracePeriod`.
 
 Content key: `ContentAddressedKeyGeneratorInterface::generate(scope, sha256,
@@ -188,8 +191,11 @@ which ignores the extension) and `extensions` (core's `ExtensionMap`, bound by
 core with `extensionOverrides`). The extension is
 `ExtensionMap::extensionFor($detectedMediaType)` (`bin` for an unknown type).
 Bind core's `FlatSha256KeyGenerator` for `<scope>/ab/cd/<sha>.<ext>` **only**
-with a store on `FlatSiblingLayout` — the pair is not validated yet, and with
-`DirectoryLayout` collecting one blob removes its `ab/cd/` neighbours.
+with a store on `FlatSiblingLayout` — with `DirectoryLayout` collecting one blob
+would remove its `ab/cd/` neighbours, so `create()` and `filestorage:deduplicate`
+refuse that pair. Core's local `FileSystemStore` / `PublicFileSystemStore` are
+content-addressable since core 0.10 and accepted; a single-tenant web root can
+use `new FlatSha256KeyGenerator(prefix: 'blobs')` + `FlatSiblingLayout`.
 
 `add()`: hash (stops at the group's `maxBytes` → `UploadSizeException`) →
 `reserve()` → `putIfAbsent()` → `commit()`; `release()` on any failure. Above
@@ -198,10 +204,9 @@ with a store on `FlatSiblingLayout` — the pair is not validated yet, and with
 object is deleted as the base facade would. Everything else delegates to the
 base facade.
 
-Not provided: a local content-addressable store (core's `FileSystemStore` /
-`PublicFileSystemStore` are not CA — use `-flysystem`'s
-`FlysystemContentAddressableStore`), keys without the `sha…` prefix (needs your
-own generator), a `filestorage:adopt` command (planned).
+Not provided: keys without the tenant for a multi-tenant installation (the
+prefixed `FlatSha256KeyGenerator` is single-tenant), a `filestorage:adopt`
+command (planned).
 
 `DedupScope`: `TenantGroup` (default, the only one safe for untrusted tenants),
 `Tenant`, `Global`. Global discloses content existence across tenants through
@@ -243,7 +248,10 @@ Rules:
    shared rows again and `commit()` schedules the blob each one left.
 3. The tenant scope is the ambient one (`FileScopeProviderInterface`). Multi-tenant
    installations run it once per tenant. The scope is printed before any work; a
-   bound provider returning null is refused.
+   bound provider returning null is refused. With no provider bound, it refuses
+   while any row has a `scope_id` (`DbRepository::hasTenantRows()`) unless
+   `--scope=global`. The generator/layout pair and the tenant-in-key check are
+   the factory's (above).
 4. **Under tenancy the reclaim step moves.** `gc --orphans` refuses while a scope
    provider is bound, so run the migration per tenant and the sweep once, from a
    maintenance entry point with the provider unbound. The closing line says so.

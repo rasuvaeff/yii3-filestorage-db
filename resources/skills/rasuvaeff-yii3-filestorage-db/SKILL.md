@@ -59,6 +59,8 @@ delete. Namespace `Rasuvaeff\Yii3FilestorageDb\`. Full API reference:
    or every migrated row lands on a key no future upload will ever join. Under
    tenancy the reclaim step moves: `gc --orphans` refuses while a scope provider
    is bound, so migrate per tenant and sweep once with the provider unbound.
+   With no provider bound it refuses while any row carries a `scope_id`
+   (`DbRepository::hasTenantRows()`), unless `--scope=global`.
 
 8. **Sizes are counted while hashing, never read off the row.** `Upload::size()`
    is null for a body that never declares its length, and a row's recorded size
@@ -69,7 +71,12 @@ delete. Namespace `Rasuvaeff\Yii3FilestorageDb\`. Full API reference:
    content key.** Same `DedupScope`, same key generator, same `ExtensionMap`:
    the live path passes `extensionFor($detectedType)`, the command
    `extensionFor($file->mimeType)` — the type the row recorded at add time. Any
-   divergence puts migrated rows on keys no upload ever joins.
+   divergence puts migrated rows on keys no upload ever joins. Both refuse a
+   generator whose keys the store's layout cannot delete one by one (core's
+   `LayoutCompatibility`: flat keys need `FlatSiblingLayout`) and, with a scope
+   provider bound and a scope other than `Global`, a generator that leaves the
+   tenant out (`FlatSha256KeyGenerator(prefix: …)`). Tests that need flat keys
+   build the store with `FlatSiblingLayout`.
 
 10. **`referencedPaths()` decides in PHP, not in SQL.** The database narrows
     with `LIKE '<dir>/%' ESCAPE '!'` — never yiisoft/db's `Like`, whose MySQL
