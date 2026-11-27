@@ -224,6 +224,25 @@ final class DeduplicatingStorageTest
      * with, so a row repointed in between can only make an orphan go, never
      * a blob.
      */
+    /**
+     * The row is gone by the time the store is looked up, so a store the
+     * registry no longer knows is a failed remove, reported the way the base
+     * facade reports it — not the registry's own exception.
+     */
+    public function aRowInAStoreTheRegistryDoesNotKnowIsARemoveException(): void
+    {
+        $this->repository->save(SqliteDatabase::file('gone', relativePath: 'g/unique', storeName: 'archive'));
+
+        try {
+            $this->storage->remove('gone');
+            Assert::fail('Expected RemoveException');
+        } catch (RemoveException $e) {
+            Assert::string($e->getMessage())->contains('orphan for filestorage:gc');
+        }
+
+        Assert::null($this->repository->find('gone'));
+    }
+
     public function removingASharedRowNeverDeletesItsBytes(): void
     {
         $file = $this->storage->add($this->upload('hello'));

@@ -205,14 +205,12 @@ final readonly class DeduplicatingStorage implements StorageInterface
             return true;
         }
 
-        $store = $this->stores?->get($file->storeName)
-            ?? ($file->storeName === $this->store->name() ? $this->store : null);
-        if ($store === null) {
-            return true;
-        }
-
         try {
-            $store->delete($file);
+            // inside the try: the row is already gone, so a store the
+            // registry no longer knows is this remove failing, too
+            $store = $this->stores?->get($file->storeName)
+                ?? ($file->storeName === $this->store->name() ? $this->store : null);
+            $store?->delete($file);
         } catch (Throwable $e) {
             throw new RemoveException(
                 "Removed metadata for \"{$id}\" but could not delete \"{$file->relativePath}\" "

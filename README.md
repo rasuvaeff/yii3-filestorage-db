@@ -144,7 +144,10 @@ tenant's rows.
 **Global access is an explicit opt-in, for maintenance only.** A maintenance
 entry point either leaves the provider unbound, or keeps it and sets
 `allowGlobalAccess` — then a null scope means "every tenant" for reads,
-updates and deletes (a new row still needs a tenant):
+updates and deletes (a new row still needs a tenant). Core's `filestorage:gc`,
+`stat`, `verify` and `backfill-hash` read through this repository, so a
+multi-tenant cron job whose tenant does not resolve now throws until its entry
+point does one of the two — see [UPGRADE.md](UPGRADE.md):
 
 ```php
 // the console entry point's own params, never the web one's

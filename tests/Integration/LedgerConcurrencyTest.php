@@ -330,13 +330,22 @@ final class LedgerConcurrencyTest
         );
 
         $transaction = $this->second->beginTransaction();
-        $reservation = $this->bob->reserve($this->blob(), self::HASH, 12, $this->at('00:10'));
 
-        Assert::true($this->alice->releaseFile('a', $this->at('00:00')));
-        $lease = $this->alice->claimForDeletion($this->at('00:00'), $this->at('00:05'));
-        Assert::true($lease instanceof \Rasuvaeff\Yii3Filestorage\Store\BlobLease, 'the collector cannot see the reservation yet');
+        try {
+            $reservation = $this->bob->reserve($this->blob(), self::HASH, 12, $this->at('00:10'));
 
-        $transaction->commit();
+            Assert::true($this->alice->releaseFile('a', $this->at('00:00')));
+            $lease = $this->alice->claimForDeletion($this->at('00:00'), $this->at('00:05'));
+            Assert::true($lease instanceof \Rasuvaeff\Yii3Filestorage\Store\BlobLease, 'the collector cannot see the reservation yet');
+
+            $transaction->commit();
+        } finally {
+            // an assertion failing above must not leave Bob's locks behind:
+            // tearDown's DROP TABLE would wait on them and hang the job
+            if ($transaction->isActive()) {
+                $transaction->rollBack();
+            }
+        }
 
         $refused = false;
 
