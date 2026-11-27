@@ -291,6 +291,24 @@ final readonly class DbRepository implements MaintenanceRepositoryInterface
     }
 
     /**
+     * Whether any row this repository can see belongs to a tenant.
+     *
+     * Asked by `filestorage:deduplicate` when no scope provider is bound: the
+     * command then reads every row and keys them all into one pool, which is
+     * only right when the table really is single-tenant. Scoped like every
+     * other statement here.
+     *
+     * @throws MissingScopeException
+     */
+    public function hasTenantRows(): bool
+    {
+        return (new Query($this->db))
+            ->from($this->table)
+            ->where($this->scoped(['not', ['scope_id' => null]]))
+            ->exists();
+    }
+
+    /**
      * Whether this repository writes through that exact connection.
      *
      * Asked by {@see DeduplicatingStorageFactory}: a ledger and a repository on

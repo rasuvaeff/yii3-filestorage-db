@@ -318,6 +318,24 @@ final class DbRepositoryTest
     }
 
     /**
+     * `filestorage:deduplicate` asks this before keying every row into one
+     * pool without a provider: only a row with a tenant makes that wrong.
+     */
+    public function hasTenantRowsSeesOnlyRowsThatCarryATenant(): void
+    {
+        Assert::false($this->repository->hasTenantRows());
+
+        $this->repository->save(SqliteDatabase::file('untenanted'));
+        Assert::false($this->repository->hasTenantRows());
+
+        $scope = new FixedScope('acme');
+        (new DbRepository($this->database->db, scopes: $scope))->save(SqliteDatabase::file('tenanted'));
+        Assert::true($this->repository->hasTenantRows());
+        Assert::true((new DbRepository($this->database->db, scopes: $scope))->hasTenantRows());
+        Assert::false((new DbRepository($this->database->db, scopes: new FixedScope('beta')))->hasTenantRows());
+    }
+
+    /**
      * The probe from the 1.0 review (`nullscope.php`): a bound provider that
      * returns null used to drop the tenant predicate, so `find()` and
      * `delete()` reached every tenant's rows. Bound means multi-tenant; a null

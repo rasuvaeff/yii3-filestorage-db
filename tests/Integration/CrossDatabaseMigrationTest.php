@@ -295,9 +295,12 @@ final class CrossDatabaseMigrationTest
             createdAt: $this->at('00:00'),
         ));
 
+        Assert::true((new DbRepository($db))->hasTenantRows());
+
         foreach (['acme', 'ACME', 'Acmé'] as $other) {
             $scope->switchTo($other);
             Assert::null($repository->find('tenant-row'), "tenant \"{$other}\" must not see the row of \"Acme\"");
+            Assert::false($repository->hasTenantRows());
             Assert::false($repository->delete('tenant-row'));
         }
 

@@ -28,10 +28,14 @@ use Rasuvaeff\Yii3Filestorage\Store\BlobId;
 use Rasuvaeff\Yii3Filestorage\Store\BlobLedgerInterface;
 use Rasuvaeff\Yii3Filestorage\Store\BlobState;
 use Rasuvaeff\Yii3Filestorage\Store\ContentAddressableStoreInterface;
+use Rasuvaeff\Yii3Filestorage\Store\FileSystem\FileSystemStore;
+use Rasuvaeff\Yii3Filestorage\Store\FileSystem\PublicFileSystemStore;
+use Rasuvaeff\Yii3Filestorage\Store\Layout\FlatSiblingLayout;
 use Rasuvaeff\Yii3Filestorage\Store\StoreRegistry;
 use Rasuvaeff\Yii3Filestorage\Test\InMemoryStore;
 use Rasuvaeff\Yii3Filestorage\Test\MemoryBlobLedger;
 use Rasuvaeff\Yii3Filestorage\Upload;
+use Rasuvaeff\Yii3FilestorageDb\ContentKeyCheck;
 use Rasuvaeff\Yii3FilestorageDb\DbBlobLedger;
 use Rasuvaeff\Yii3FilestorageDb\DbRepository;
 use Rasuvaeff\Yii3FilestorageDb\DeduplicatingStorage;
@@ -59,6 +63,7 @@ use Yiisoft\Test\Support\Clock\StaticClock;
 #[Covers(DeduplicatingStorage::class)]
 #[Covers(DeduplicatingStorageFactory::class)]
 #[Covers(DedupScope::class)]
+#[Covers(ContentKeyCheck::class)]
 final class DeduplicatingStorageTest
 {
     private SqliteDatabase $database;
@@ -462,11 +467,11 @@ final class DeduplicatingStorageTest
      */
     public function anInjectedKeyGeneratorDecidesTheLayout(): void
     {
-        $storage = $this->factory(keys: new FixedKeyGenerator('shared/one/original.bin'))->create();
+        $storage = $this->factory(keys: new FixedKeyGenerator('shared/one'))->create();
 
         $file = $storage->add($this->upload('hello'));
 
-        Assert::same($file->relativePath, 'shared/one/original.bin');
+        Assert::same($file->relativePath, 'shared/one/' . hash('sha256', 'hello') . '/original.bin');
     }
 
     /**
@@ -475,7 +480,7 @@ final class DeduplicatingStorageTest
      */
     public function theContentKeyCarriesTheDetectedExtension(): void
     {
-        $storage = $this->factory(keys: new FlatSha256KeyGenerator())->create();
+        $storage = $this->factory(stores: $this->flatStores(), keys: new FlatSha256KeyGenerator())->create();
 
         $file = $storage->add($this->upload('hello'));
 
@@ -493,6 +498,7 @@ final class DeduplicatingStorageTest
     public function theExtensionMapOverridesReachTheContentKey(): void
     {
         $storage = $this->factory(
+            stores: $this->flatStores(),
             keys: new FlatSha256KeyGenerator(),
             extensions: new ExtensionMap(['text/plain' => 'text']),
         )->create();
@@ -621,6 +627,105 @@ final class DeduplicatingStorageTest
         $storage->add($this->upload('hello'));
     }
 
+    /**
+     * Summary A1: a flat `<prefix>/ab/cd/<sha>.ext` key under the default
+     * {@see \Rasuvaeff\Yii3Filestorage\Store\Layout\DirectoryLayout} makes
+     * deleting one blob delete its whole fan-out bucket. The pair is refused
+     * when the storage is assembled, before a single byte is written.
+     */
+    public function aFlatKeyGeneratorOnTheDirectoryLayoutIsRefusedBeforeAnythingIsWritten(): void
+    {
+        $refused = null;
+
+        try {
+            $this->factory(keys: new FlatSha256KeyGenerator())->create()->add($this->upload('hello'));
+        } catch (InvalidConfigException $e) {
+            $refused = $e->getMessage();
+        }
+
+        Assert::string((string) $refused)->contains('Store "upload"');
+        Assert::string((string) $refused)->contains(FlatSha256KeyGenerator::class);
+        Assert::string((string) $refused)->contains('cannot share a store');
+        Assert::same($this->store->writeCount(), 0);
+    }
+
+    /**
+     * A generator that drops the tenant from the key (`FlatSha256KeyGenerator`
+     * with a prefix) turns a tenant-separated scope into cross-tenant sharing —
+     * the content-existence oracle {@see DedupScope} exists to prevent. With a
+     * provider bound that is refused; `Global` states the sharing on purpose.
+     */
+    public function aGeneratorThatIgnoresTheTenantIsRefusedUnderATenantScope(): void
+    {
+        Expect::exception(InvalidConfigException::class)->withMessageContaining('ignores the tenant');
+
+        $this->factory(
+            stores: $this->flatStores(),
+            scopes: new FixedScope('tenant-a'),
+            keys: new FlatSha256KeyGenerator(prefix: 'blobs'),
+        )->create();
+    }
+
+    public function aGeneratorThatIgnoresTheTenantIsAcceptedUnderTheGlobalScopeOrWithoutAProvider(): void
+    {
+        $stores = $this->flatStores();
+        $keys = new FlatSha256KeyGenerator(prefix: 'blobs');
+
+        $global = $this->factory(stores: $stores, scopes: new FixedScope('tenant-a'), keys: $keys)
+            ->create(scope: DedupScope::Global);
+        $single = $this->factory(stores: $stores, keys: $keys)->create();
+
+        Assert::true(str_starts_with($global->add($this->upload('hello'))->relativePath, 'blobs/'));
+        Assert::true(str_starts_with($single->add($this->upload('bye'))->relativePath, 'blobs/'));
+    }
+
+    /**
+     * The setup the cska-one adoption targets: a public local store whose root
+     * is a shared web directory, flat sibling layout, one `blobs/` pool. Core
+     * 0.10 made the local stores content-addressable, so the factory accepts
+     * them; this pins the whole path — share, serve, remove — on real files.
+     */
+    public function aPublicLocalStoreWithFlatBlobsDeduplicatesEndToEnd(): void
+    {
+        $root = sys_get_temp_dir() . '/filestorage-db-' . bin2hex(random_bytes(6));
+        $public = new PublicFileSystemStore(
+            new FileSystemStore(
+                name: 'upload',
+                rootPath: $root,
+                streamFactory: $this->factory,
+                layout: new FlatSiblingLayout(),
+                ownedPrefixes: ['blobs', 'common'],
+            ),
+            baseUrl: '/uploads',
+        );
+
+        try {
+            $storage = $this->factory(
+                stores: new StoreRegistry([$public]),
+                keys: new FlatSha256KeyGenerator(prefix: 'blobs'),
+            )->create();
+
+            $first = $storage->add($this->upload('hello'));
+            $second = $storage->add($this->upload('hello'));
+            $sha = hash('sha256', 'hello');
+            $path = 'blobs/' . substr($sha, 0, 2) . '/' . substr($sha, 2, 2) . "/{$sha}.txt";
+
+            Assert::same($first->relativePath, $path);
+            Assert::same($second->relativePath, $path);
+            Assert::same(glob("{$root}/blobs/*/*/*"), ["{$root}/{$path}"]);
+            Assert::same($public->publicUrl($second), "/uploads/{$path}");
+            Assert::same((string) $storage->stream($second), 'hello');
+
+            Assert::true($storage->remove($first->id));
+            Assert::true($storage->remove($second->id));
+
+            Assert::same($this->ledger->find(BlobId::create('upload', $path))?->state, BlobState::PendingDelete);
+            Assert::true(is_file("{$root}/{$path}"), 'only a collector deletes shared bytes');
+        } finally {
+            exec('rm -rf ' . escapeshellarg($root));
+        }
+    }
+
     private function factory(
         ?StoreRegistry $stores = null,
         ?FixedScope $scopes = null,
@@ -667,6 +772,17 @@ final class DeduplicatingStorageTest
         );
     }
 
+    /**
+     * Flat content keys need the sibling layout; under `DirectoryLayout` the
+     * factory refuses them (summary A1).
+     */
+    private function flatStores(): StoreRegistry
+    {
+        return new StoreRegistry([new ContentAddressableInMemoryStore(
+            new InMemoryStore('upload', $this->factory, new StaticClock($this->at('00:00')), new FlatSiblingLayout()),
+        )]);
+    }
+
     private function upload(string $contents): Upload
     {
         return Upload::fromStream($this->factory->createStream($contents), 'a.txt', $this->factory);
@@ -690,8 +806,8 @@ final class DeduplicatingStorageTest
     public function aFailedWriteReleasesTheReservationAndSurfacesAnAddException(): void
     {
         $this->store->failNextPut();
-        $storage = $this->factory(keys: new FixedKeyGenerator('shared/one/original.bin'))->create();
-        $blob = BlobId::create('upload', 'shared/one/original.bin');
+        $storage = $this->factory(keys: new FixedKeyGenerator('shared/one'))->create();
+        $blob = BlobId::create('upload', 'shared/one/' . hash('sha256', 'hello') . '/original.bin');
 
         try {
             $storage->add($this->upload('hello'));

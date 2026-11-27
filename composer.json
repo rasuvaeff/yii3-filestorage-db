@@ -28,7 +28,7 @@
         "psr/clock": "^1.0",
         "psr/http-factory": "^1.0",
         "psr/http-message": "^2.0",
-        "rasuvaeff/yii3-filestorage": "^0.9",
+        "rasuvaeff/yii3-filestorage": "^0.10",
         "symfony/console": "^6.4 || ^7.0 || ^8.0",
         "yiisoft/db": "^2.0",
         "yiisoft/db-migration": "^2.1"

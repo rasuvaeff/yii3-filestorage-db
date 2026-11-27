@@ -56,7 +56,11 @@ final readonly class DeduplicatingStorageFactory
     /**
      * @param non-empty-string|null $storeName Defaults to the registry's default store.
      *
-     * @throws InvalidConfigException When the store cannot deduplicate safely.
+     * @throws InvalidConfigException When the store cannot deduplicate safely:
+     *         no atomic put-if-absent, a ledger on another connection, content
+     *         keys the store's layout cannot delete one by one, or — with a
+     *         scope provider bound and a scope other than `Global` — keys that
+     *         leave the tenant out.
      * @throws \InvalidArgumentException When `reservationTtl` or
      *         `deleteGracePeriod` is not a positive interval.
      */
@@ -97,11 +101,14 @@ final readonly class DeduplicatingStorageFactory
             );
         }
 
+        $keys = $this->keys ?? new Sha256KeyGenerator();
+        ContentKeyCheck::assert($keys, $store, $scope, tenantBound: $this->scopes !== null);
+
         return new DeduplicatingStorage(
             unique: $this->unique,
             ledger: $this->ledger,
             store: $store,
-            keys: $this->keys ?? new Sha256KeyGenerator(),
+            keys: $keys,
             mimeTypeDetector: $this->mimeTypeDetector,
             idGenerator: $this->idGenerator,
             policies: $this->policies,

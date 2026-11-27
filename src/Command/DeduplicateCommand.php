@@ -8,6 +8,7 @@ use DateInterval;
 use Override;
 use Psr\Clock\ClockInterface;
 use Psr\Http\Message\StreamFactoryInterface;
+use Rasuvaeff\Yii3Filestorage\Exception\InvalidConfigException;
 use Rasuvaeff\Yii3Filestorage\File;
 use Rasuvaeff\Yii3Filestorage\Mime\ExtensionMap;
 use Rasuvaeff\Yii3Filestorage\Path\ContentAddressedKeyGeneratorInterface;
@@ -19,6 +20,7 @@ use Rasuvaeff\Yii3Filestorage\Store\ContentAddressableStoreInterface;
 use Rasuvaeff\Yii3Filestorage\Store\StoredObjectId;
 use Rasuvaeff\Yii3Filestorage\Store\StoreRegistry;
 use Rasuvaeff\Yii3Filestorage\Upload;
+use Rasuvaeff\Yii3FilestorageDb\ContentKeyCheck;
 use Rasuvaeff\Yii3FilestorageDb\DbRepository;
 use Rasuvaeff\Yii3FilestorageDb\DedupScope;
 use Rasuvaeff\Yii3FilestorageDb\Exception\InvalidFileRowException;
@@ -162,6 +164,30 @@ final class DeduplicateCommand extends Command
                 'Store "%s" cannot deduplicate: it does not implement %s, so there is nothing to migrate onto.',
                 $store->name(),
                 ContentAddressableStoreInterface::class,
+            ));
+
+            return Command::FAILURE;
+        }
+
+        try {
+            ContentKeyCheck::assert($this->keys ?? new Sha256KeyGenerator(), $store, $scope, tenantBound: $this->scopes !== null);
+        } catch (InvalidConfigException $e) {
+            $io->error($e->getMessage());
+
+            return Command::FAILURE;
+        }
+
+        // Without a provider the repository pages every row and the key gets
+        // the `shared` tenant — so in a multi-tenant table every tenant's rows
+        // would land in one pool, which a tenant-separating scope promises
+        // never happens. Only `Global` pools them on purpose.
+        if ($this->scopes === null && $scope !== DedupScope::Global && $this->repository->hasTenantRows()) {
+            $io->error(sprintf(
+                'No %s is bound, but rows belong to tenants. Run this command once per tenant with the tenant '
+                    . 'established, as the application\'s other CLI jobs do, or pass --scope=%s to share across '
+                    . 'tenants on purpose.',
+                FileScopeProviderInterface::class,
+                DedupScope::Global->value,
             ));
 
             return Command::FAILURE;
