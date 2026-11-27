@@ -111,7 +111,7 @@ final class DeduplicateCommand extends Command
         $io = new SymfonyStyle($input, $output);
         $options = $input->getOptions();
 
-        $apply = (bool) $input->getOption('apply');
+        $apply = $input->getOption('apply') === true;
         $limit = max(1, (int) $input->getOption('limit'));
         $maxBytes = $this->maxBytesOption($options);
         if ($maxBytes === null) {
@@ -181,8 +181,11 @@ final class DeduplicateCommand extends Command
         $lastId = $after;
 
         while ($seen < $limit) {
+            /** @var int<1, 500> $pageSize the loop condition keeps `$limit - $seen` positive */
+            $pageSize = min(500, $limit - $seen);
+
             try {
-                $page = iterator_to_array($this->repository->files($lastId, min(500, $limit - $seen)), preserve_keys: false);
+                $page = iterator_to_array($this->repository->files($lastId, $pageSize), preserve_keys: false);
             } catch (InvalidFileRowException $e) {
                 // files() is a generator and the mapper throws mid-iteration,
                 // so one hand-edited row used to abort the whole run before
