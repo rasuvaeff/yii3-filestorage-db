@@ -12,6 +12,9 @@ use Rasuvaeff\Yii3Filestorage\Store\BlobId;
 use Rasuvaeff\Yii3FilestorageDb\Exception\InvalidFileRowException;
 use Yiisoft\Db\Connection\ConnectionInterface;
 use Yiisoft\Db\Query\Query;
+use Yiisoft\Db\QueryBuilder\Condition\Like;
+use Yiisoft\Db\QueryBuilder\Condition\LikeConjunction;
+use Yiisoft\Db\QueryBuilder\Condition\LikeMode;
 
 /**
  * File metadata in a database table.
@@ -31,6 +34,12 @@ use Yiisoft\Db\Query\Query;
  */
 final readonly class DbRepository implements MaintenanceRepositoryInterface
 {
+    /**
+     * Directories per statement. Each one binds two parameters, and SQLite
+     * builds before 3.32 refuse more than 999.
+     */
+    private const int DIRECTORY_BATCH = 200;
+
     private string $table;
     private FileRowMapper $mapper;
 
@@ -133,6 +142,67 @@ final readonly class DbRepository implements MaintenanceRepositoryInterface
         }
     }
 
+    /**
+     * One statement per batch of directories: `relative_path LIKE '<dir>/%'`
+     * for rows below a directory, `relative_path IN (...)` for root-level
+     * rows, which are their own directory.
+     *
+     * The database only narrows; the answer is decided here. `LIKE 'd/%'` also
+     * matches `d/sub/x`, and MySQL's default collation compares both `LIKE`
+     * and `=` case- and accent-insensitively — so every row that comes back
+     * is checked against the exact store name and the exact directory. No
+     * `DISTINCT` either: under that collation it would fold `A/x` and `a/x`
+     * into one row, and if the survivor is the one the exact check discards,
+     * the real reference is lost and the sweep deletes referenced bytes.
+     */
+    #[Override]
+    public function referencedPaths(string $storeName, array $directories): array
+    {
+        $wanted = array_fill_keys($directories, value: true);
+        $paths = [];
+        $seen = [];
+
+        foreach (array_chunk(array_values(array_unique($directories)), self::DIRECTORY_BATCH) as $batch) {
+            $prefixes = array_map(static fn(string $directory): string => $directory . '/', $batch);
+
+            /** @var list<array<string, mixed>> $rows */
+            $rows = (new Query($this->db))
+                ->select(['store_name', 'relative_path'])
+                ->from($this->table)
+                ->where($this->scoped([
+                    'and',
+                    ['store_name' => $storeName],
+                    [
+                        'or',
+                        new Like(
+                            column: 'relative_path',
+                            value: $prefixes,
+                            mode: LikeMode::StartsWith,
+                            conjunction: LikeConjunction::Or,
+                        ),
+                        ['in', 'relative_path', $batch],
+                    ],
+                ]))
+                ->all();
+
+            foreach ($rows as $row) {
+                $path = isset($row['relative_path']) && \is_string($row['relative_path']) ? $row['relative_path'] : '';
+                if (
+                    $path !== ''
+                    && ($row['store_name'] ?? null) === $storeName
+                    && isset($wanted[$this->directoryOf($path)])
+                    && !isset($seen[$path])
+                ) {
+                    // a list beside a set: a numeric path is an int key in PHP
+                    $seen[$path] = true;
+                    $paths[] = $path;
+                }
+            }
+        }
+
+        return $paths;
+    }
+
     #[Override]
     public function updateContentHash(string $id, string $contentHash): bool
     {
@@ -187,6 +257,16 @@ final readonly class DbRepository implements MaintenanceRepositoryInterface
             ->one();
 
         return $row;
+    }
+
+    /**
+     * {@see File::directory()} for a path that has not been mapped to a File.
+     */
+    private function directoryOf(string $path): string
+    {
+        $slash = strrpos($path, '/');
+
+        return $slash === false || $slash === 0 ? $path : substr($path, 0, $slash);
     }
 
     /**

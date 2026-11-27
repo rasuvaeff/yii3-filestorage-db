@@ -18,7 +18,7 @@ final readonly class FixedKeyGenerator implements ContentAddressedKeyGeneratorIn
     public function __construct(private string $key) {}
 
     #[Override]
-    public function generate(string $scope, string $sha256): string
+    public function generate(string $scope, string $sha256, ?string $extension = null): string
     {
         return $this->key;
     }

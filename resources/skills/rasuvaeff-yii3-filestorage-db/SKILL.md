@@ -59,9 +59,22 @@ delete. Namespace `Rasuvaeff\Yii3FilestorageDb\`. Full API reference:
    can have drifted. Pairing the real hash with a stale size in the ledger makes
    every later add of that content fail on the size check.
 
-9. **No suppressions.** No `@psalm-suppress`, no baseline. Fix the root cause.
+9. **`DeduplicatingStorage` and `filestorage:deduplicate` must compute the same
+   content key.** Same `DedupScope`, same key generator, same `ExtensionMap`:
+   the live path passes `extensionFor($detectedType)`, the command
+   `extensionFor($file->mimeType)` — the type the row recorded at add time. Any
+   divergence puts migrated rows on keys no upload ever joins.
 
-10. **Verification is mandatory.** `make build` *and* `make test-integration` —
+10. **`referencedPaths()` decides in PHP, not in SQL.** The database narrows
+    with `LIKE '<dir>/%'`; the exact store and directory comparison happens
+    after, because MySQL's default collation is case-insensitive and `LIKE`
+    also matches subdirectories. Never add `DISTINCT` there — it would fold
+    `A/x` and `a/x` before the check and can lose a real reference, which the
+    orphan sweep turns into deleted bytes.
+
+11. **No suppressions.** No `@psalm-suppress`, no baseline. Fix the root cause.
+
+12. **Verification is mandatory.** `make build` *and* `make test-integration` —
     `composer build` runs the Unit suite only.
 
 ## Gotchas
@@ -72,8 +85,11 @@ delete. Namespace `Rasuvaeff\Yii3FilestorageDb\`. Full API reference:
 - `DbRepository::save()` is a scoped update falling through to an insert. Do
   not "simplify" it into an upsert: an upsert matches on the primary key alone
   and would hand a row to another tenant.
-- The blob primary key is `sha256("store:path")`, because the pair itself
-  exceeds MySQL's index key length at a 512-character path.
+- The blob primary key is `sha256("store:path")`: a *unique* index over the
+  pair needs the whole 512-character path, which MySQL refuses under the
+  `COMPACT` row format. The non-unique `(store_name, relative_path)` index on
+  the file table gets away with a 191-character prefix on MySQL; on PostgreSQL
+  it needs `varchar_pattern_ops` or `LIKE 'x%'` ignores it.
 - A malformed row throws `InvalidFileRowException`. Never coerce values until
   `File::create()` stops refusing.
 - Table names come from typed value objects because `yiisoft/db-migration`

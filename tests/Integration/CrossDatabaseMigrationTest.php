@@ -7,6 +7,7 @@ namespace Rasuvaeff\Yii3FilestorageDb\Tests\Integration;
 use DateInterval;
 use DateTimeImmutable;
 use Nyholm\Psr7\Factory\Psr17Factory;
+use Rasuvaeff\Yii3Filestorage\File;
 use Rasuvaeff\Yii3Filestorage\Id\Uuid7IdGenerator;
 use Rasuvaeff\Yii3Filestorage\Mime\FinfoMimeTypeDetector;
 use Rasuvaeff\Yii3Filestorage\Path\RandomPathGenerator;
@@ -24,6 +25,7 @@ use Rasuvaeff\Yii3FilestorageDb\DeduplicatingStorage;
 use Rasuvaeff\Yii3FilestorageDb\DeduplicatingStorageFactory;
 use Rasuvaeff\Yii3FilestorageDb\Migration\M260807000000CreateFilestorageFileTable;
 use Rasuvaeff\Yii3FilestorageDb\Migration\M260807000001CreateFilestorageBlobTables;
+use Rasuvaeff\Yii3FilestorageDb\Migration\M261127000000AddFilestorageFileStorePathIndex;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\ContentAddressableInMemoryStore;
 use Testo\Assert;
 use Testo\Codecov\CoversNothing;
@@ -79,16 +81,28 @@ final class CrossDatabaseMigrationTest
             $builder = new MigrationBuilder(db: $db, informer: new NullMigrationInformer());
             $files = new M260807000000CreateFilestorageFileTable();
             $blobs = new M260807000001CreateFilestorageBlobTables();
+            $storePath = new M261127000000AddFilestorageFileStorePathIndex();
             $files->up($builder);
             $blobs->up($builder);
+            $storePath->up($builder);
 
             foreach (self::TABLES as $table) {
                 Assert::notNull($db->getTableSchema($table, true), "{$table} was not created");
             }
+            Assert::true(
+                \in_array('idx_filestorage_file_store_path', $this->indexNames($db), strict: true),
+                'the store/path index was not created',
+            );
 
             $this->deduplicatedAddsAndRemoves($db);
             $this->reservationsAndCollection($db);
+            $this->referencedPaths($db);
 
+            $storePath->down($builder);
+            Assert::false(
+                \in_array('idx_filestorage_file_store_path', $this->indexNames($db), strict: true),
+                'the store/path index was not dropped',
+            );
             $blobs->down($builder);
             $files->down($builder);
 
@@ -188,6 +202,67 @@ final class CrossDatabaseMigrationTest
         Assert::notNull($lease);
         Assert::true($ledger->completeDeletion($lease));
         Assert::null($ledger->find($blob));
+    }
+
+    /**
+     * The orphan sweep's lookup, on the engines whose `LIKE` and collation
+     * differ from SQLite's: MySQL compares `=` and `LIKE` case-insensitively
+     * by default, so the case variant comes back from the server and has to
+     * be dropped by the exact comparison. A 512-character path goes past the
+     * MySQL index prefix.
+     */
+    private function referencedPaths(ConnectionInterface $db): void
+    {
+        $repository = new DbRepository($db);
+        $long = 'g/' . str_repeat('x', 500);
+        $rows = [
+            'r1' => 'g/ab/cd/k1/original',
+            'r2' => 'g/ab/cd/k1/thumb.webp',
+            'r3' => 'g/ab/cd/k1/sub/deeper',
+            'r4' => 'G/AB/CD/K1/original',
+            'r5' => 'a_b/original',
+            'r6' => 'axb/original',
+            'r7' => 'root.txt',
+            'r8' => $long . '/original',
+        ];
+        foreach ($rows as $id => $path) {
+            $repository->save(File::create(
+                id: $id,
+                storeName: 'upload',
+                groupName: 'common',
+                relativePath: $path,
+                originalName: 'a.txt',
+                size: 1,
+                createdAt: $this->at('00:00'),
+            ));
+        }
+
+        $paths = $repository->referencedPaths('upload', ['g/ab/cd/k1', 'a_b', 'root.txt', $long]);
+        sort($paths);
+
+        $expected = ['a_b/original', 'g/ab/cd/k1/original', 'g/ab/cd/k1/thumb.webp', $long . '/original', 'root.txt'];
+        sort($expected);
+
+        Assert::same($paths, $expected);
+        Assert::same($repository->referencedPaths('upload', ['ROOT.TXT', 'g/ab/cd/k2']), []);
+        Assert::same($repository->referencedPaths('other', ['g/ab/cd/k1']), []);
+
+        foreach (array_keys($rows) as $id) {
+            $repository->delete($id);
+        }
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function indexNames(ConnectionInterface $db): array
+    {
+        $names = [];
+        foreach ($db->getSchema()->getTableIndexes('filestorage_file', true) as $index) {
+            $names[] = $index->name;
+        }
+
+        return $names;
     }
 
     private function storage(

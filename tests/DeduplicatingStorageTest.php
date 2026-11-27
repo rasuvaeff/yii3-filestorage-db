@@ -13,9 +13,11 @@ use Rasuvaeff\Yii3Filestorage\Exception\PolicyViolationException;
 use Rasuvaeff\Yii3Filestorage\Exception\RemoveException;
 use Rasuvaeff\Yii3Filestorage\Exception\StoreException;
 use Rasuvaeff\Yii3Filestorage\Id\Uuid7IdGenerator;
+use Rasuvaeff\Yii3Filestorage\Mime\ExtensionMap;
 use Rasuvaeff\Yii3Filestorage\Mime\FinfoMimeTypeDetector;
 use Rasuvaeff\Yii3Filestorage\Mime\MimeTypeDetectorInterface;
 use Rasuvaeff\Yii3Filestorage\Path\ContentAddressedKeyGeneratorInterface;
+use Rasuvaeff\Yii3Filestorage\Path\FlatSha256KeyGenerator;
 use Rasuvaeff\Yii3Filestorage\Path\RandomPathGenerator;
 use Rasuvaeff\Yii3Filestorage\Policy\DeliveryPolicyRegistry;
 use Rasuvaeff\Yii3Filestorage\Policy\PolicyRegistry;
@@ -356,6 +358,39 @@ final class DeduplicatingStorageTest
     }
 
     /**
+     * A flat key carries the extension of the *detected* type — `a.txt` is
+     * named by the client, `text/plain` is what the bytes are.
+     */
+    public function theContentKeyCarriesTheDetectedExtension(): void
+    {
+        $storage = $this->factory(keys: new FlatSha256KeyGenerator())->create();
+
+        $file = $storage->add($this->upload('hello'));
+
+        Assert::same($file->relativePath, (new FlatSha256KeyGenerator())->generate(
+            DedupScope::TenantGroup->keyFor('common', null),
+            hash('sha256', 'hello'),
+            'txt',
+        ));
+    }
+
+    /**
+     * The application's `extensionOverrides` decide the extension here too,
+     * exactly as they do for the base facade's unique paths.
+     */
+    public function theExtensionMapOverridesReachTheContentKey(): void
+    {
+        $storage = $this->factory(
+            keys: new FlatSha256KeyGenerator(),
+            extensions: new ExtensionMap(['text/plain' => 'text']),
+        )->create();
+
+        $file = $storage->add($this->upload('hello'));
+
+        Assert::true(str_ends_with($file->relativePath, '.text'), $file->relativePath);
+    }
+
+    /**
      * A body whose length is only known once it has been read: the cap has to
      * be enforced during the read, because there is nothing to check before it.
      */
@@ -481,6 +516,7 @@ final class DeduplicatingStorageTest
         ?ContentAddressedKeyGeneratorInterface $keys = null,
         ?PolicyRegistry $policies = null,
         ?MimeTypeDetectorInterface $mimeTypeDetector = null,
+        ?ExtensionMap $extensions = null,
     ): DeduplicatingStorageFactory {
         $stores ??= new StoreRegistry([$this->store]);
         $clock = new StaticClock($this->at('00:00'));
@@ -497,6 +533,7 @@ final class DeduplicatingStorageTest
             clock: $clock,
             scopes: $scopes,
             keys: $keys,
+            extensions: $extensions,
         );
     }
 

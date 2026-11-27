@@ -179,9 +179,34 @@ MSI without any test getting worse.
   An upsert matches on the primary key alone, so another tenant's row would be
   silently taken over. Ids are unguessable; "unguessable" is not a boundary.
 - **The blob primary key is `sha256(store:path)`.** A unique index over the
-  pair would say the same thing but exceeds MySQL's key length at a
-  512-character path. The derived key also makes two writers racing to create
-  one blob collide on the primary key instead of producing two rows.
+  pair would say the same thing but needs the whole 512-character path in the
+  key — a prefix cannot enforce uniqueness — which MySQL refuses under the
+  `COMPACT` row format (767 bytes per column, `utf8mb4` is four a character).
+  The derived key also makes two writers racing to create one blob collide on
+  the primary key instead of producing two rows.
+- **`referencedPaths()` narrows in SQL and decides in PHP.** `LIKE '<dir>/%'`
+  also matches subdirectories, and MySQL's default `utf8mb4_0900_ai_ci`
+  compares `LIKE` *and* `=` case- and accent-insensitively — so every row is
+  checked against the exact store name and the exact `File::directory()`.
+  There is no `DISTINCT`: under that collation it folds `A/x` and `a/x` into
+  one row before the check, and if the survivor is the one the check drops,
+  `gc --orphans` deletes referenced bytes. The result is a list beside a set,
+  because a numeric path used as an array key becomes an int.
+- **The store/path index differs per engine, deliberately.**
+  `M261127000000AddFilestorageFileStorePathIndex` indexes `relative_path(191)`
+  on MySQL (the 767-byte *per-column prefix* limit of `COMPACT`; the composite
+  key may exceed it — verified on MySQL 8.4 `ROW_FORMAT=COMPACT`) and uses
+  `varchar_pattern_ops` on PostgreSQL — under any non-`C` collation a plain
+  btree is not used for `LIKE 'x%'`. Verified with `EXPLAIN` on MySQL 8.4 and
+  PostgreSQL 17 (`en_US.utf8`): both answer the lookup by range scans on this
+  index. Only the default branch runs under mutation (SQLite);
+  `CrossDatabaseMigrationTest` covers the other two.
+- **The content key's extension comes from one place.** `DeduplicatingStorage`
+  passes `ExtensionMap::extensionFor()` of the detected type,
+  `DeduplicateCommand` of the row's recorded `mimeType` — the same value, since
+  the row records what was detected. Both take core's DI-bound `ExtensionMap`
+  so `extensionOverrides` apply to both; `aFileTheLivePathSharedIsAlreadyWhereTheCommandWouldPutIt`
+  pins the parity with `FlatSha256KeyGenerator`.
 - **A malformed row is `InvalidFileRowException`, never a coerced `File`.**
   Coercing until `File::create()` stops refusing turns a corrupted row into a
   plausible record pointing at the wrong object.
