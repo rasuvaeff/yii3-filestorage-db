@@ -46,6 +46,11 @@ final readonly class DbRepository implements MaintenanceRepositoryInterface
      */
     private const int DIRECTORY_BATCH = 200;
 
+    /**
+     * Ids per `findMany()` statement, under the same 999-parameter ceiling.
+     */
+    private const int ID_BATCH = 500;
+
     private string $table;
     private FileRowMapper $mapper;
 
@@ -72,6 +77,45 @@ final readonly class DbRepository implements MaintenanceRepositoryInterface
         $row = $this->row($id);
 
         return $row === null ? null : $this->mapper->fromRow($row);
+    }
+
+    /**
+     * Several rows in one statement per batch of ids, in no particular order.
+     *
+     * Scoped exactly like {@see find()}: an id that does not exist and an id
+     * of another tenant are both simply absent from the result. The id is
+     * compared exactly here as well — MySQL's default collation would also
+     * answer for an id differing only in case.
+     *
+     * @param list<string> $ids
+     *
+     * @return list<File>
+     *
+     * @throws InvalidFileRowException
+     * @throws MissingScopeException
+     */
+    public function findMany(array $ids): array
+    {
+        $files = [];
+
+        foreach (array_chunk(array_values(array_unique($ids)), self::ID_BATCH) as $batch) {
+            $wanted = array_fill_keys($batch, value: true);
+
+            /** @var list<array<string, mixed>> $rows */
+            $rows = (new Query($this->db))
+                ->from($this->table)
+                ->where($this->scoped(['in', 'id', $batch]))
+                ->all();
+
+            foreach ($rows as $row) {
+                $file = $this->mapper->fromRow($row);
+                if (isset($wanted[$file->id])) {
+                    $files[] = $file;
+                }
+            }
+        }
+
+        return $files;
     }
 
     /**

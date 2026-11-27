@@ -383,6 +383,46 @@ final class DbRepositoryTest
         Assert::same(iterator_to_array($maintenance->files(), preserve_keys: false)[0]->id ?? null, 'b');
     }
 
+    /**
+     * One statement for a page of ids instead of one per id — what
+     * `-attachments` lists an owner's files with — keyed by id, scoped like
+     * `find()`, and silent about ids it cannot see.
+     */
+    public function findManyReadsSeveralRowsAtOnceWithinTheScope(): void
+    {
+        $scope = new FixedScope('tenant-a');
+        $scoped = new DbRepository($this->database->db, scopes: $scope);
+        $scoped->save(SqliteDatabase::file('a'));
+        $scoped->save(SqliteDatabase::file('b'));
+        $scope->switchTo('tenant-b');
+        $scoped->save(SqliteDatabase::file('c'));
+        $scope->switchTo('tenant-a');
+
+        $ids = array_map(static fn(File $file): string => $file->id, $scoped->findMany(['b', 'a', 'c', 'missing', 'a']));
+        sort($ids);
+
+        Assert::same($ids, ['a', 'b']);
+        Assert::same($scoped->findMany([]), []);
+    }
+
+    public function findManyAnswersForMoreIdsThanOneStatementBinds(): void
+    {
+        $ids = [];
+        for ($i = 0; $i < 1_100; $i++) {
+            $ids[] = "f{$i}";
+            $this->repository->save(SqliteDatabase::file("f{$i}"));
+        }
+
+        Assert::same(\count($this->repository->findMany($ids)), 1_100);
+    }
+
+    public function findManyRefusesANullScopeFromABoundProvider(): void
+    {
+        $scoped = new DbRepository($this->database->db, scopes: new FixedScope(null));
+
+        Assert::true($this->refusedForMissingScope(static fn(): mixed => $scoped->findMany(['a'])));
+    }
+
     public function aTenantSeesItsOwnRows(): void
     {
         $scope = new FixedScope('tenant-a');
