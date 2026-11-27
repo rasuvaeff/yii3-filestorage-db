@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace Rasuvaeff\Yii3FilestorageDb\Tests;
 
 use DateTimeImmutable;
-use LogicException;
 use Nyholm\Psr7\Factory\Psr17Factory;
 use Psr\Clock\ClockInterface;
 use Psr\Http\Message\StreamFactoryInterface;
@@ -281,19 +280,10 @@ final class ConfigWiringTest
     {
         $definitions = $this->definitions($params);
         if ($core) {
-            // Core's own definitions, loaded the way `yiisoft/config` would
-            // load them: this package's keys on top, and neither claiming one
-            // of the other's — `yiisoft/config` refuses such a duplicate key,
-            // so a silent `+=` here would hide exactly the failure this test
-            // family exists to catch.
-            $coreDefinitions = $this->coreDefinitions();
-            $overlap = array_intersect_key($definitions, $coreDefinitions);
-            if ($overlap !== []) {
-                throw new LogicException(
-                    'Package and core DI definitions overlap: ' . implode(', ', array_keys($overlap)),
-                );
-            }
-            $definitions += $coreDefinitions;
+            // Core's own definitions beneath this package's. That the two
+            // packages claim no key of each other's is checked by
+            // `bin/config-merge-harness`, which runs the real config plugin.
+            $definitions += $this->coreDefinitions();
         }
 
         $definitions[ConnectionInterface::class] = fn(): ConnectionInterface => $this->database->db;

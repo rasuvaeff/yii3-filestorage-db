@@ -23,7 +23,7 @@ packages are built against it.
 
 - PHP 8.3+
 - `ext-json`
-- `rasuvaeff/yii3-filestorage` ^0.1
+- `rasuvaeff/yii3-filestorage` ^0.8.2
 - `yiisoft/db` ^2.0 (plus a driver: `yiisoft/db-sqlite`, `-mysql`, `-pgsql`, …)
 - `symfony/console` ^6.4 || ^7.0 || ^8.0, `psr/http-factory` ^1.0 and
   `psr/http-message` ^2.0 — for `filestorage:deduplicate`, which reads objects
@@ -204,8 +204,8 @@ That override points `StorageInterface` at a facade the factory *builds*, so the
 factory cannot ask for `StorageInterface` to get the plain one — it would be
 handed the object it is in the middle of constructing. It asks core for
 `Storage::class` instead, the concrete id core binds alongside the interface for
-exactly this. Nothing to configure; it is why this package requires core
-`^0.1.1`, and the same rule applies to any decorator you write yourself.
+exactly this since 0.1.1. Nothing to configure, and the same rule applies to any
+decorator you write yourself.
 
 `create()` refuses three configurations that would otherwise lose data quietly,
 and says what to do instead: a store that does not implement

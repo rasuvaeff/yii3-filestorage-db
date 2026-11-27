@@ -5,6 +5,10 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.2.0 — 2026-11-27
+
+- **Changed:** requires `rasuvaeff/yii3-filestorage` `^0.8.2`, so the whole family installs on one line of the core. This release no longer installs with core 0.1; stay on 0.1.1 for those.
+
 ## 0.1.1 — 2026-11-27
 
 - `composer mutation` now runs Infection with `--with-uncovered`, so code the tests execute without naming it in `#[Covers]` is mutated and counted (overall MSI was 83% when measured this way, now 93% against `minMsi` 89). Added tests for the add failure path (`AddException`, release of the reservation), `remove()` failures, the digest pass (declared size over the cap, a stalled body), the ledger's insert-race retry, the lost-activation and busy-revive races (a `ConnectionInterface` decorator injects them), the ledger row readers, index columns of the migrations, claim order, and the command's failure, advice and summary messages. `infection.json5` gained the template's signature-default ignore regex and disabled `PublicVisibility`/`ProtectedVisibility`. `DbRepository::files()` now lists its parameters one per line (no behaviour change) so the ignore regex matches its default.

@@ -104,7 +104,7 @@ MSI without any test getting worse.
   factory's product; a factory asking for that interface is handed the object
   being built, and the container answers `CircularReferenceException` naming an
   interface the recipe never mentions. Core binds `Storage::class` alongside the
-  interface for exactly this (`^0.1.1`), and
+  interface for exactly this (since core 0.1.1), and
   `ConfigWiringTest::theDocumentedApplicationOverrideResolves` is the only test
   in the family that loads *both* packages' `config/di.php` and executes the
   recipe. Every other wiring test here sees one package and would pass with the
