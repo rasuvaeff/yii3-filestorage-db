@@ -387,7 +387,7 @@ final class DeduplicatingStorageTest
 
         $file = $storage->add($this->upload('hello'));
 
-        Assert::string($file->relativePath)->endsWith('.text');
+        Assert::true(str_ends_with($file->relativePath, '.text'), $file->relativePath);
     }
 
     /**
