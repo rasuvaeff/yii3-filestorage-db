@@ -132,8 +132,8 @@ Implements core's `StorageInterface`. **Not bound by this package** — replacin
 `StorageInterface` is a root-application override, because core owns that key.
 The factory takes the base facade as core's concrete `Storage::class`, not as
 `StorageInterface`: the override below points that interface at the factory's own
-product, so asking for it would be a `CircularReferenceException`. Hence core
-`^0.1.1`, which is the release that added the concrete id.
+product, so asking for it would be a `CircularReferenceException`. Core has had
+the concrete id since 0.1.1.
 
 ```php
 StorageInterface::class => static fn (DeduplicatingStorageFactory $f): StorageInterface
