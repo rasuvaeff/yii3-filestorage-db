@@ -8,6 +8,7 @@ use DateInterval;
 use Psr\Clock\ClockInterface;
 use Rasuvaeff\Yii3Filestorage\Exception\InvalidConfigException;
 use Rasuvaeff\Yii3Filestorage\Id\IdGeneratorInterface;
+use Rasuvaeff\Yii3Filestorage\Mime\ExtensionMap;
 use Rasuvaeff\Yii3Filestorage\Mime\MimeTypeDetectorInterface;
 use Rasuvaeff\Yii3Filestorage\Path\ContentAddressedKeyGeneratorInterface;
 use Rasuvaeff\Yii3Filestorage\Path\Sha256KeyGenerator;
@@ -49,6 +50,7 @@ final readonly class DeduplicatingStorageFactory
         private ClockInterface $clock,
         private ?FileScopeProviderInterface $scopes = null,
         private ?ContentAddressedKeyGeneratorInterface $keys = null,
+        private ?ExtensionMap $extensions = null,
     ) {}
 
     /**
@@ -108,6 +110,7 @@ final readonly class DeduplicatingStorageFactory
             deleteGracePeriod: $deleteGracePeriod,
             defaultGroup: $defaultGroup,
             scopes: $this->scopes,
+            extensions: $this->extensions ?? new ExtensionMap(),
         );
     }
 }

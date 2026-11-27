@@ -14,6 +14,7 @@ use Rasuvaeff\Yii3Filestorage\Exception\BlobBusyException;
 use Rasuvaeff\Yii3Filestorage\Exception\RemoveException;
 use Rasuvaeff\Yii3Filestorage\File;
 use Rasuvaeff\Yii3Filestorage\Id\IdGeneratorInterface;
+use Rasuvaeff\Yii3Filestorage\Mime\ExtensionMap;
 use Rasuvaeff\Yii3Filestorage\Mime\MimeTypeDetectorInterface;
 use Rasuvaeff\Yii3Filestorage\Path\ContentAddressedKeyGeneratorInterface;
 use Rasuvaeff\Yii3Filestorage\Policy\PolicyRegistry;
@@ -87,6 +88,7 @@ final readonly class DeduplicatingStorage implements StorageInterface
         private DateInterval $deleteGracePeriod = new DateInterval('PT1H'),
         private string $defaultGroup = 'common',
         private ?FileScopeProviderInterface $scopes = null,
+        private ExtensionMap $extensions = new ExtensionMap(),
     ) {}
 
     #[Override]
@@ -124,7 +126,13 @@ final readonly class DeduplicatingStorage implements StorageInterface
         [$hash, $size] = $digest;
         $blob = BlobId::create(
             $this->store->name(),
-            $this->keys->generate($this->scope->keyFor($groupName, $this->scopes?->currentScopeId()), $hash),
+            $this->keys->generate(
+                scope: $this->scope->keyFor($groupName, $this->scopes?->currentScopeId()),
+                sha256: $hash,
+                // what the base facade would name the same file — and what
+                // `filestorage:deduplicate` derives from the type the row records
+                extension: $this->extensions->extensionFor($mimeType),
+            ),
         );
 
         return $this->share(

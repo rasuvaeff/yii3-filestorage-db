@@ -46,6 +46,10 @@ MigrationService::class => [
 `M260807000000CreateFilestorageFileTable` → `filestorage_file`.
 `M260807000001CreateFilestorageBlobTables` → `filestorage_blob` +
 `filestorage_blob_reservation`.
+`M261127000000AddFilestorageFileStorePathIndex` (0.3.0) → index
+`idx_<file table>_store_path` on `(store_name, relative_path)` for the orphan
+sweep: MySQL `relative_path(191)` prefix, PostgreSQL `varchar_pattern_ops` (a
+plain btree is not used for `LIKE 'x%'` under a non-`C` collation).
 
 No `reference_count` column: a reference is a `filestorage_file` row with the
 blob's id, and guards ask `NOT EXISTS`. No foreign keys.
@@ -78,9 +82,17 @@ $repository->find(string $id): ?File;
 $repository->save(File $file, ?BlobId $blob = null): void;  // blob: ledger only
 $repository->delete(string $id): bool;
 $repository->files(?string $afterId = null, int $limit = 1000): iterable<File>;
+$repository->referencedPaths(string $storeName, array $directories): list<string>;  // gc --orphans, per page
 $repository->updateContentHash(string $id, string $contentHash): bool;
 $repository->findBlobRowId(string $id): ?string;            // scoped, for the ledger
 ```
+
+`referencedPaths()`: paths of the store's rows whose `File::directory()` is one
+of `$directories`. One parameterized statement per 200 directories
+(`LIKE '<dir>/%'` via `LikeMode::StartsWith`, plus `IN` for root-level rows);
+`_`/`%` are literal; store and directory are compared **exactly in PHP**
+(MySQL's default collation is case-insensitive), no `DISTINCT` (it would fold
+case variants before the exact check). Scoped like every other statement.
 
 `save()` is a scoped update falling through to an insert — not an upsert, which
 would match on the primary key alone and hand a row to another tenant.
@@ -151,6 +163,14 @@ StorageInterface::class => static fn (DeduplicatingStorageFactory $f): StorageIn
 this package's `DbBlobLedger`, or when the ledger and the repository are on
 different connections (which would make `commit()` two transactions).
 
+Content key: `ContentAddressedKeyGeneratorInterface::generate(scope, sha256,
+extension)` — the factory's optional `keys` (default `Sha256KeyGenerator`,
+which ignores the extension) and `extensions` (core's `ExtensionMap`, bound by
+core with `extensionOverrides`). The extension is
+`ExtensionMap::extensionFor($detectedMediaType)` (`bin` for an unknown type).
+Bind core's `FlatSha256KeyGenerator` for `<scope>/ab/cd/<sha>.<ext>` with a
+store on `FlatSiblingLayout`.
+
 `add()`: hash → `reserve()` → `putIfAbsent()` → `commit()`; `release()` on any
 failure. `remove()` is `releaseFile()` — it never deletes bytes. Everything
 else delegates to the base facade.
@@ -180,7 +200,9 @@ ledger-managed content keys. Bound by this package and named in
 | `--max-bytes` | 104857600 | Above it a row keeps its unique object, as a live add would |
 
 Per row: read → hash → `reserve()` → `putIfAbsent()` → `commit()`, `release()` on
-failure. The size in the ledger is **counted while hashing**, not taken from the
+failure. The key comes from the same `keys` and `ExtensionMap` as the live path,
+with the extension of the row's recorded `mimeType`, so a migrated row lands
+exactly where a live add of the same bytes would. The size in the ledger is **counted while hashing**, not taken from the
 row — a row whose recorded size drifted would otherwise pair the real hash with a
 stale size and make every later add of that content fail.
 

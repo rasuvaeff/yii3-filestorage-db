@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.3.0 — 2026-11-27
+
+- **Changed:** requires `rasuvaeff/yii3-filestorage` `^0.9`, whose maintenance and key-generator contracts changed (see core's 0.9.0 notes). This release no longer installs with core 0.8; stay on 0.2.1 for that.
+- Enh #14: `DbRepository::referencedPaths(string $storeName, array $directories): list<string>` — what `filestorage:gc --orphans` asks per listing page. One parameterized statement per 200 directories (`LIKE '<dir>/%'` with `_`/`%` taken literally, plus root-level paths), the tenant predicate as everywhere, and an exact store and directory comparison in PHP, because MySQL's default collation compares case-insensitively.
+- Enh #14: new migration `M261127000000AddFilestorageFileStorePathIndex` — an index on `filestorage_file (store_name, relative_path)` so that lookup is a range scan. MySQL indexes a 191-character prefix of the path; PostgreSQL uses `varchar_pattern_ops`, without which a btree is not used for `LIKE 'x%'`. Run `migrate:up` after upgrading.
+- Enh #14: `DeduplicatingStorage` and `filestorage:deduplicate` pass the extension of the detected media type (core's `ExtensionMap`, `bin` for an unknown type) to `ContentAddressedKeyGeneratorInterface::generate()`, so core's `FlatSha256KeyGenerator` works with deduplication. The command takes it from the row's recorded `mimeType`, so a migrated row lands where a live add of the same bytes would. `DeduplicatingStorage`, `DeduplicatingStorageFactory` and `DeduplicateCommand` take an optional `ExtensionMap` (last parameter); `config/di.php` injects core's binding. With the default `Sha256KeyGenerator` keys do not move.
+- CI: the backward-compatibility step tolerates a report across a pre-1.0 minor declared in `CHANGELOG.md`, as the template does.
+- `extra.branch-alias.dev-master` is `0.3.x-dev` (was a stale `0.1.x-dev`).
+
 ## 0.2.1 — 2026-11-27
 
 - **Fixed:** removing a deduplicated file failed on MySQL (`1054 Unknown column '1'`) and PostgreSQL (`42703 column "1" does not exist`). The ledger's `NOT EXISTS` guards selected the string `'1'`, which `yiisoft/db` quotes as a column name; SQLite accepts it. Every statement carrying the guard was affected: `releaseFile()`, `release()`, `expireReservations()`, `claimForDeletion()`, `completeDeletion()` (#12).

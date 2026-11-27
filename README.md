@@ -23,7 +23,7 @@ packages are built against it.
 
 - PHP 8.3+
 - `ext-json`
-- `rasuvaeff/yii3-filestorage` ^0.8.2
+- `rasuvaeff/yii3-filestorage` ^0.9
 - `yiisoft/db` ^2.0 (plus a driver: `yiisoft/db-sqlite`, `-mysql`, `-pgsql`, …)
 - `symfony/console` ^6.4 || ^7.0 || ^8.0, `psr/http-factory` ^1.0 and
   `psr/http-message` ^2.0 — for `filestorage:deduplicate`, which reads objects
@@ -61,7 +61,11 @@ return [
 ```
 
 Three tables: `filestorage_file`, `filestorage_blob` and
-`filestorage_blob_reservation`.
+`filestorage_blob_reservation`, and an index on `filestorage_file`
+`(store_name, relative_path)` for the orphan sweep (`M261127000000…`, added in
+0.3.0 — an existing installation picks it up with the next `migrate:up`). On
+MySQL it indexes the first 191 characters of the path, on PostgreSQL it uses
+`varchar_pattern_ops` so that `LIKE 'dir/%'` can use it.
 
 > **`yiisoft/db-migration` ^2.1 is a hard requirement.** On 2.0.x this exact
 > registration silently found nothing: namespace resolution matched a
@@ -217,6 +221,28 @@ connection than the repository — which makes `commit()` two transactions rathe
 than one, so a crash between them leaves a row with no reference or a reference
 with no row.
 
+The content key comes from core's `ContentAddressedKeyGeneratorInterface`
+(`Sha256KeyGenerator` unless one is bound), and it is given the extension of
+the *detected* media type through core's `ExtensionMap` — the same one, with the
+same `extensionOverrides`, that names unique files. `Sha256KeyGenerator` ignores
+it, so existing keys do not move. For a flat tree such as
+`blobs/ab/cd/<sha>.<ext>`, bind core's `FlatSha256KeyGenerator` and give the
+store `FlatSiblingLayout`:
+
+```php
+use Rasuvaeff\Yii3Filestorage\Path\ContentAddressedKeyGeneratorInterface;
+use Rasuvaeff\Yii3Filestorage\Path\FlatSha256KeyGenerator;
+
+return [
+    ContentAddressedKeyGeneratorInterface::class => FlatSha256KeyGenerator::class,
+];
+```
+
+`filestorage:deduplicate` takes the same generator and the same `ExtensionMap`,
+and derives the extension from the media type the row records — the one
+detected when the file was added — so a migrated row lands exactly where a live
+`add()` of the same bytes would.
+
 Everything the consumer sees is unchanged. `add()` still returns a `File` with
 its own id, group, description and metadata; two uploads of the same bytes just
 end up pointing at one object. Above `dedupMaxBytes` an upload silently takes
@@ -302,6 +328,15 @@ do {
 
 The cursor keeps the tenant predicate.
 
+`referencedPaths($storeName, $directories)` is what `filestorage:gc --orphans`
+asks once per listing page: the paths of the store's rows that live in any of
+the given directories. It runs one parameterized statement per 200 directories
+(`relative_path LIKE '<dir>/%'` or equal to a root-level path), takes `_` and
+`%` in a directory literally, and then compares the store and the directory
+exactly in PHP — MySQL's default collation would otherwise answer for `A/x` when
+asked about `a`. It keeps the tenant predicate too, which is one more reason the
+sweep runs from an entry point with no scope provider bound.
+
 ## Storage format
 
 | Decision | Why |
@@ -310,7 +345,7 @@ The cursor keeps the tenant predicate.
 | `metadata` is JSON in a text column | The shape is a flat `array<string, scalar\|null>` and nothing queries inside it, so a native JSON column would buy nothing and cost portability |
 | `save()` is a scoped update falling through to an insert, not an upsert | An upsert matches on the primary key alone, so another tenant's row would be silently taken over. Ids are unguessable, but "unguessable" is not a boundary |
 | A malformed row is an exception, not a coerced `File` | `InvalidFileRowException`. Coercing until `File::create()` stops refusing turns a corrupted row into a plausible record pointing at the wrong object |
-| The blob primary key is `sha256(store:path)` | The pair itself exceeds MySQL's index key length at a 512-character path, and a derived key makes two writers racing to create one blob collide on the primary key instead of producing two rows |
+| The blob primary key is `sha256(store:path)` | A unique index over the pair would need the whole 512-character path in the key (a prefix cannot enforce uniqueness), which MySQL refuses under the `COMPACT` row format, and a derived key makes two writers racing to create one blob collide on the primary key instead of producing two rows |
 
 ## Examples
 

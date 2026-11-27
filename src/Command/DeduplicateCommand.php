@@ -9,6 +9,7 @@ use Override;
 use Psr\Clock\ClockInterface;
 use Psr\Http\Message\StreamFactoryInterface;
 use Rasuvaeff\Yii3Filestorage\File;
+use Rasuvaeff\Yii3Filestorage\Mime\ExtensionMap;
 use Rasuvaeff\Yii3Filestorage\Path\ContentAddressedKeyGeneratorInterface;
 use Rasuvaeff\Yii3Filestorage\Path\Sha256KeyGenerator;
 use Rasuvaeff\Yii3Filestorage\Repository\FileScopeProviderInterface;
@@ -77,6 +78,7 @@ final class DeduplicateCommand extends Command
         private readonly ?ContentAddressedKeyGeneratorInterface $keys = null,
         private readonly DateInterval $reservationTtl = new DateInterval('PT15M'),
         private readonly DateInterval $deleteGracePeriod = new DateInterval('PT1H'),
+        private readonly ?ExtensionMap $extensions = null,
     ) {
         parent::__construct();
     }
@@ -328,8 +330,11 @@ final class DeduplicateCommand extends Command
         $blob = BlobId::create(
             $store->name(),
             ($this->keys ?? new Sha256KeyGenerator())->generate(
-                $scope->keyFor($file->groupName, $this->scopes?->currentScopeId()),
-                $hash,
+                scope: $scope->keyFor($file->groupName, $this->scopes?->currentScopeId()),
+                sha256: $hash,
+                // the row records the type detected at add time, so this is the
+                // extension the live path chose for the same bytes
+                extension: ($this->extensions ?? new ExtensionMap())->extensionFor($file->mimeType),
             ),
         );
 

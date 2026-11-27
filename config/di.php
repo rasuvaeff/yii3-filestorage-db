@@ -5,6 +5,7 @@ declare(strict_types=1);
 use Psr\Clock\ClockInterface;
 use Psr\Http\Message\StreamFactoryInterface;
 use Rasuvaeff\Yii3Filestorage\Id\IdGeneratorInterface;
+use Rasuvaeff\Yii3Filestorage\Mime\ExtensionMap;
 use Rasuvaeff\Yii3Filestorage\Mime\MimeTypeDetectorInterface;
 use Rasuvaeff\Yii3Filestorage\Policy\PolicyRegistry;
 use Rasuvaeff\Yii3Filestorage\Storage;
@@ -114,6 +115,7 @@ return [
         IdGeneratorInterface $idGenerator,
         PolicyRegistry $policies,
         ClockInterface $clock,
+        ExtensionMap $extensions,
         ?FileScopeProviderInterface $scopes = null,
         ?ContentAddressedKeyGeneratorInterface $keys = null,
     ): DeduplicatingStorageFactory => new DeduplicatingStorageFactory(
@@ -127,19 +129,22 @@ return [
         clock: $clock,
         scopes: $scopes,
         keys: $keys,
+        extensions: $extensions,
     ),
 
     // The migration for existing data. It lives here rather than in core
     // because it has to produce byte-identical content keys to the
     // DeduplicatingStorage the application configured — same DedupScope, same
-    // scope provider — and a second copy of that decision in core is how the
-    // two drift into keys that never join.
+    // scope provider, same ExtensionMap (core's, carrying the application's
+    // `extensionOverrides`) — and a second copy of that decision in core is how
+    // the two drift into keys that never join.
     DeduplicateCommand::class => static fn (
         StoreRegistry $stores,
         DbRepository $repository,
         BlobLedgerInterface $ledger,
         StreamFactoryInterface $streams,
         ClockInterface $clock,
+        ExtensionMap $extensions,
         ?FileScopeProviderInterface $scopes = null,
         ?ContentAddressedKeyGeneratorInterface $keys = null,
     ): DeduplicateCommand => new DeduplicateCommand(
@@ -150,5 +155,6 @@ return [
         clock: $clock,
         scopes: $scopes,
         keys: $keys,
+        extensions: $extensions,
     ),
 ];

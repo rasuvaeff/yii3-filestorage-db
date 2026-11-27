@@ -14,6 +14,7 @@ use Rasuvaeff\Yii3FilestorageDb\DbRepository;
 use Rasuvaeff\Yii3FilestorageDb\FileTableName;
 use Rasuvaeff\Yii3FilestorageDb\Migration\M260807000000CreateFilestorageFileTable;
 use Rasuvaeff\Yii3FilestorageDb\Migration\M260807000001CreateFilestorageBlobTables;
+use Rasuvaeff\Yii3FilestorageDb\Migration\M261127000000AddFilestorageFileStorePathIndex;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\SqliteDatabase;
 use Testo\Assert;
 use Testo\Codecov\CoversNothing;
@@ -97,6 +98,7 @@ final class SqliteIntegrationTest
         Assert::same($this->migrations->getNewMigrations(), [
             M260807000000CreateFilestorageFileTable::class,
             M260807000001CreateFilestorageBlobTables::class,
+            M261127000000AddFilestorageFileStorePathIndex::class,
         ]);
     }
 
@@ -107,6 +109,12 @@ final class SqliteIntegrationTest
         Assert::notNull($this->db->getTableSchema('filestorage_file', true));
         Assert::notNull($this->db->getTableSchema('filestorage_blob', true));
         Assert::notNull($this->db->getTableSchema('filestorage_blob_reservation', true));
+
+        $indexes = array_map(
+            static fn(object $index): string => $index->name,
+            $this->db->getSchema()->getTableIndexes('filestorage_file', true),
+        );
+        Assert::true(\in_array('idx_filestorage_file_store_path', $indexes, strict: true));
     }
 
     public function aSecondRunHasNothingLeftToApply(): void

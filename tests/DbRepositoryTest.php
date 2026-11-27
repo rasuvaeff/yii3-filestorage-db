@@ -211,6 +211,104 @@ final class DbRepositoryTest
         Assert::same(iterator_to_array($scoped->files(), preserve_keys: false), []);
     }
 
+    /**
+     * The orphan sweep's question: which rows live in these directories. A
+     * row in a subdirectory, in another directory, or in another store is
+     * not an answer, and a root-level row is its own directory.
+     */
+    public function referencedPathsAnswersForExactlyTheAskedDirectories(): void
+    {
+        $rows = [
+            'a' => 'g/ab/cd/k1/original',
+            'b' => 'g/ab/cd/k1/thumb.webp',
+            'c' => 'g/ab/cd/k1/sub/deeper',
+            'd' => 'g/ab/cd/k2/original',
+            'e' => 'root.txt',
+        ];
+        foreach ($rows as $id => $path) {
+            $this->repository->save(SqliteDatabase::file($id, relativePath: $path));
+        }
+        $this->repository->save(SqliteDatabase::file('f', relativePath: 'g/ab/cd/k1/elsewhere', storeName: 'other'));
+
+        $paths = $this->repository->referencedPaths('upload', ['g/ab/cd/k1', 'root.txt']);
+        sort($paths);
+
+        Assert::same($paths, ['g/ab/cd/k1/original', 'g/ab/cd/k1/thumb.webp', 'root.txt']);
+        Assert::same($this->repository->referencedPaths('upload', ['g/ab/cd/k1/sub']), ['g/ab/cd/k1/sub/deeper']);
+        Assert::same($this->repository->referencedPaths('upload', ['g/ab/cd/k3']), []);
+    }
+
+    /**
+     * `_` and `%` in a directory are characters, not wildcards. Unescaped, a
+     * directory `a_b` would claim the rows of `axb`, and an orphan sweep would
+     * keep bytes nothing references — or, the other way round, a caller would
+     * learn about rows it never asked for.
+     */
+    public function referencedPathsTakesLikeWildcardsLiterally(): void
+    {
+        $this->repository->save(SqliteDatabase::file('a', relativePath: 'axb/original'));
+        $this->repository->save(SqliteDatabase::file('b', relativePath: 'a_b/original'));
+        $this->repository->save(SqliteDatabase::file('c', relativePath: '50x/original'));
+
+        Assert::same($this->repository->referencedPaths('upload', ['a_b']), ['a_b/original']);
+        Assert::same($this->repository->referencedPaths('upload', ['50%']), []);
+    }
+
+    /**
+     * SQLite's `LIKE` ignores ASCII case, and MySQL's default collation
+     * ignores case in `=` as well. The directory is compared exactly here, not
+     * by the database.
+     */
+    public function referencedPathsComparesTheDirectoryExactly(): void
+    {
+        $this->repository->save(SqliteDatabase::file('a', relativePath: 'G/AB/original'));
+        $this->repository->save(SqliteDatabase::file('b', relativePath: 'g/ab/original'));
+        $this->repository->save(SqliteDatabase::file('c', relativePath: 'ROOT'));
+
+        Assert::same($this->repository->referencedPaths('upload', ['g/ab', 'root']), ['g/ab/original']);
+    }
+
+    /**
+     * Two rows sharing one deduplicated object are one path. And a numeric
+     * path stays a string — PHP turns a numeric array key into an int.
+     */
+    public function referencedPathsListsEachPathOnceAndAsAString(): void
+    {
+        $this->repository->save(SqliteDatabase::file('a', relativePath: 'shared/original'));
+        $this->repository->save(SqliteDatabase::file('b', relativePath: 'shared/original'));
+        $this->repository->save(SqliteDatabase::file('c', relativePath: '123'));
+
+        Assert::same($this->repository->referencedPaths('upload', ['shared', 'shared']), ['shared/original']);
+        Assert::same($this->repository->referencedPaths('upload', ['123']), ['123']);
+    }
+
+    /**
+     * A listing page can name more directories than one statement should bind.
+     */
+    public function referencedPathsAnswersForMoreDirectoriesThanOneBatch(): void
+    {
+        $directories = [];
+        for ($i = 0; $i < 450; $i++) {
+            $directories[] = "d{$i}";
+            $this->repository->save(SqliteDatabase::file("f{$i}", relativePath: "d{$i}/original"));
+        }
+
+        Assert::same(\count($this->repository->referencedPaths('upload', $directories)), 450);
+    }
+
+    public function referencedPathsKeepsTheTenantPredicate(): void
+    {
+        $scope = new FixedScope('tenant-a');
+        $scoped = new DbRepository($this->database->db, scopes: $scope);
+        $scoped->save(SqliteDatabase::file('a', relativePath: 'g/original'));
+
+        Assert::same($scoped->referencedPaths('upload', ['g']), ['g/original']);
+
+        $scope->switchTo('tenant-b');
+
+        Assert::same($scoped->referencedPaths('upload', ['g']), []);
+    }
+
     public function aTenantSeesItsOwnRows(): void
     {
         $scope = new FixedScope('tenant-a');

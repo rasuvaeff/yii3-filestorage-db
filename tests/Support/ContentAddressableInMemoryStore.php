@@ -12,6 +12,7 @@ use Rasuvaeff\Yii3Filestorage\Exception\StoreException;
 use Rasuvaeff\Yii3Filestorage\File;
 use Rasuvaeff\Yii3Filestorage\Path\PathGeneratorInterface;
 use Rasuvaeff\Yii3Filestorage\Store\ContentAddressableStoreInterface;
+use Rasuvaeff\Yii3Filestorage\Store\Layout\ObjectLayoutInterface;
 use Rasuvaeff\Yii3Filestorage\Store\StoredObjectId;
 use Rasuvaeff\Yii3Filestorage\Store\StoreResult;
 use Rasuvaeff\Yii3Filestorage\Test\InMemoryStore;
@@ -127,6 +128,12 @@ final class ContentAddressableInMemoryStore implements ContentAddressableStoreIn
         int $maxBytes = 0,
     ): StoreResult {
         return $this->inner->write($upload, $groupName, $pathGenerator, $mediaType, $maxBytes);
+    }
+
+    #[Override]
+    public function layout(): ObjectLayoutInterface
+    {
+        return $this->inner->layout();
     }
 
     #[Override]

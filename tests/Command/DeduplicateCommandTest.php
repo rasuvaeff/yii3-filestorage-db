@@ -4,13 +4,21 @@ declare(strict_types=1);
 
 namespace Rasuvaeff\Yii3FilestorageDb\Tests\Command;
 
+use DateInterval;
 use DateTimeImmutable;
 use Nyholm\Psr7\Factory\Psr17Factory;
 use Psr\Http\Message\StreamInterface;
 use Rasuvaeff\Yii3Filestorage\File;
+use Rasuvaeff\Yii3Filestorage\Id\Uuid7IdGenerator;
+use Rasuvaeff\Yii3Filestorage\Mime\ExtensionMap;
+use Rasuvaeff\Yii3Filestorage\Mime\FinfoMimeTypeDetector;
+use Rasuvaeff\Yii3Filestorage\Path\FlatSha256KeyGenerator;
 use Rasuvaeff\Yii3Filestorage\Path\RandomPathGenerator;
 use Rasuvaeff\Yii3Filestorage\Path\Sha256KeyGenerator;
+use Rasuvaeff\Yii3Filestorage\Policy\DeliveryPolicyRegistry;
+use Rasuvaeff\Yii3Filestorage\Policy\PolicyRegistry;
 use Rasuvaeff\Yii3Filestorage\Repository\FileScopeProviderInterface;
+use Rasuvaeff\Yii3Filestorage\Storage;
 use Rasuvaeff\Yii3Filestorage\Store\BlobId;
 use Rasuvaeff\Yii3Filestorage\Store\BlobState;
 use Rasuvaeff\Yii3Filestorage\Store\StoredObjectId;
@@ -21,6 +29,7 @@ use Rasuvaeff\Yii3FilestorageDb\BlobRowId;
 use Rasuvaeff\Yii3FilestorageDb\Command\DeduplicateCommand;
 use Rasuvaeff\Yii3FilestorageDb\DbBlobLedger;
 use Rasuvaeff\Yii3FilestorageDb\DbRepository;
+use Rasuvaeff\Yii3FilestorageDb\DeduplicatingStorageFactory;
 use Rasuvaeff\Yii3FilestorageDb\DedupScope;
 use Rasuvaeff\Yii3FilestorageDb\FileRowMapper;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\ContentAddressableInMemoryStore;
@@ -599,6 +608,61 @@ final class DeduplicateCommandTest
     }
 
     /**
+     * The extension comes from the media type the row recorded — the type
+     * detected when the file was added — through the same map the live path
+     * uses.
+     */
+    public function aFlatKeyCarriesTheRecordedTypesExtension(): void
+    {
+        $this->store('a', 'hello', mimeType: 'text/plain');
+
+        $this->run(['--apply' => true], keys: new FlatSha256KeyGenerator(), extensions: new ExtensionMap(['text/plain' => 'text']));
+
+        Assert::same($this->repository->find('a')?->relativePath, (new FlatSha256KeyGenerator())->generate(
+            DedupScope::TenantGroup->keyFor('common', null),
+            hash('sha256', 'hello'),
+            'text',
+        ));
+    }
+
+    /**
+     * The migration and the live path must agree on every content key, or the
+     * rows they produce never share an object. A file added through the
+     * deduplicating facade is already where the command would put it.
+     */
+    public function aFileTheLivePathSharedIsAlreadyWhereTheCommandWouldPutIt(): void
+    {
+        $clock = new StaticClock($this->at('00:00'));
+        $stores = new StoreRegistry([$this->store]);
+        $storage = (new DeduplicatingStorageFactory(
+            unique: new Storage(
+                stores: $stores,
+                repository: $this->repository,
+                pathGenerator: new RandomPathGenerator(),
+                mimeTypeDetector: new FinfoMimeTypeDetector(),
+                idGenerator: new Uuid7IdGenerator($clock),
+                policies: new PolicyRegistry(),
+                deliveryPolicies: new DeliveryPolicyRegistry(),
+                clock: $clock,
+                defaultUrlTtl: new DateInterval('PT1H'),
+            ),
+            stores: $stores,
+            repository: $this->repository,
+            ledger: $this->ledger,
+            mimeTypeDetector: new FinfoMimeTypeDetector(),
+            idGenerator: new Uuid7IdGenerator($clock),
+            policies: new PolicyRegistry(),
+            clock: $clock,
+            keys: new FlatSha256KeyGenerator(),
+        ))->create();
+        $storage->add(Upload::fromStream($this->factory->createStream('hello'), 'a.txt', $this->factory));
+
+        $display = $this->display($this->run(['--apply' => true], keys: new FlatSha256KeyGenerator()));
+
+        Assert::string($display)->contains('Migrated 0 of 1 row; 1 already shared, 0 skipped, 0 failed.');
+    }
+
+    /**
      * Content longer than one read: the byte counter has to accumulate across
      * chunks, or the ledger records the size of the last chunk.
      */
@@ -616,6 +680,8 @@ final class DeduplicateCommandTest
         array $arguments = [],
         ?StoreRegistry $stores = null,
         ?DbBlobLedger $ledger = null,
+        ?FlatSha256KeyGenerator $keys = null,
+        ?ExtensionMap $extensions = null,
     ): CommandTester {
         $tester = new CommandTester(new DeduplicateCommand(
             stores: $stores ?? new StoreRegistry([$this->store]),
@@ -623,6 +689,8 @@ final class DeduplicateCommandTest
             ledger: $ledger ?? $this->ledger,
             streams: $this->factory,
             clock: new StaticClock($this->at('01:00')),
+            keys: $keys,
+            extensions: $extensions,
         ));
         $tester->execute($arguments);
 
@@ -635,6 +703,7 @@ final class DeduplicateCommandTest
         string $group = 'common',
         ?string $description = null,
         ?int $size = null,
+        ?string $mimeType = null,
     ): File {
         $result = $this->inner->write(
             Upload::fromStream($this->factory->createStream($contents), 'a.txt', $this->factory),
@@ -650,6 +719,7 @@ final class DeduplicateCommandTest
             originalName: 'a.txt',
             size: $size ?? $result->size,
             createdAt: $this->at('00:00'),
+            mimeType: $mimeType,
             description: $description,
         );
         $this->repository->save($file);
