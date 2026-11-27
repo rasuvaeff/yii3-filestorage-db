@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.2.1 — 2026-11-27
+
+- **Fixed:** removing a deduplicated file failed on MySQL (`1054 Unknown column '1'`) and PostgreSQL (`42703 column "1" does not exist`). The ledger's `NOT EXISTS` guards selected the string `'1'`, which `yiisoft/db` quotes as a column name; SQLite accepts it. Every statement carrying the guard was affected: `releaseFile()`, `release()`, `expireReservations()`, `claimForDeletion()`, `completeDeletion()` (#12).
+- **Fixed:** on MySQL, a second `add()` of identical content could fail with `AddException` ("Blob ... disappeared while its reservation was being committed"). MySQL reports changed rows rather than matched ones, so `commit()`'s activation update read 0 when it wrote only values the row already held (a frozen clock, or the same microsecond). `commit()` now re-reads the blob row before concluding it is gone; `DbRepository::updateContentHash()` likewise returns `true` when the row already holds that hash (#12).
+- CI: an ungated `database-integration` matrix job runs the Integration suite against MySQL 8.4 and PostgreSQL 17; the new `CrossDatabaseMigrationTest` applies both migrations up and down and drives the whole ledger lifecycle there. `MigrationTest` asserts that no column carries a `DEFAULT` (MySQL rejects one on TEXT).
+
 ## 0.2.0 — 2026-11-27
 
 - **Changed:** requires `rasuvaeff/yii3-filestorage` `^0.8.2`, so the whole family installs on one line of the core. This release no longer installs with core 0.1; stay on 0.1.1 for those.

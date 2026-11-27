@@ -136,9 +136,13 @@ final readonly class DbRepository implements MaintenanceRepositoryInterface
     #[Override]
     public function updateContentHash(string $id, string $contentHash): bool
     {
-        return $this->db->createCommand()
+        // MySQL counts changed rows, not matched ones: re-setting the hash a
+        // row already holds reports 0, which is "found", not "missing"
+        $updated = $this->db->createCommand()
             ->update($this->table, ['content_hash' => $contentHash], $this->scoped(['id' => $id]))
-            ->execute() > 0;
+            ->execute();
+
+        return $updated > 0 || $this->row($id) !== null;
     }
 
     /**

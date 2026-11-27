@@ -140,6 +140,69 @@ jobs:
       - name: Integration tests
         run: composer test:integration
 
+  database-integration:
+    name: ${{ matrix.database }} integration
+    runs-on: ubuntu-latest
+
+    # deliberately ungated: a matrix job skipped by the `changes` filter reports
+    # a single check under the raw, unexpanded name, which wedges a PR forever
+    # once that name is a required status check
+
+    strategy:
+      fail-fast: false
+      matrix:
+        database:
+          - mysql
+          - pgsql
+
+    services:
+      mysql:
+        image: mysql:8.4@sha256:b3b90af2a6552ae30c266fdb7d5dd55f3afb72404bb78d37fe8a23eb857fd3fb
+        env:
+          MYSQL_DATABASE: filestorage
+          MYSQL_ROOT_PASSWORD: filestorage
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -hlocalhost -uroot -pfilestorage"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+      postgres:
+        image: postgres:17@sha256:a426e44bac0b759c95894d68e1a0ac03ecc20b619f498a91aae373bf06d8508d
+        env:
+          POSTGRES_DB: filestorage
+          POSTGRES_PASSWORD: filestorage
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d filestorage"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # v2
+        with:
+          php-version: '8.4'
+          coverage: none
+          extensions: fileinfo, filter, json, mbstring, pdo_mysql, pdo_pgsql, pdo_sqlite
+          tools: composer:v2
+
+      - name: Install dependencies
+        run: composer install --no-interaction --no-progress --prefer-dist
+
+      - name: Run integration suite
+        run: vendor/bin/testo --suite=Integration
+        env:
+          FILESTORAGE_TEST_DB: ${{ matrix.database }}
+
   windows:
     name: Windows
     needs: changes

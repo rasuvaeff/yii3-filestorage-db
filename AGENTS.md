@@ -60,6 +60,22 @@ make release-check
 
 `make test-coverage` and `make mutation` bootstrap `pcov` inside the
 `composer:2` container because the base image has no coverage driver.
+
+`tests/Integration/CrossDatabaseMigrationTest` runs only when
+`FILESTORAGE_TEST_DB=mysql|pgsql` names a live server (database `filestorage`,
+password `filestorage`; ports via `FILESTORAGE_TEST_MYSQL_PORT` /
+`FILESTORAGE_TEST_PGSQL_PORT`). `composer:2` has neither `pdo_mysql` nor
+`pdo_pgsql` — use an image with them (`FROM composer:2` +
+`docker-php-ext-install pdo_mysql pdo_pgsql`) and `--network host`:
+
+```bash
+docker run -d --name fsdb-mysql -p 127.0.0.1:13306:3306 \
+  -e MYSQL_DATABASE=filestorage -e MYSQL_ROOT_PASSWORD=filestorage mysql:8.4
+docker run --rm --network host -v "$PWD":/app -w /app \
+  -e FILESTORAGE_TEST_DB=mysql -e FILESTORAGE_TEST_MYSQL_PORT=13306 \
+  <php-with-pdo-image> vendor/bin/testo --suite=Integration
+```
+
 `composer.lock` is gitignored (library).
 
 ## Mutation testing
@@ -81,6 +97,7 @@ scenario the schema or the driver rules out:
 | Diagnostics on a path a second fault opens | the `$io->text()` naming a reservation that could not be released, in `DeduplicateCommand`'s failure arm | Reaching it needs the store to fail *and* the ledger to fail right after — the double would have to be broken in two coordinated ways, which asserts the double rather than the command. The arm itself is covered; only the message inside it is not |
 | Redundant rewinds | `$stream->rewind()` after the digest pass in `DeduplicatingStorage` and `DeduplicateCommand` | `Upload::stream()` rewinds on every access and every consumer goes through it, so a missing rewind is invisible |
 | Lines with no opcode | the continuation lines of the multi-line messages in `DeduplicatingStorageFactory` and `reclaimAdvice()`; the unreachable `return 0` of `maxBytesOption()` (the option always has a default) | pcov records no executable opcode there, so the mutant is Not Covered whatever the tests assert; the messages themselves are asserted in full |
+| MySQL rowcount fallbacks | `$activated === 0 && $this->blobRow($id) === null` in `commit()`, `$updated > 0 \|\| $this->row($id) !== null` in `updateContentHash()` | They exist for MySQL, which counts *changed* rows. SQLite counts matched rows, so the re-read half is invisible to every unit test; `CrossDatabaseMigrationTest` covers it on MySQL, but mutation runs on SQLite only |
 | Console option casts and guards | `(bool) $input->getOption('apply')` and the `isset() && is_string() && !== ''` chain in `stringOption()` | Symfony already guarantees the type, so only the `!== ''` half is reachable — and that half is tested. The rest exists so psalm can narrow without a suppression |
 
 Two shapes are worth knowing before adding tests here.
@@ -115,6 +132,15 @@ MSI without any test getting worse.
   the answer off the affected-row count. A `SELECT` followed by an `UPDATE` is
   two moments with a gap, and the gap is where a committed file row ends up
   pointing at bytes another process already removed.
+- **Everything here must run on MySQL and PostgreSQL, not only SQLite.**
+  SQLite accepts two things the others do not, and both shipped: a string
+  select (`select('1')` is quoted as a column named `1` — use
+  `new Expression('1')`), and MySQL's affected-row count is *changed* rows, not
+  matched rows (`CLIENT_FOUND_ROWS` is off, and the connection is the
+  application's). An `UPDATE` whose decision is its affected count must either
+  always change a column (a state or a fresh token) or re-read the row on 0.
+  `CrossDatabaseMigrationTest` drives every ledger statement on both servers in
+  the `database-integration` CI job; a new statement belongs there too (#12).
 - **There is no `reference_count` column, and adding one would be a
   regression.** A reference *is* a `filestorage_file` row carrying the blob's
   id. A denormalised counter is a second source of truth that can drift from

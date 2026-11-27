@@ -81,3 +81,7 @@ delete. Namespace `Rasuvaeff\Yii3FilestorageDb\`. Full API reference:
   scalar constructor argument silently gets the default.
 - Unit tests run against real in-memory SQLite with the migrations applied. A
   fake connection would have to reimplement the SQL under test.
+- SQLite is not enough for the ledger: it accepts `select('1')` (MySQL/PostgreSQL
+  read it as a column) and reports matched rows where MySQL reports changed ones.
+  Every new ledger statement goes into `tests/Integration/CrossDatabaseMigrationTest`
+  (`FILESTORAGE_TEST_DB=mysql|pgsql`), which CI runs on MySQL 8.4 and PostgreSQL.
