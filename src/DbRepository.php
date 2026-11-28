@@ -10,25 +10,34 @@ use Rasuvaeff\Yii3Filestorage\Repository\FileScopeProviderInterface;
 use Rasuvaeff\Yii3Filestorage\Repository\MaintenanceRepositoryInterface;
 use Rasuvaeff\Yii3Filestorage\Store\BlobId;
 use Rasuvaeff\Yii3FilestorageDb\Exception\InvalidFileRowException;
+use Rasuvaeff\Yii3FilestorageDb\Exception\MissingScopeException;
 use Yiisoft\Db\Connection\ConnectionInterface;
+use Yiisoft\Db\Expression\Expression;
 use Yiisoft\Db\Query\Query;
-use Yiisoft\Db\QueryBuilder\Condition\Like;
-use Yiisoft\Db\QueryBuilder\Condition\LikeConjunction;
-use Yiisoft\Db\QueryBuilder\Condition\LikeMode;
 
 /**
  * File metadata in a database table.
  *
  * Every statement this class issues carries the tenant predicate when a
- * {@see FileScopeProviderInterface} is bound. There is no method that skips
- * it — not for downloads, not for maintenance. A signed download that needs to
- * read outside the current request's scope goes through
+ * {@see FileScopeProviderInterface} is bound and resolves a tenant. No method
+ * skips it for a resolved tenant — not for downloads, not for maintenance; the
+ * only global path is the explicit `allowGlobalAccess` opt-in below. A signed
+ * download that needs to read outside the current request's scope goes through
  * {@see DbScopedFileResolver}, which matches an *authenticated* scope rather
  * than turning the filter off.
  *
  * With no scope provider bound the package is single-tenant: no predicate is
  * added and `scope_id` stays null. That is a deliberate absence rather than a
  * predicate on null, so a single-tenant installation pays nothing.
+ *
+ * A *bound* provider that returns null is a tenant that did not resolve, and
+ * every method refuses it with {@see MissingScopeException} rather than
+ * dropping the predicate. The one way to act on every tenant with a provider
+ * bound is the explicit `allowGlobalAccess` opt-in, meant for maintenance entry
+ * points — `config/di.php` gives it only to the `MaintenanceRepositoryInterface`
+ * and `BlobLedgerInterface` bindings, under the `globalMaintenanceAccess`
+ * parameter; even then a new row is not written without a tenant. Null is never a
+ * wildcard by accident, which is also how {@see DbScopedFileResolver} treats it.
  *
  * @api
  */
@@ -40,13 +49,26 @@ final readonly class DbRepository implements MaintenanceRepositoryInterface
      */
     private const int DIRECTORY_BATCH = 200;
 
+    /**
+     * Ids per `findMany()` statement, under the same 999-parameter ceiling.
+     */
+    private const int ID_BATCH = 500;
+
     private string $table;
     private FileRowMapper $mapper;
 
+    /**
+     * @param bool $allowGlobalAccess With a provider bound, let a null scope
+     *        mean "every tenant" for reads, updates and deletes instead of
+     *        refusing. For a maintenance entry point that shares the
+     *        application's provider — never for a request path, where a null
+     *        is a tenant that failed to resolve.
+     */
     public function __construct(
         private ConnectionInterface $db,
         FileTableName $table = new FileTableName(),
         private ?FileScopeProviderInterface $scopes = null,
+        private bool $allowGlobalAccess = false,
     ) {
         $this->table = $table->value;
         $this->mapper = new FileRowMapper();
@@ -61,7 +83,47 @@ final readonly class DbRepository implements MaintenanceRepositoryInterface
     }
 
     /**
-     * Replaces the row with this id, or inserts it.
+     * Several rows in one statement per batch of ids, in no particular order.
+     *
+     * Scoped exactly like {@see find()}: an id that does not exist and an id
+     * of another tenant are both simply absent from the result. The id is
+     * compared exactly here as well — MySQL's default collation would also
+     * answer for an id differing only in case.
+     *
+     * @param list<string> $ids
+     *
+     * @return list<File>
+     *
+     * @throws InvalidFileRowException
+     * @throws MissingScopeException
+     */
+    public function findMany(array $ids): array
+    {
+        $files = [];
+
+        foreach (array_chunk(array_values(array_unique($ids)), self::ID_BATCH) as $batch) {
+            $wanted = array_fill_keys($batch, value: true);
+
+            /** @var list<array<string, mixed>> $rows */
+            $rows = (new Query($this->db))
+                ->from($this->table)
+                ->where($this->scoped(['in', 'id', $batch]))
+                ->all();
+
+            foreach ($rows as $row) {
+                $file = $this->mapper->fromRow($row);
+                if (isset($wanted[$file->id])) {
+                    $files[] = $file;
+                }
+            }
+        }
+
+        return $files;
+    }
+
+    /**
+     * Replaces the row with this id, or inserts it — an upsert by id, with
+     * `scope_id` assigned once, on insert, and never rewritten by a replace.
      *
      * Deliberately not an `upsert`. An upsert matches on the primary key
      * alone, so a row belonging to another tenant would be silently taken
@@ -76,7 +138,12 @@ final readonly class DbRepository implements MaintenanceRepositoryInterface
     #[Override]
     public function save(File $file, ?BlobId $blob = null): void
     {
-        $row = $this->mapper->toRow($file, $blob, $this->scopes?->currentScopeId());
+        $scopeId = $this->scopeId();
+        // only reachable under the global opt-in: updating any tenant's row is
+        // what it is for, inserting a row that belongs to no tenant is not
+        $tenantless = $scopeId === null && $this->scopes instanceof FileScopeProviderInterface;
+
+        $row = $this->mapper->toRow($file, $blob, $scopeId);
 
         // An update must not touch the two columns a File does not carry.
         //
@@ -103,6 +170,10 @@ final readonly class DbRepository implements MaintenanceRepositoryInterface
 
         if ($updated > 0 || $this->row($file->id) !== null) {
             return;
+        }
+
+        if ($tenantless) {
+            throw $this->missingScope('insert a new row');
         }
 
         $this->db->createCommand()->insert($this->table, $row)->execute();
@@ -143,8 +214,8 @@ final readonly class DbRepository implements MaintenanceRepositoryInterface
     }
 
     /**
-     * One statement per batch of directories: `relative_path LIKE '<dir>/%'`
-     * for rows below a directory, `relative_path IN (...)` for root-level
+     * One statement per batch of directories: `relative_path LIKE '<dir>/%'
+     * ESCAPE '!'` for rows below a directory, `relative_path IN (...)` for root-level
      * rows, which are their own directory.
      *
      * The database only narrows; the answer is decided here. `LIKE 'd/%'` also
@@ -163,8 +234,6 @@ final readonly class DbRepository implements MaintenanceRepositoryInterface
         $seen = [];
 
         foreach (array_chunk(array_values(array_unique($directories)), self::DIRECTORY_BATCH) as $batch) {
-            $prefixes = array_map(static fn(string $directory): string => $directory . '/', $batch);
-
             /** @var list<array<string, mixed>> $rows */
             $rows = (new Query($this->db))
                 ->select(['store_name', 'relative_path'])
@@ -172,16 +241,7 @@ final readonly class DbRepository implements MaintenanceRepositoryInterface
                 ->where($this->scoped([
                     'and',
                     ['store_name' => $storeName],
-                    [
-                        'or',
-                        new Like(
-                            column: 'relative_path',
-                            value: $prefixes,
-                            mode: LikeMode::StartsWith,
-                            conjunction: LikeConjunction::Or,
-                        ),
-                        ['in', 'relative_path', $batch],
-                    ],
+                    ['or', ...$this->startsWithAny($batch), ['in', 'relative_path', $batch]],
                 ]))
                 ->all();
 
@@ -234,6 +294,24 @@ final readonly class DbRepository implements MaintenanceRepositoryInterface
     }
 
     /**
+     * Whether any row this repository can see belongs to a tenant.
+     *
+     * Asked by `filestorage:deduplicate` when no scope provider is bound: the
+     * command then reads every row and keys them all into one pool, which is
+     * only right when the table really is single-tenant. Scoped like every
+     * other statement here.
+     *
+     * @throws MissingScopeException
+     */
+    public function hasTenantRows(): bool
+    {
+        return (new Query($this->db))
+            ->from($this->table)
+            ->where($this->scoped(['not', ['scope_id' => null]]))
+            ->exists();
+    }
+
+    /**
      * Whether this repository writes through that exact connection.
      *
      * Asked by {@see DeduplicatingStorageFactory}: a ledger and a repository on
@@ -260,6 +338,38 @@ final readonly class DbRepository implements MaintenanceRepositoryInterface
     }
 
     /**
+     * `relative_path LIKE '<dir>/%' ESCAPE '!'`, one per directory.
+     *
+     * Not `yiisoft/db`'s `Like` condition: it escapes with a backslash, and
+     * its MySQL builder emits no `ESCAPE` clause, so the backslash only works
+     * while it is MySQL's default escape character. Under
+     * `sql_mode=NO_BACKSLASH_ESCAPES` there is none — `\_` is then a literal
+     * backslash followed by a wildcard, a directory with `_` in its name
+     * matches nothing, and the orphan sweep quarantines bytes live rows point
+     * at. `!` declared as the escape in the statement means the same thing on
+     * every engine and in every mode.
+     *
+     * @param list<string> $directories
+     *
+     * @return list<Expression>
+     */
+    private function startsWithAny(array $directories): array
+    {
+        $column = $this->db->getQuoter()->quoteColumnName('relative_path');
+        $conditions = [];
+
+        foreach ($directories as $i => $directory) {
+            $parameter = ":fs_dir_{$i}";
+            $conditions[] = new Expression(
+                "{$column} LIKE {$parameter} ESCAPE '!'",
+                [$parameter => strtr($directory . '/', ['!' => '!!', '%' => '!%', '_' => '!_']) . '%'],
+            );
+        }
+
+        return $conditions;
+    }
+
+    /**
      * {@see File::directory()} for a path that has not been mapped to a File.
      */
     private function directoryOf(string $path): string
@@ -270,15 +380,52 @@ final readonly class DbRepository implements MaintenanceRepositoryInterface
     }
 
     /**
+     * The scope every statement filters by: null when no provider is bound,
+     * or under the explicit global opt-in.
+     *
+     * @return non-empty-string|null
+     *
+     * @throws MissingScopeException
+     */
+    private function scopeId(): ?string
+    {
+        if (!$this->scopes instanceof FileScopeProviderInterface) {
+            return null;
+        }
+
+        $scopeId = $this->scopes->currentScopeId();
+        if ($scopeId === null && !$this->allowGlobalAccess) {
+            throw $this->missingScope('run a statement');
+        }
+
+        return $scopeId;
+    }
+
+    private function missingScope(string $action): MissingScopeException
+    {
+        return new MissingScopeException(sprintf(
+            '%s is bound but returned no scope, so this repository will not %s without a tenant predicate. '
+            . 'Establish the tenant first. A maintenance command that must see every tenant gets it through '
+            . 'the globalMaintenanceAccess parameter (or %s with allowGlobalAccess: true), or runs with the '
+            . 'provider unbound',
+            FileScopeProviderInterface::class,
+            $action,
+            self::class,
+        ));
+    }
+
+    /**
      * Adds the mandatory tenant predicate, when there is one.
      *
      * @param array<mixed> $condition
      *
      * @return array<mixed>
+     *
+     * @throws MissingScopeException
      */
     private function scoped(array $condition): array
     {
-        $scopeId = $this->scopes?->currentScopeId();
+        $scopeId = $this->scopeId();
         if ($scopeId === null) {
             return $condition;
         }

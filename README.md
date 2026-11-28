@@ -23,7 +23,7 @@ packages are built against it.
 
 - PHP 8.3+
 - `ext-json`
-- `rasuvaeff/yii3-filestorage` ^0.9
+- `rasuvaeff/yii3-filestorage` ^0.10
 - `yiisoft/db` ^2.0 (plus a driver: `yiisoft/db-sqlite`, `-mysql`, `-pgsql`, …)
 - `symfony/console` ^6.4 || ^7.0 || ^8.0, `psr/http-factory` ^1.0 and
   `psr/http-message` ^2.0 — for `filestorage:deduplicate`, which reads objects
@@ -37,7 +37,11 @@ composer require rasuvaeff/yii3-filestorage-db
 ```
 
 This package binds `RepositoryInterface`, `MaintenanceRepositoryInterface`,
-`ScopedFileResolverInterface` and `BlobLedgerInterface`. Core binds the facade.
+`ScopedFileResolverInterface` and `BlobLedgerInterface`, plus `DbRepository` and
+`DbBlobLedger` by class. Core binds the facade. `BlobLedgerInterface` is what
+core's `filestorage:gc` resolves; the deduplicating storage and
+`filestorage:deduplicate` are wired with `DbBlobLedger::class` — so rebinding
+`BlobLedgerInterface` (a decorator, say) changes `gc` only.
 You still bind a `StoreInterface` — a local `FileSystemStore`, or
 `rasuvaeff/yii3-filestorage-flysystem` for S3 and friends.
 
@@ -61,7 +65,7 @@ return [
 ```
 
 Three tables: `filestorage_file`, `filestorage_blob` and
-`filestorage_blob_reservation`, and an index on `filestorage_file`
+`filestorage_blob_reservation`, an index on `filestorage_file`
 `(store_name, relative_path)` for the orphan sweep (`M261127000000…`, added in
 0.3.0 — an existing installation picks it up with the next `migrate:up`). On
 MySQL it indexes the first 191 characters of the path, on PostgreSQL it uses
@@ -70,6 +74,16 @@ PostgreSQL a plain `CREATE INDEX` blocks writes while it builds, so for a large
 busy table create it first with `CREATE INDEX CONCURRENTLY idx_filestorage_file_store_path
 ON filestorage_file (store_name, relative_path varchar_pattern_ops)` — the
 migration uses `IF NOT EXISTS` and then only records itself.
+
+`M261128000000…` (0.4.0) switches `filestorage_file.scope_id` to a binary NO
+PAD collation on MySQL and MariaDB, whose default collations compare `Acme`,
+`acme` and `Acmé` as one tenant: `utf8mb4_0900_bin` on MySQL 8.0.17+,
+`utf8mb4_nopad_bin` on MariaDB. Not `utf8mb4_bin` — that one is PAD SPACE and
+would make `acme ` and `acme` one tenant, a match MySQL 8's default never
+made. MySQL older than 8.0.17 has no such collation and the migration throws
+there. It only makes comparison stricter, so it cannot fail on existing rows;
+on SQLite and PostgreSQL it does nothing. On MySQL and MariaDB it rebuilds the
+table and blocks writes to it meanwhile — see [UPGRADE.md](UPGRADE.md).
 
 > **`yiisoft/db-migration` ^2.1 is a hard requirement.** On 2.0.x this exact
 > registration silently found nothing: namespace resolution matched a
@@ -89,6 +103,7 @@ return [
         'blobTable' => 'filestorage_blob',
         'blobReservationTable' => 'filestorage_blob_reservation',
         'tablePrefix' => '',
+        'globalMaintenanceAccess' => false,
     ],
 ];
 ```
@@ -96,13 +111,18 @@ return [
 The prefix is prepended to all three. Names are validated by typed value
 objects — `FileTableName`, `BlobTableName`, `BlobReservationTableName` — which
 the migrations resolve from the container, so the schema and the queries cannot
-disagree about a name.
+disagree about a name. `globalMaintenanceAccess` is the maintenance opt-in
+described under [Tenant scoping](#tenant-scoping).
 
 ## Tenant scoping
 
 Bind `FileScopeProviderInterface` and every statement this package issues gains
 a `scope_id` predicate. Leave it unbound and the installation is single-tenant:
-no predicate, no cost.
+no predicate, no cost. The column is compared byte for byte, on MySQL and
+MariaDB too — case, accents and trailing spaces count: `Acme`, `acme` and
+`acme ` are three tenants. The `M261128…` migration gives `scope_id` a binary
+NO PAD collation (`utf8mb4_0900_bin` on MySQL 8.0.17+, `utf8mb4_nopad_bin` on
+MariaDB; older MySQL is refused, see [UPGRADE.md](UPGRADE.md)).
 
 ```php
 // config/common/di/filestorage.php
@@ -125,8 +145,42 @@ Only your application knows what a tenant is — from `rasuvaeff/yii3-tenancy`, 
 session, a subdomain — so this package cannot bind it for you without being
 wrong in every installation that does it differently.
 
-**There is no method that skips the predicate.** Not for downloads, not for
-maintenance. A signed download has no ambient tenant, which is the point of
+**A bound provider that returns `null` is refused, not obeyed.** Bound means
+multi-tenant, and a null there is a tenant that did not resolve — an anonymous
+route, a failed lookup, a job started without its context. Every
+`DbRepository` method, `DeduplicatingStorage::add()` and
+`filestorage:deduplicate` then throw `MissingScopeException` (or, for the
+command, exit with an error) rather than drop the predicate. Before 0.4.0 the
+predicate was silently dropped there, and `find()`/`remove()` reached every
+tenant's rows.
+
+**Global access is an explicit opt-in, for maintenance only.** Core's
+`filestorage:gc`, `stat`, `verify` and `backfill-hash` (and `-images`'
+`filestorage:images:warm`) read through `MaintenanceRepositoryInterface`, so a
+multi-tenant cron job whose tenant does not resolve throws until its entry
+point either leaves the provider unbound, or sets `globalMaintenanceAccess` —
+see [UPGRADE.md](UPGRADE.md):
+
+```php
+// config/console/params.php
+return [
+    'rasuvaeff/yii3-filestorage-db' => ['globalMaintenanceAccess' => true],
+];
+```
+
+Then a null scope means "every tenant" for reads, updates and deletes (a new
+row still needs a tenant) — but only through the two keys those commands
+resolve: `MaintenanceRepositoryInterface` and `BlobLedgerInterface` (`gc`
+releases expired rows through the ledger). `RepositoryInterface`,
+`DbRepository`, `DbBlobLedger` and the deduplicating storage keep refusing. That
+is what makes the console params a safe place for it: Yii3 shares them with
+every console process, queue workers included, and a worker without a tenant
+still gets `MissingScopeException`, not every tenant's rows. Constructing
+`DbRepository(allowGlobalAccess: true)` yourself is the same opt-in, without
+that fence.
+
+**No method skips the predicate for a resolved tenant.** Not for downloads, not
+for maintenance. A signed download has no ambient tenant, which is the point of
 signing it, and the shortcut everyone reaches for — looking up by id with the
 filter off — reads any file whose id leaks. Use `ScopedFileResolverInterface`
 instead: the scope was authenticated when the token was minted, travels inside
@@ -138,7 +192,8 @@ $file = $resolver->findInScope($payload->fileId, $payload->scopeId);
 
 `null` is a scope, not the absence of one: it matches `scope_id IS NULL`, which
 is what an unscoped application's rows carry. An unscoped token is never a
-wildcard.
+wildcard — the resolver and the repository agree that null never means "every
+tenant" unless the maintenance opt-in says so.
 
 ## Deduplication
 
@@ -165,21 +220,42 @@ On any failure between steps, `release($reservation, $deleteAfter)`. Removal is
 | Ownership is a `BlobId`, never a content hash | A hash is identical across stores, groups and tenants, so a hash-keyed count lets one tenant delete what another is reading |
 | There is no `reference_count` column | A reference *is* a file row with this blob's id, and the guards ask `NOT EXISTS`. A counter is a second source of truth that can drift, and every underflow guard only detects drift after it happens |
 
-States are `writing`, `active`, `pending_delete` and `deleting`. A writer may
-join any of them except the last, where it gets a `BlobBusyException` and
-retries after the lease ends.
+States are `writing`, `active`, `pending_delete` and `deleting`. A writer joins
+any of them. A `deleting` blob whose lease is still live answers
+`BlobBusyException` — retry once the lease expires; after that the writer takes
+the blob back (a collector that died under its lease no longer blocks the
+content until the next `gc`, and its stale `completeDeletion()` is refused).
+`commit()` refuses to activate a blob a collector claimed after the join. A
+row that `commit()` moves to another content key schedules the blob it left.
 
-The collection pass:
+The collection pass is `filestorage:gc` (core). Use it; do not write your own.
+If you must, the order is **quarantine → `completeDeletion()` → purge, or
+restore when refused** — deleting the object before `completeDeletion()` is the
+race core 0.9 introduced the quarantine to close: a collector whose lease was
+stolen deletes bytes a writer has just re-published, and the refusal comes
+after the delete.
 
 ```php
 $ledger->expireReservations($now, $deleteAfter);         // sweep abandoned writers first
 
 while ($lease = $ledger->claimForDeletion($now, $now->add($leaseTtl))) {
     try {
-        $store->deleteObject($lease->blob->object);
-        $ledger->completeDeletion($lease);               // refuses if the blob was revived
-    } catch (StoreException) {
+        // null when no member of the blob existed any more
+        $entry = $store->quarantine($store->layout()->deletion($lease->blob->object), $now);
+    } catch (StoreException|\InvalidArgumentException) {
+        // InvalidArgumentException: the layout refused the key — a
+        // configuration mistake, which must not end the run either
         $ledger->abandonDeletion($lease, $retryAfter);   // back off, keep the row
+
+        continue;
+    }
+
+    if ($ledger->completeDeletion($lease)) {             // refuses if the blob was revived
+        if ($entry !== null) {
+            $store->purge($entry);
+        }
+    } elseif ($entry !== null) {
+        $store->restore($entry);                         // keeps a writer's re-publication
     }
 }
 ```
@@ -215,7 +291,12 @@ handed the object it is in the middle of constructing. It asks core for
 exactly this since 0.1.1. Nothing to configure, and the same rule applies to any
 decorator you write yourself.
 
-`create()` refuses three configurations that would otherwise lose data quietly,
+`reservationTtl` and `deleteGracePeriod` must be positive (`InvalidArgumentException`
+otherwise): with zero grace "scheduled" and "collectable" are one instant, and a
+writer joining a blob that is losing its last reference races the collector
+instead of being ahead of it.
+
+`create()` refuses five configurations that would otherwise lose data quietly,
 and says what to do instead: a store that does not implement
 `ContentAddressableStoreInterface`; a `BlobLedgerInterface` that is not this
 package's `DbBlobLedger`, because the guards deduplication rests on are SQL
@@ -223,15 +304,42 @@ predicates inside the statements that act, and an implementation that keeps its
 state anywhere else cannot make the same promise; and a ledger on a different
 connection than the repository — which makes `commit()` two transactions rather
 than one, so a crash between them leaves a row with no reference or a reference
-with no row.
+with no row; content keys the store's layout cannot delete one by one (core's
+`LayoutCompatibility`, below); and — with a `FileScopeProviderInterface` bound
+and a scope other than `Global` — a key generator that leaves the tenant out of
+the key, which would share bytes across tenants under a scope that promises
+not to. The last two are checked by `DeduplicatingStorage`'s own constructor,
+so a storage built without the factory is refused the same way
+(`InvalidConfigException`).
+
+**Isolation on MySQL and MariaDB.** The ledger reads a blob row and then
+updates it under a guard that re-checks the row, so it runs its own
+transactions as `READ COMMITTED` on the MySQL driver whatever the session
+default is. Under REPEATABLE READ, MariaDB 11.6.2+ with
+`innodb_snapshot_isolation=ON` (its default) fails that `UPDATE` with error 1020
+"Record has changed since last read" whenever another connection changed the
+row in between — two simultaneous uploads of one file, or removing a file
+while the same bytes are uploaded. Called inside a transaction you already
+opened, the level cannot be set (`yiisoft/db` sets it only on the outermost
+transaction): there error 1020 surfaces as a `LedgerException` naming the
+cause — an `AddException`/`RemoveException` from `DeduplicatingStorage` — and
+you retry your transaction or run it at `READ COMMITTED`. PostgreSQL already
+defaults to `READ COMMITTED`; SQLite is left alone. Writes under
+`READ COMMITTED` need `binlog_format` `ROW` or `MIXED` (the MySQL and MariaDB
+defaults), not `STATEMENT`.
 
 The content key comes from core's `ContentAddressedKeyGeneratorInterface`
 (`Sha256KeyGenerator` unless one is bound), and it is given the extension of
 the *detected* media type through core's `ExtensionMap` — the same one, with the
 same `extensionOverrides`, that names unique files. `Sha256KeyGenerator` ignores
 it, so existing keys do not move. For a flat tree such as
-`blobs/ab/cd/<sha>.<ext>`, bind core's `FlatSha256KeyGenerator` and give the
-store `FlatSiblingLayout`:
+`sha/ab/cd/<sha>.<ext>`, bind core's `FlatSha256KeyGenerator` and give the
+store `FlatSiblingLayout` — **both, always**. With the default
+`DirectoryLayout` a collected blob would take its whole `ab/cd/` directory, and
+with it every other blob that shares the first four hex digits, so `create()`
+and `filestorage:deduplicate` check the pair with core's
+`LayoutCompatibility::assertContentKeys()` and refuse a mismatch
+(`InvalidConfigException`) before anything is written:
 
 ```php
 use Rasuvaeff\Yii3Filestorage\Path\ContentAddressedKeyGeneratorInterface;
@@ -242,6 +350,35 @@ return [
 ];
 ```
 
+Since core 0.10 the local stores — `FileSystemStore` and
+`PublicFileSystemStore` — are content-addressable, so `create()` accepts them
+too. A single-tenant site that keeps one flat pool under its web root:
+
+```php
+use Rasuvaeff\Yii3Filestorage\Path\FlatSha256KeyGenerator;
+use Rasuvaeff\Yii3Filestorage\Store\FileSystem\FileSystemStore;
+use Rasuvaeff\Yii3Filestorage\Store\FileSystem\PublicFileSystemStore;
+use Rasuvaeff\Yii3Filestorage\Store\Layout\FlatSiblingLayout;
+
+$store = new PublicFileSystemStore(
+    new FileSystemStore(
+        name: 'public',
+        rootPath: '/app/public/uploads',
+        streamFactory: $streams,
+        quarantinePath: '/app/runtime/quarantine',
+        layout: new FlatSiblingLayout(),
+        ownedPrefixes: ['blobs', 'avatars'],
+    ),
+    baseUrl: '/uploads',
+    webRoot: '/app/public',
+);
+// bound as ContentAddressedKeyGeneratorInterface: keys become blobs/ab/cd/<sha>.<ext>
+$keys = new FlatSha256KeyGenerator(prefix: 'blobs');
+```
+
+The prefix replaces the scope, tenant included — which is why it is refused
+once a `FileScopeProviderInterface` is bound (see the table below).
+
 `filestorage:deduplicate` takes the same generator and the same `ExtensionMap`,
 and derives the extension from the media type the row records — the one
 detected when the file was added — so a migrated row lands exactly where a live
@@ -251,7 +388,29 @@ Everything the consumer sees is unchanged. `add()` still returns a `File` with
 its own id, group, description and metadata; two uploads of the same bytes just
 end up pointing at one object. Above `dedupMaxBytes` an upload silently takes
 the unique path — the content key *is* the hash, so it cannot be chosen without
-reading the whole body, and that read is not worth an unbounded second pass.
+reading the whole body, and that read is not worth an unbounded second pass. It
+stays in the deduplicating store, and `remove()` deletes its bytes, exactly as
+the base facade would; shared bytes are only ever deleted by the collector. A
+body that declares no length is also stopped at the group's `maxBytes` while it
+is hashed, with the base facade's `UploadSizeException`.
+
+**Links minted outside the tenant's request.** With deduplication on,
+`StorageInterface` resolves to `DeduplicatingStorage`, and it has core's
+`withProxyUrls()` too: `$storage->withProxyUrls($urls->forScope($tenantId))->urlFor($file)`
+(`-web`'s `HmacProxyUrlGenerator::forScope()`) returns the same decorator over a
+base facade minting through the pinned generator — ledger, store and keys
+shared. It delegates to the wrapped facade, so that has to be core's `Storage`
+(what `DeduplicatingStorageFactory` wraps) or another `DeduplicatingStorage`;
+anything else is an `InvalidConfigException` naming the class, not a link
+minted through the unpinned generator.
+
+### What it does not do
+
+| Expectation | Reality | Instead |
+|---|---|---|
+| Existing `blobs/ab/cd/<sha>.<ext>` addresses kept by a multi-tenant installation | `new FlatSha256KeyGenerator(prefix: 'blobs')` replaces the `sha/<tenant>/<group>` prefix, and with it the tenant — refused under a bound provider unless the scope is `Global` | Single-tenant (no provider bound): the prefixed generator with `FlatSiblingLayout`. Otherwise a generator that keeps the tenant in the key |
+| Adopting objects already at their content key without copying | There is no `filestorage:adopt`; `filestorage:deduplicate` reads, hashes and re-publishes every row | Planned. Until then, `filestorage:deduplicate` |
+| Equal bytes shared across groups | The default `TenantGroup` puts the group into the key | `DedupScope::Global` (or `Tenant`), see below |
 
 ### How widely bytes are shared
 
@@ -293,7 +452,10 @@ Per row it reads the object, hashes it, reserves the content key, publishes with
 `putIfAbsent()`, and repoints the row through `commit()` — the same protocol a
 live `add()` uses, so a crash anywhere leaves either the old row or the new one,
 never a row pointing at nothing. A second run over the same range is a no-op: a
-row already at its content key is recognised and skipped.
+row already at its content key is recognised and skipped. A run with a
+different key — another `--scope`, key generator or `extensionOverrides` —
+moves already-shared rows again, and `commit()` schedules the blob each row
+left, so `filestorage:gc` collects it after the grace period.
 
 **The old object is left behind on purpose.** It becomes an orphan the moment
 its row is repointed, and `filestorage:gc --orphans --apply` reclaims it once
@@ -304,7 +466,11 @@ readers still holding the old path.
 filters by whatever `FileScopeProviderInterface` reports, and the content key
 mixes that same scope in — so a multi-tenant installation runs this once per
 tenant, with the tenant established the way its other CLI jobs establish it. The
-scope in force is printed before any work starts.
+scope in force is printed before any work starts, and a bound provider with no
+tenant is refused — even under the maintenance opt-in, which would page every
+tenant's rows into one pool. With **no** provider bound the command cannot tell
+tenants apart, so it refuses while any row carries a `scope_id`
+(`DbRepository::hasTenantRows()`), unless `--scope=global` pools them on purpose.
 
 **Under tenancy the reclaim step moves.** `filestorage:gc --orphans` refuses
 while a `FileScopeProviderInterface` is bound — a tenant-filtered set of rows
@@ -335,11 +501,23 @@ The cursor keeps the tenant predicate.
 `referencedPaths($storeName, $directories)` is what `filestorage:gc --orphans`
 asks once per listing page: the paths of the store's rows that live in any of
 the given directories. It runs one parameterized statement per 200 directories
-(`relative_path LIKE '<dir>/%'` or equal to a root-level path), takes `_` and
-`%` in a directory literally, and then compares the store and the directory
-exactly in PHP — MySQL's default collation would otherwise answer for `A/x` when
+(`relative_path LIKE '<dir>/%' ESCAPE '!'` or equal to a root-level path), takes
+`_` and `%` in a directory literally — with an escape character declared in the
+statement, so MySQL's `NO_BACKSLASH_ESCAPES` mode does not turn them back into
+wildcards — and then compares the store and the directory exactly in PHP — MySQL's default collation would otherwise answer for `A/x` when
 asked about `a`. It keeps the tenant predicate too, which is one more reason the
 sweep runs from an entry point with no scope provider bound.
+
+`findMany($ids)` reads a batch of rows in one statement per 500 ids, scoped like
+`find()`; ids that do not exist or belong to another tenant are absent from the
+result.
+
+`DbBlobLedger` implements core's optional `BlobLedgerBatchLookupInterface`:
+`filestorage:gc` asks it about every object of a quarantine page with one
+`findMany($blobs)` — one statement per 500 blobs, the blob rows with their
+reference and reservation counts as correlated subqueries — instead of three
+statements per object. The answer is what `find()` would give for each blob,
+unknown blobs left out.
 
 ## Storage format
 
@@ -368,8 +546,10 @@ make release-check
 ```
 
 `make test-integration` runs on SQLite. The same suite runs against MySQL or
-PostgreSQL when `FILESTORAGE_TEST_DB` names one (CI does both); the image needs
-`pdo_mysql`/`pdo_pgsql`, which `composer:2` lacks:
+PostgreSQL when `FILESTORAGE_TEST_DB` names one (CI does both) — the ledger
+concurrency cases then use two server connections, on MySQL under
+`NO_BACKSLASH_ESCAPES,ANSI_QUOTES`; the image needs `pdo_mysql`/`pdo_pgsql`,
+which `composer:2` lacks:
 
 ```bash
 docker run --rm --network host -v "$PWD":/app -w /app \

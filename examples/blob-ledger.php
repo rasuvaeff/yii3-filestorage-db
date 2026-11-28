@@ -86,15 +86,18 @@ echo "leased: state {$ledger->find($blob)?->state->value}\n";
 echo "a second collector finds nothing: "
     . ($ledger->claimForDeletion($at('01:01'), $at('01:06')) === null ? 'yes' : 'no') . "\n";
 
-// 7. A writer arriving now is told to come back — joining a blob being deleted
-//    is how a committed row ends up pointing at nothing.
+// 7. A writer arriving while the lease is live is told to come back — joining a
+//    blob being deleted is how a committed row ends up pointing at nothing.
+//    Once the lease has expired (the collector died), a writer takes it over.
 try {
     $ledger->reserve($blob, $hash, 14, $at('01:10'));
 } catch (BlobBusyException $e) {
     echo "reserve refused: {$e->getMessage()}\n";
 }
 
-// 8. Delete the object, then the row. Only now would the store be touched.
+// 8. The collector quarantines the object, then asks the ledger: only a
+//    successful completeDeletion() lets it purge (a refusal means restore).
+//    That is `filestorage:gc` — use it rather than writing this loop.
 echo "deleted: " . ($ledger->completeDeletion($lease) ? 'yes' : 'no') . "\n";
 echo "ledger row gone: " . ($ledger->find($blob) === null ? 'yes' : 'no') . "\n";
 

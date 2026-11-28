@@ -12,6 +12,7 @@ use Rasuvaeff\Yii3Filestorage\File;
 use Rasuvaeff\Yii3Filestorage\Id\Uuid7IdGenerator;
 use Rasuvaeff\Yii3Filestorage\Mime\ExtensionMap;
 use Rasuvaeff\Yii3Filestorage\Mime\FinfoMimeTypeDetector;
+use Rasuvaeff\Yii3Filestorage\Path\ContentAddressedKeyGeneratorInterface;
 use Rasuvaeff\Yii3Filestorage\Path\FlatSha256KeyGenerator;
 use Rasuvaeff\Yii3Filestorage\Path\RandomPathGenerator;
 use Rasuvaeff\Yii3Filestorage\Path\Sha256KeyGenerator;
@@ -21,12 +22,14 @@ use Rasuvaeff\Yii3Filestorage\Repository\FileScopeProviderInterface;
 use Rasuvaeff\Yii3Filestorage\Storage;
 use Rasuvaeff\Yii3Filestorage\Store\BlobId;
 use Rasuvaeff\Yii3Filestorage\Store\BlobState;
+use Rasuvaeff\Yii3Filestorage\Store\Layout\FlatSiblingLayout;
 use Rasuvaeff\Yii3Filestorage\Store\StoredObjectId;
 use Rasuvaeff\Yii3Filestorage\Store\StoreRegistry;
 use Rasuvaeff\Yii3Filestorage\Test\InMemoryStore;
 use Rasuvaeff\Yii3Filestorage\Upload;
 use Rasuvaeff\Yii3FilestorageDb\BlobRowId;
 use Rasuvaeff\Yii3FilestorageDb\Command\DeduplicateCommand;
+use Rasuvaeff\Yii3FilestorageDb\ContentKeyCheck;
 use Rasuvaeff\Yii3FilestorageDb\DbBlobLedger;
 use Rasuvaeff\Yii3FilestorageDb\DbRepository;
 use Rasuvaeff\Yii3FilestorageDb\DeduplicatingStorageFactory;
@@ -44,6 +47,7 @@ use Symfony\Component\Console\Tester\CommandTester;
 use Testo\Assert;
 use Testo\Codecov\Covers;
 use Testo\Data\DataProvider;
+use Testo\Expect;
 use Testo\Lifecycle\AfterTest;
 use Testo\Lifecycle\BeforeTest;
 use Testo\Test;
@@ -54,6 +58,7 @@ use Yiisoft\Test\Support\Clock\StaticClock;
 #[Covers(DbBlobLedger::class)]
 #[Covers(DbRepository::class)]
 #[Covers(DedupScope::class)]
+#[Covers(ContentKeyCheck::class)]
 #[Covers(FileRowMapper::class)]
 #[Covers(Timestamps::class)]
 #[Covers(BlobRowId::class)]
@@ -353,6 +358,65 @@ final class DeduplicateCommandTest
     }
 
     /**
+     * The content key mixes the tenant in, and the rows come from the
+     * repository. A bound provider returning null would key every row into
+     * the `shared` pool — and under the repository's global opt-in, page every
+     * tenant's rows into it, merging tenants. Refused before anything is read.
+     */
+    public function aBoundProviderReturningNullIsRefusedBeforeAnythingIsRead(): void
+    {
+        $file = $this->store('a', 'hello');
+        $writes = $this->store->writeCount();
+        $scopes = new FixedScope();
+
+        $tester = new CommandTester(new DeduplicateCommand(
+            stores: new StoreRegistry([$this->store]),
+            repository: new DbRepository($this->database->db, scopes: $scopes, allowGlobalAccess: true),
+            ledger: $this->ledger,
+            streams: $this->factory,
+            clock: new StaticClock($this->at('01:00')),
+            scopes: $scopes,
+        ));
+
+        Assert::same($tester->execute(['--apply' => true]), Command::FAILURE);
+        Assert::string($this->display($tester))->contains($this->normalised(
+            FileScopeProviderInterface::class . ' is bound but returned no scope. This command keys rows by the '
+            . 'tenant in force, so establish the tenant first and run it once per tenant — or, for a '
+            . 'single-tenant installation, leave the provider unbound.',
+        ));
+        Assert::same($this->repository->find('a')?->relativePath, $file->relativePath);
+        Assert::same($this->store->writeCount(), $writes);
+    }
+
+    public function aZeroGracePeriodIsRefused(): void
+    {
+        Expect::exception(\InvalidArgumentException::class)->withMessageContaining('deleteGracePeriod');
+
+        new DeduplicateCommand(
+            stores: new StoreRegistry([$this->store]),
+            repository: $this->repository,
+            ledger: $this->ledger,
+            streams: $this->factory,
+            clock: new StaticClock($this->at('01:00')),
+            deleteGracePeriod: new DateInterval('PT0S'),
+        );
+    }
+
+    public function aZeroReservationTtlIsRefused(): void
+    {
+        Expect::exception(\InvalidArgumentException::class)->withMessageContaining('reservationTtl');
+
+        new DeduplicateCommand(
+            stores: new StoreRegistry([$this->store]),
+            repository: $this->repository,
+            ledger: $this->ledger,
+            streams: $this->factory,
+            clock: new StaticClock($this->at('01:00')),
+            reservationTtl: new DateInterval('PT0S'),
+        );
+    }
+
+    /**
      * The refusal has to say which values are acceptable, or the operator's next
      * move is another guess.
      */
@@ -438,6 +502,24 @@ final class DeduplicateCommandTest
         // from a broken one — and only the failed count turns the exit red.
         Assert::string($this->display($tester))->contains('0 already shared, 1 skipped, 0 failed');
         Assert::same($tester->getStatusCode(), Command::SUCCESS);
+    }
+
+    /**
+     * The row gets the size counted while hashing — the number the ledger was
+     * given — not the store's answer on the reuse branch, which measures the
+     * object already there. The live `add()` does the same for the same
+     * reason.
+     */
+    public function theRowGetsTheCountedSizeNotTheReusedObjects(): void
+    {
+        $this->store('a', 'hello');
+        $this->store('b', 'hello');
+        $this->run(['--apply' => true, '--limit' => '1']);
+        $this->store->misreportReuseSize(3);
+
+        $this->run(['--apply' => true, '--after' => 'a']);
+
+        Assert::same($this->repository->find('b')?->size, 5);
     }
 
     public function theSkipMessageNamesTheRowAndItsSize(): void
@@ -600,11 +682,14 @@ final class DeduplicateCommandTest
             ledger: $this->ledger,
             streams: $this->factory,
             clock: new StaticClock($this->at('01:00')),
-            keys: new FixedKeyGenerator('shared/one/original.bin'),
+            keys: new FixedKeyGenerator('shared/one'),
         ));
         $tester->execute(['--apply' => true]);
 
-        Assert::same($this->repository->find('a')?->relativePath, 'shared/one/original.bin');
+        Assert::same(
+            $this->repository->find('a')?->relativePath,
+            'shared/one/' . hash('sha256', 'hello') . '/original.bin',
+        );
     }
 
     /**
@@ -614,6 +699,7 @@ final class DeduplicateCommandTest
      */
     public function aFlatKeyCarriesTheRecordedTypesExtension(): void
     {
+        $this->useFlatLayout();
         $this->store('a', 'hello', mimeType: 'text/plain');
 
         $this->run(['--apply' => true], keys: new FlatSha256KeyGenerator(), extensions: new ExtensionMap(['text/plain' => 'text']));
@@ -632,6 +718,7 @@ final class DeduplicateCommandTest
      */
     public function aFileTheLivePathSharedIsAlreadyWhereTheCommandWouldPutIt(): void
     {
+        $this->useFlatLayout();
         $clock = new StaticClock($this->at('00:00'));
         $stores = new StoreRegistry([$this->store]);
         $storage = (new DeduplicatingStorageFactory(
@@ -676,19 +763,118 @@ final class DeduplicateCommandTest
         Assert::same($this->ledger->find($this->blobFor('common', $contents))?->size, 700_000);
     }
 
+    /**
+     * Summary A1: a flat key under the default `DirectoryLayout` makes deleting
+     * one blob delete its whole fan-out bucket. Refused before any row is read —
+     * in a dry run too, whose report would name targets that must never exist.
+     */
+    public function aFlatKeyGeneratorOnTheDirectoryLayoutIsRefusedBeforeAnythingIsWritten(): void
+    {
+        $file = $this->store('a', 'hello');
+        $writes = $this->store->writeCount();
+
+        $tester = $this->run(['--apply' => true], keys: new FlatSha256KeyGenerator());
+        $dryRun = $this->run([], keys: new FlatSha256KeyGenerator());
+
+        Assert::same($tester->getStatusCode(), Command::FAILURE);
+        Assert::same($dryRun->getStatusCode(), Command::FAILURE);
+        Assert::string($this->display($tester))->contains('cannot share a store');
+        Assert::string($this->display($dryRun))->notContains('would move');
+        Assert::same($this->repository->find('a')?->relativePath, $file->relativePath);
+        Assert::same($this->store->writeCount(), $writes);
+        Assert::null($this->ledger->find(BlobId::create('upload', (new FlatSha256KeyGenerator())->generate(
+            DedupScope::TenantGroup->keyFor('common', null),
+            hash('sha256', 'hello'),
+            'txt',
+        ))));
+    }
+
+    /**
+     * With no provider bound the command cannot see `scope_id`: in a
+     * multi-tenant table it paged every tenant's rows and keyed them all into
+     * `sha/shared/...`, so two tenants' identical files shared one blob under a
+     * scope that promises they never do. Refused while any row carries a
+     * tenant; `--scope=global` is the one scope that pools them on purpose.
+     */
+    public function tenantRowsWithoutABoundProviderAreRefused(): void
+    {
+        $acme = $this->store('a', 'hello', tenant: 'acme');
+        $beta = $this->store('b', 'hello', tenant: 'beta');
+
+        $tester = $this->run(['--apply' => true]);
+
+        Assert::same($tester->getStatusCode(), Command::FAILURE);
+        Assert::string($this->display($tester))->contains($this->normalised(
+            'No ' . FileScopeProviderInterface::class . ' is bound, but rows belong to tenants. Run this command '
+            . 'once per tenant with the tenant established, as the application\'s other CLI jobs do, or pass '
+            . '--scope=global to share across tenants on purpose.',
+        ));
+        Assert::same($this->repository->find('a')?->relativePath, $acme->relativePath);
+        Assert::same($this->repository->find('b')?->relativePath, $beta->relativePath);
+        Assert::null($this->ledger->find($this->blobFor('common', 'hello')));
+    }
+
+    public function tenantRowsWithoutABoundProviderMayBePooledOnPurposeWithTheGlobalScope(): void
+    {
+        $this->store('a', 'hello', tenant: 'acme');
+        $this->store('b', 'hello', tenant: 'beta');
+        $blob = $this->blobFor('common', 'hello', DedupScope::Global);
+
+        Assert::same($this->run(['--apply' => true, '--scope' => 'global'])->getStatusCode(), Command::SUCCESS);
+
+        Assert::same($this->repository->find('a')?->relativePath, $blob->relativePath());
+        Assert::same($this->repository->find('b')?->relativePath, $blob->relativePath());
+    }
+
+    /**
+     * A generator that drops the tenant from the key turns the per-tenant pool
+     * the bound provider establishes into one shared by every tenant.
+     */
+    public function aGeneratorThatIgnoresTheTenantIsRefusedUnderATenantScope(): void
+    {
+        $this->useFlatLayout();
+        $stores = new StoreRegistry([$this->store]);
+        $keys = new FlatSha256KeyGenerator(prefix: 'blobs');
+
+        $tester = $this->run(['--apply' => true], stores: $stores, keys: $keys, scopes: new FixedScope('acme'));
+        $global = $this->run(
+            ['--apply' => true, '--scope' => 'global'],
+            stores: $stores,
+            keys: $keys,
+            scopes: new FixedScope('acme'),
+        );
+
+        Assert::same($tester->getStatusCode(), Command::FAILURE);
+        Assert::string($this->display($tester))->contains('ignores the tenant');
+        Assert::string($this->display($tester))->contains('choose the "global" scope to share across tenants on purpose');
+        Assert::same($global->getStatusCode(), Command::SUCCESS);
+    }
+
+    /**
+     * Flat content keys need the sibling layout; under `DirectoryLayout` the
+     * command refuses them (summary A1).
+     */
+    private function useFlatLayout(): void
+    {
+        $this->inner = new InMemoryStore('upload', $this->factory, new StaticClock($this->at('00:00')), new FlatSiblingLayout());
+        $this->store = new ContentAddressableInMemoryStore($this->inner);
+    }
+
     private function run(
         array $arguments = [],
         ?StoreRegistry $stores = null,
         ?DbBlobLedger $ledger = null,
-        ?FlatSha256KeyGenerator $keys = null,
+        ?ContentAddressedKeyGeneratorInterface $keys = null,
         ?ExtensionMap $extensions = null,
+        ?FileScopeProviderInterface $scopes = null,
     ): CommandTester {
         $tester = new CommandTester(new DeduplicateCommand(
             stores: $stores ?? new StoreRegistry([$this->store]),
-            repository: $this->repository,
+            repository: $scopes === null ? $this->repository : new DbRepository($this->database->db, scopes: $scopes),
             ledger: $ledger ?? $this->ledger,
             streams: $this->factory,
             clock: new StaticClock($this->at('01:00')),
+            scopes: $scopes,
             keys: $keys,
             extensions: $extensions,
         ));
@@ -704,6 +890,7 @@ final class DeduplicateCommandTest
         ?string $description = null,
         ?int $size = null,
         ?string $mimeType = null,
+        ?string $tenant = null,
     ): File {
         $result = $this->inner->write(
             Upload::fromStream($this->factory->createStream($contents), 'a.txt', $this->factory),
@@ -722,7 +909,8 @@ final class DeduplicateCommandTest
             mimeType: $mimeType,
             description: $description,
         );
-        $this->repository->save($file);
+        ($tenant === null ? $this->repository : new DbRepository($this->database->db, scopes: new FixedScope($tenant)))
+            ->save($file);
 
         return $file;
     }
@@ -801,7 +989,12 @@ final class DeduplicateCommandTest
      */
     private function display(CommandTester $tester): string
     {
-        return (string) preg_replace('/[\\s!\\[\\]]+/u', ' ', $tester->getDisplay());
+        return $this->normalised($tester->getDisplay());
+    }
+
+    private function normalised(string $text): string
+    {
+        return (string) preg_replace('/[\\s!\\[\\]]+/u', ' ', $text);
     }
 
     public function theMaxBytesRefusalExplainsWhyZeroIsNotAnAnswer(): void

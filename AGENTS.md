@@ -11,17 +11,20 @@ makes deduplicated bytes safe to delete. Namespace
 
 Public API: `DbRepository` (core's `RepositoryInterface` +
 `MaintenanceRepositoryInterface`), `DbScopedFileResolver`
-(`ScopedFileResolverInterface`), `DbBlobLedger` (`BlobLedgerInterface`),
+(`ScopedFileResolverInterface`), `DbBlobLedger` (`BlobLedgerBatchLookupInterface`,
+which extends `BlobLedgerInterface`),
 `DeduplicatingStorage` / `DeduplicatingStorageFactory` / `DedupScope`,
 `Command\DeduplicateCommand`, the
 table-name value objects `FileTableName` / `BlobTableName` /
 `BlobReservationTableName`, the migrations under `src/Migration/`, and
-`Exception\InvalidFileRowException`. `FileRowMapper`, `Timestamps` and
-`BlobRowId` are `@internal`.
+`Exception\InvalidFileRowException`. `FileRowMapper`, `Timestamps`,
+`BlobRowId`, `PositiveInterval`, `ContentKeyCheck` and `ExactCollation` are
+`@internal`.
 
 DI wiring: `config/di.php` binds the four contracts above, the three table
-names, `DeduplicatingStorageFactory` and `Command\DeduplicateCommand`;
-`config/params.php` names the command under `yiisoft/yii-console`. It must
+names, `DbRepository`/`DbBlobLedger` by class (the scoped hot-path pair the
+factory and the command take), `DeduplicatingStorageFactory` and
+`Command\DeduplicateCommand`; `config/params.php` names the command under `yiisoft/yii-console`. It must
 **not** bind `StorageInterface` (core's), `StoreInterface` (a store backend's) or `FileScopeProviderInterface` (the application's) —
 `yiisoft/config` allows exactly one vendor package per key, and two packages
 claiming one is a `Duplicate key` error by design.
@@ -39,7 +42,13 @@ claiming one is a `Duplicate key` error by design.
    *through the repository* rather than issuing its own SQL, precisely because
    its own `DELETE ... WHERE id = :id` would be a cross-tenant delete. A signed
    download uses `DbScopedFileResolver`; turning the filter off for downloads
-   reads any file whose id leaks.
+   reads any file whose id leaks. A bound provider returning null is refused
+   (`MissingScopeException`), never read as "no predicate"; the one global
+   path is the explicit maintenance opt-in: the `globalMaintenanceAccess`
+   param, which `config/di.php` applies only to the
+   `MaintenanceRepositoryInterface` and `BlobLedgerInterface` bindings.
+   Console params are shared with queue workers, so it must never reach
+   `RepositoryInterface`, `DbRepository` or the deduplicating storage.
 4. **Preserve the public contract.** Update `README.md` **and `README.ru.md`**,
    `llms.txt` and the tests with any API change.
 
@@ -62,9 +71,9 @@ make release-check
 `composer:2` container because the base image has no coverage driver.
 
 `tests/Integration/CrossDatabaseMigrationTest` runs only when
-`FILESTORAGE_TEST_DB=mysql|pgsql` names a live server (database `filestorage`,
-password `filestorage`; ports via `FILESTORAGE_TEST_MYSQL_PORT` /
-`FILESTORAGE_TEST_PGSQL_PORT`). `composer:2` has neither `pdo_mysql` nor
+`FILESTORAGE_TEST_DB=mysql|mariadb|pgsql` names a live server (database
+`filestorage`, password `filestorage`; ports via `FILESTORAGE_TEST_MYSQL_PORT` /
+`FILESTORAGE_TEST_MARIADB_PORT` (default 3307) / `FILESTORAGE_TEST_PGSQL_PORT`). `composer:2` has neither `pdo_mysql` nor
 `pdo_pgsql` — use an image with them (`FROM composer:2` +
 `docker-php-ext-install pdo_mysql pdo_pgsql`) and `--network host`:
 
@@ -83,8 +92,9 @@ docker run --rm --network host -v "$PWD":/app -w /app \
 `minMsi` is **89**, run with `--with-uncovered`. The only ignores are the
 template's: `PublicVisibility`/`ProtectedVisibility` off and the regex for
 `type $name = default,` signature lines. Measured as CI runs it
-(`zend.assertions=-1`): 590 mutants, 37 undetected, 6 ignored, MSI 93%. The 37
-fall into these groups, none of which a test can kill without inventing a
+(`zend.assertions=-1`, 2026-11-28): 891 mutants, 82 undetected (43 Escaped,
+39 Not Covered), 7 ignored, MSI 90.72%, covered MSI 94.91%. The 82 fall into
+these groups, none of which a test can kill without inventing a
 scenario the schema or the driver rules out:
 
 | Group | Example | Why no test kills it |
@@ -92,12 +102,14 @@ scenario the schema or the driver rules out:
 | Guards the schema already enforces | `isset($row['state']) && \is_string(...)` in the ledger's row readers | The columns are `NOT NULL`, and `yiisoft/db` typecasts numeric columns on read — so the null and wrong-type branches cannot be produced through any driver. They stay because a hand-edited row is not impossible, only unreachable from here |
 | Predicates a single process cannot weaken observably | dropping `['id' => $id]` from `completeDeletion()` beside a unique `lease_token`; the `state = 'deleting'` half of the lease-steal arm, where only `deleting` rows have a non-null `lease_expires_at` | Both halves select the same row. Weakening one is visible only to a second process holding a colliding claim, which random 128-bit tokens make unreachable |
 | Ordering and floors | `orderBy(['id' => SORT_ASC])` on the candidate scan; `max(0, …)` around a decrement | Fairness and defence, not correctness: the scan returns the same set unordered, and the floors guard an underflow the callers already make impossible |
-| Exception-code arguments | the `0` in `new InvalidFileRowException($m, 0, $e)` | Nothing asserts an exception code, and asserting one would pin a value that carries no meaning |
 | Page-size constants and paged-walk `continue` | the `500` in `files($after, 500)` and the `262_144` read size in `DeduplicateCommand`; the `continue` in each of its "skip this row" branches | Killing the page sizes needs 500-row fixtures, and even then a different boundary is not a different result. The `continue`s are equivalent to `break` because the cursor advances *before* the branch and the outer `while` re-pages from it |
 | Diagnostics on a path a second fault opens | the `$io->text()` naming a reservation that could not be released, in `DeduplicateCommand`'s failure arm | Reaching it needs the store to fail *and* the ledger to fail right after — the double would have to be broken in two coordinated ways, which asserts the double rather than the command. The arm itself is covered; only the message inside it is not |
-| Redundant rewinds | `$stream->rewind()` after the digest pass in `DeduplicatingStorage` and `DeduplicateCommand` | `Upload::stream()` rewinds on every access and every consumer goes through it, so a missing rewind is invisible |
-| Lines with no opcode | the continuation lines of the multi-line messages in `DeduplicatingStorageFactory` and `reclaimAdvice()`; the unreachable `return 0` of `maxBytesOption()` (the option always has a default) | pcov records no executable opcode there, so the mutant is Not Covered whatever the tests assert; the messages themselves are asserted in full |
+| Redundant rewinds | `$stream->rewind()` on the over-the-cap exit of `DeduplicatingStorage`'s digest pass and after `DeduplicateCommand`'s | `Upload::stream()` rewinds on every access and every consumer goes through it, so a missing rewind is invisible |
+| Lines with no opcode | the continuation lines of multi-line messages built from literals and `::class` constants (`DeduplicatingStorageFactory`, `reclaimAdvice()`, the two tenant refusals in `DeduplicateCommand`, `DbRepository::missingScope()`, the snapshot-conflict message, `withProxyUrls()`) — the compiler folds them into one constant; the unreachable `return 0` of `maxBytesOption()` (the option always has a default) | pcov records no executable opcode there, so the mutant is Not Covered whatever the tests assert; the messages themselves are asserted in full |
 | MySQL rowcount fallbacks | `$activated === 0 && $this->blobRow($id) === null` in `commit()`, `$updated > 0 \|\| $this->row($id) !== null` in `updateContentHash()` | They exist for MySQL, which counts *changed* rows. SQLite counts matched rows, so the re-read half is invisible to every unit test; `CrossDatabaseMigrationTest` covers it on MySQL, but mutation runs on SQLite only |
+| Server-only branches | the `SELECT VERSION()`/`information_schema.COLLATIONS` reads in `M261128…`'s `exactCollation()` and its `modify()` calls; the `mysql`/`pgsql` match arms of `M261127…` | They run only on the MySQL driver; the decision itself lives in `ExactCollation` and is unit-tested, the queries are proven by the `mysql`/`mariadb` integration legs |
+| Array shaping the result does not depend on | `array_values()` before `array_chunk()` (which reindexes anyway); `array_unique()` over directories in `referencedPaths()` (the `$seen` set dedups across batches); `where(['b.id' => $ids])` in `findMany()` and the `store_name`/`LIKE` narrowing in `referencedPaths()` (PHP filters every row again); `$seen[$path] = true` → `false` (`isset()` is true for `false`); `preserve_keys` on the command's page | Each is narrowing or tidying in front of an exact check that decides the answer; dropping it changes the cost, not the result |
+| SQLite-only degenerate cases | `$seen < $limit` → `<=` and `$limit + $seen` in the command's paging (`LIMIT 0` and an exhausted page end the walk the same way); `$slash === 0` in `directoryOf()` (`File` refuses a leading slash); the registry-before-own-store `??` in `DeduplicatingStorage::remove()` (the registry's store of that name is the deduplicating store); the `return` after `joinExpiredDeletion()` (the next guard returns for `deleting` too); `(int)` before `< 1` in `ExactCollation` | Equivalent on every input the tests can produce through the schema |
 | Console option casts and guards | `(bool) $input->getOption('apply')` and the `isset() && is_string() && !== ''` chain in `stringOption()` | Symfony already guarantees the type, so only the `!== ''` half is reachable — and that half is tested. The rest exists so psalm can narrow without a suppression |
 
 Two shapes are worth knowing before adding tests here.
@@ -139,8 +151,23 @@ MSI without any test getting worse.
   matched rows (`CLIENT_FOUND_ROWS` is off, and the connection is the
   application's). An `UPDATE` whose decision is its affected count must either
   always change a column (a state or a fresh token) or re-read the row on 0.
-  `CrossDatabaseMigrationTest` drives every ledger statement on both servers in
-  the `database-integration` CI job; a new statement belongs there too (#12).
+  `CrossDatabaseMigrationTest` drives every ledger statement on MySQL, MariaDB
+  and PostgreSQL in the `database-integration` CI job; a new statement belongs
+  there too (#12).
+- **The ledger's transactions run at READ COMMITTED on the MySQL driver**
+  (`DbBlobLedger::transaction()`). MariaDB 11.6.2+ (`innodb_snapshot_isolation`
+  on) fails a REPEATABLE READ read-then-update with error 1020 when another
+  connection changed the row after the snapshot; MySQL never does, so only the
+  `mariadb` CI leg sees it. Inside an application transaction the level cannot
+  be set, and 1020 there becomes a `LedgerException`.
+  `LedgerConcurrencyTest` commits a second writer inside the ledger's
+  transaction through `InterleavingScope` (the repository asks for the scope
+  once per statement).
+- **`findMany()` is one statement per chunk, with the counts in it.** Correlated
+  `COUNT(*)` subqueries over aliased tables; a new form of it belongs in
+  `CrossDatabaseMigrationTest` and `LedgerBatchLookupTest` (MySQL under
+  `ANSI_QUOTES`). `DeduplicatingStorage::withProxyUrls()` forwards every
+  constructor argument — a new one added there must be added to the copy too.
 - **There is no `reference_count` column, and adding one would be a
   regression.** A reference *is* a `filestorage_file` row carrying the blob's
   id. A denormalised counter is a second source of truth that can drift from
@@ -170,7 +197,9 @@ MSI without any test getting worse.
   in core is how the two drift.
 - **A deletion lease is exclusive and expiring.** Expiry is not a detail: it is
   the entire recovery story for a worker that dies mid-delete. `reserve()`
-  refuses a `deleting` blob with `BlobBusyException` rather than joining it.
+  refuses a `deleting` blob whose lease is live with `BlobBusyException`, and
+  joins one whose lease has expired (the stale collector's `completeDeletion()`
+  then fails on its token).
 - **Timestamps are text, UTC, with microseconds.** The ledger compares
   deadlines with `<=` against a stored string, and lexicographic order only
   agrees with chronological order when every row carries the same offset.
@@ -207,6 +236,18 @@ MSI without any test getting worse.
   the row records what was detected. Both take core's DI-bound `ExtensionMap`
   so `extensionOverrides` apply to both; `aFileTheLivePathSharedIsAlreadyWhereTheCommandWouldPutIt`
   pins the parity with `FlatSha256KeyGenerator`.
+- **The factory and the command refuse the same key generators, through one
+  class.** `ContentKeyCheck` runs core's `LayoutCompatibility::assertContentKeys()`
+  (flat keys under `DirectoryLayout` delete their `ab/cd/` neighbours) and, with
+  a provider bound and a scope other than `Global`, core's
+  `LayoutCompatibility::tenantProblem()` with the scope strings this package
+  really generates (`DedupScope::keyFor('probe', 'tenant-a'|'tenant-b')`) — one
+  digest, equal keys mean the generator drops the tenant and the scope's
+  separation is fake. Do not grow a local copy of the probe; only the
+  `Global` exemption and the hint are this package's. Without a provider the command also refuses a table with
+  tenant rows (`DbRepository::hasTenantRows()`): it cannot see `scope_id`, and
+  would pool every tenant. Tests that use flat keys need a `FlatSiblingLayout`
+  store.
 - **A malformed row is `InvalidFileRowException`, never a coerced `File`.**
   Coercing until `File::create()` stops refusing turns a corrupted row into a
   plausible record pointing at the wrong object.

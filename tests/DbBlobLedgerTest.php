@@ -16,6 +16,7 @@ use Rasuvaeff\Yii3Filestorage\Store\BlobToken;
 use Rasuvaeff\Yii3FilestorageDb\BlobRowId;
 use Rasuvaeff\Yii3FilestorageDb\DbBlobLedger;
 use Rasuvaeff\Yii3FilestorageDb\DbRepository;
+use Rasuvaeff\Yii3FilestorageDb\PositiveInterval;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\FixedScope;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\InterceptingConnection;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\SqliteDatabase;
@@ -28,11 +29,13 @@ use Testo\Lifecycle\BeforeTest;
 use Testo\Test;
 use Yiisoft\Db\Exception\IntegrityException;
 use Yiisoft\Db\Query\Query;
+use Yiisoft\Db\Transaction\TransactionInterface;
 use Yiisoft\Test\Support\Clock\StaticClock;
 
 #[Test]
 #[Covers(DbBlobLedger::class)]
 #[Covers(BlobRowId::class)]
+#[Covers(PositiveInterval::class)]
 final class DbBlobLedgerTest
 {
     private SqliteDatabase $database;
@@ -491,6 +494,140 @@ final class DbBlobLedgerTest
     }
 
     /**
+     * The probe from the 1.0 review (`remigrate.php`): `filestorage:deduplicate`
+     * repointing a row that already shared a blob — another `--scope`, another
+     * key generator — left the old blob `active` with no reference, where
+     * neither the blob collector nor the orphan sweep would ever take it.
+     */
+    public function repointingACommittedRowSchedulesTheBlobItLeft(): void
+    {
+        $this->ledger->commit($this->reserve(), SqliteDatabase::file('a'));
+        $this->ledger->commit($this->reserveOther(), $this->fileOnOtherBlob('a'));
+
+        $left = $this->ledger->find($this->blob());
+        Assert::same($left?->state, BlobState::PendingDelete);
+        Assert::same($left?->referenceCount, 0);
+        Assert::same($left?->deleteAfter?->format('H:i'), '01:00');
+        Assert::same($this->ledger->find($this->otherBlob())?->state, BlobState::Active);
+        Assert::true($this->ledger->claimForDeletion($this->at('01:00'), $this->at('01:05')) instanceof BlobLease);
+    }
+
+    public function repointingLeavesABlobOtherRowsStillReferenceActive(): void
+    {
+        $this->ledger->commit($this->reserve(), SqliteDatabase::file('a'));
+        $this->ledger->commit($this->reserve(), SqliteDatabase::file('b'));
+        $this->ledger->commit($this->reserveOther(), $this->fileOnOtherBlob('a'));
+
+        Assert::same($this->ledger->find($this->blob())?->state, BlobState::Active);
+        Assert::same($this->ledger->find($this->blob())?->referenceCount, 1);
+    }
+
+    public function recommittingARowToTheSameBlobDoesNotScheduleIt(): void
+    {
+        $this->ledger->commit($this->reserve(), SqliteDatabase::file('a'));
+        $this->ledger->commit($this->reserve(), SqliteDatabase::file('a'));
+
+        Assert::same($this->ledger->find($this->blob())?->state, BlobState::Active);
+        Assert::null($this->ledger->find($this->blob())?->deleteAfter);
+    }
+
+    /**
+     * A collector that died between its claim and its delete leaves the row
+     * `deleting` until the next `gc`. Once the lease has expired a writer
+     * joins rather than failing until then: since 0.9 the collector deletes
+     * through the quarantine, a stale collector's `completeDeletion()` is
+     * refused, and it restores — keeping the bytes the writer re-published.
+     */
+    public function aWriterJoinsABlobWhoseDeletionLeaseExpired(): void
+    {
+        $this->ledger->release($this->reserve(), $this->at('01:00'));
+        $lease = $this->ledger->claimForDeletion($this->at('01:00'), $this->at('01:05'));
+
+        $later = $this->ledgerAt('01:05');
+        $reservation = $later->reserve($this->blob(), SqliteDatabase::HASH, 12, $this->at('01:20'));
+
+        $record = $later->find($this->blob());
+        Assert::same($record?->state, BlobState::Writing);
+        Assert::null($record?->leaseExpiresAt);
+        Assert::false($this->ledger->completeDeletion($lease ?? $this->forgedLease()), 'the stale lease must not delete');
+        Assert::false($this->ledger->abandonDeletion($lease ?? $this->forgedLease(), $this->at('02:00')));
+
+        $later->commit($reservation, SqliteDatabase::file('a'));
+        Assert::same($later->find($this->blob())?->state, BlobState::Active);
+    }
+
+    /**
+     * The join and the claim are not serialised by a lock: a writer can read
+     * an `active` blob, and a collector with a snapshot that does not see the
+     * writer's uncommitted reservation can claim it after the last reference
+     * goes. `commit()` used to activate that `deleting` row regardless,
+     * erasing the lease while the collector deleted the bytes.
+     */
+    public function commitRefusesABlobAClaimTookAfterTheReservation(): void
+    {
+        $reservation = $this->reserve();
+        $this->database->db->createCommand()->update(
+            'filestorage_blob',
+            ['state' => BlobState::Deleting->value, 'lease_token' => 'cafebabecafebabe', 'lease_expires_at' => '2026-01-01T01:05:00.000000+00:00'],
+            ['id' => BlobRowId::for($this->blob())],
+        )->execute();
+
+        try {
+            $this->ledger->commit($reservation, SqliteDatabase::file('a'));
+            Assert::fail('Expected LedgerException');
+        } catch (LedgerException $e) {
+            Assert::string($e->getMessage())->contains('is being deleted');
+        }
+
+        $record = $this->ledger->find($this->blob());
+        Assert::same($record?->state, BlobState::Deleting);
+        Assert::same($record?->reservationCount, 1, 'the reservation is rolled back, not consumed');
+        Assert::null($this->repository->find('a'));
+        Assert::true($this->ledger->completeDeletion(new BlobLease($this->blob(), new BlobToken('cafebabecafebabe'), $this->at('01:05'))) === false);
+    }
+
+    /**
+     * @return iterable<string, array{string}>
+     */
+    public static function nonPositiveIntervalProvider(): iterable
+    {
+        yield 'zero' => ['PT0S'];
+        yield 'zero days' => ['P0D'];
+    }
+
+    /**
+     * A zero grace period makes "scheduled" and "collectable" the same
+     * instant, and the join ↔ claim race above stops being theoretical.
+     */
+    #[DataProvider('nonPositiveIntervalProvider')]
+    public function aGracePeriodThatIsNotPositiveIsRefused(string $interval): void
+    {
+        Expect::exception(\InvalidArgumentException::class)->withMessageContaining('deleteGracePeriod');
+
+        new DbBlobLedger(
+            db: $this->database->db,
+            repository: $this->repository,
+            clock: new StaticClock($this->at('00:00')),
+            deleteGracePeriod: new \DateInterval($interval),
+        );
+    }
+
+    public function anInvertedGracePeriodIsRefused(): void
+    {
+        $interval = new \DateInterval('PT1H');
+        $interval->invert = 1;
+
+        Expect::exception(\InvalidArgumentException::class)->withMessageContaining('deleteGracePeriod');
+
+        new DbBlobLedger(
+            db: $this->database->db,
+            repository: $this->repository,
+            clock: new StaticClock($this->at('00:00')),
+            deleteGracePeriod: $interval,
+        );
+    }
+
+    /**
      * Two blobs with the same content in different stores are two rows. A
      * ledger keyed by hash would have merged them, and a delete in one store
      * would have removed what the other still points at.
@@ -679,6 +816,67 @@ final class DbBlobLedgerTest
         Assert::same($this->ledger->find($this->blob())?->state, BlobState::PendingDelete);
     }
 
+    /**
+     * Core's optional batch lookup (review 1.0 pass 2, maintenance N7):
+     * `filestorage:gc` asks the ledger about every object of every quarantine
+     * entry on every run. `findMany()` answers what `find()` answers for each
+     * blob — counts and dates included — and leaves out the unknown ones.
+     */
+    public function findManyAnswersWhatFindAnswersForEachBlob(): void
+    {
+        $this->ledger->commit($this->reserve(), SqliteDatabase::file('a'));
+        $this->reserve();
+        $this->ledger->commit($this->reserveOther(), $this->fileOnOtherBlob('b'));
+        $this->ledger->releaseFile('b', $this->at('01:00'));
+        $writing = BlobId::create('upload', 'sha/aa/bb/original');
+        $this->ledger->reserve($writing, SqliteDatabase::HASH, 5, $this->at('00:10'));
+        $unknown = BlobId::create('upload', 'sha/ff/ff/original');
+
+        $records = $this->ledger->findMany([$this->blob(), $this->otherBlob(), $writing, $unknown, $this->blob()]);
+
+        Assert::same(array_keys($records), [$this->blob()->key(), $this->otherBlob()->key(), $writing->key()]);
+        foreach ([$this->blob(), $this->otherBlob(), $writing] as $blob) {
+            Assert::equals($records[$blob->key()], $this->ledger->find($blob));
+        }
+        Assert::same($records[$this->blob()->key()]->referenceCount, 1);
+        Assert::same($records[$this->blob()->key()]->reservationCount, 1);
+        Assert::same($records[$this->otherBlob()->key()]->state, BlobState::PendingDelete);
+        Assert::same($records[$writing->key()]->state, BlobState::Writing);
+    }
+
+    /**
+     * The point of the capability: one query per page of blobs — rows and
+     * both counts together — instead of three per blob; none at all for an
+     * empty page. A page longer than {@see DbBlobLedger::FIND_MANY_CHUNK}
+     * blobs is split, so no driver meets an unbounded `IN` list.
+     */
+    public function findManyIsOneQueryPerChunk(): void
+    {
+        $connection = new InterceptingConnection($this->database->db);
+        $ledger = $this->ledgerOver($connection);
+        $ledger->commit($this->reserveWith($ledger), SqliteDatabase::file('a'));
+        $queries = 0;
+        $connection->onCreateCommand = static function (?string $sql, \Closure $proceed) use (&$queries): mixed {
+            ++$queries;
+
+            return $proceed();
+        };
+
+        Assert::same($ledger->findMany([]), []);
+        Assert::same($queries, 0);
+
+        Assert::count($ledger->findMany([$this->blob(), $this->otherBlob()]), 1);
+        Assert::same($queries, 1);
+
+        $queries = 0;
+        $page = array_map(
+            static fn(int $i): BlobId => BlobId::create('upload', "sha/{$i}/original"),
+            range(1, DbBlobLedger::FIND_MANY_CHUNK * 2 + 1),
+        );
+        Assert::equals($ledger->findMany([$this->blob(), ...$page]), [$this->blob()->key() => $ledger->find($this->blob())]);
+        Assert::same($queries, 3 + 3);
+    }
+
     private function reserve(string $hash = SqliteDatabase::HASH, int $size = 12): BlobReservation
     {
         return $this->ledger->reserve($this->blob(), $hash, $size, $this->at('00:10'));
@@ -722,6 +920,78 @@ final class DbBlobLedgerTest
     private function at(string $time): DateTimeImmutable
     {
         return new DateTimeImmutable("2026-01-01T{$time}:00.000000+00:00");
+    }
+
+    /**
+     * Review pass 2 N-B1: every transaction the ledger owns runs at READ
+     * COMMITTED on the MySQL driver, and on no other.
+     */
+    public function theLedgersOwnTransactionsRunAtReadCommittedOnMysqlOnly(): void
+    {
+        $connection = new InterceptingConnection($this->database->db);
+        $ledger = $this->ledgerOver($connection);
+        $connection->driverName = 'mysql';
+
+        $ledger->commit($this->reserveWith($ledger), SqliteDatabase::file('a'));
+        $ledger->release($this->reserveWith($ledger), $this->at('01:00'));
+        $ledger->releaseFile('a', $this->at('01:00'));
+        $ledger->expireReservations($this->at('00:00'), $this->at('01:00'));
+
+        Assert::same($connection->isolationLevels, array_fill(0, 6, TransactionInterface::READ_COMMITTED));
+
+        $connection->driverName = null;
+        $connection->isolationLevels = [];
+        $ledger->expireReservations($this->at('00:00'), $this->at('01:00'));
+
+        Assert::same($connection->isolationLevels, [null]);
+    }
+
+    /**
+     * Inside an application transaction the level cannot be set, and MariaDB
+     * answers a changed row with error 1020 — which yiisoft/db raises as an
+     * `IntegrityException`. It must not reach `reserve()`'s insert-race retry
+     * or the caller as a driver error.
+     */
+    public function aSnapshotConflictIsALedgerExceptionNamingTheCause(): void
+    {
+        $connection = new InterceptingConnection($this->database->db);
+        $conflict = new IntegrityException('1020 Record has changed since last read', ['HY000', 1020, 'Record has changed']);
+        $attempts = 0;
+        $connection->onTransaction = static function () use ($conflict, &$attempts): never {
+            ++$attempts;
+
+            throw $conflict;
+        };
+
+        try {
+            $this->reserveWith($this->ledgerOver($connection));
+            Assert::fail('Expected LedgerException');
+        } catch (LedgerException $e) {
+            Assert::same(
+                $e->getMessage(),
+                'A blob row changed after this transaction\'s snapshot (MariaDB error 1020 under REPEATABLE READ):'
+                . ' the ledger was called inside a transaction it does not own. Retry that transaction, or run it'
+                . ' at READ COMMITTED',
+            );
+            Assert::same($e->getCode(), 0);
+            Assert::same($e->getPrevious(), $conflict);
+            Assert::same($attempts, 1, 'a snapshot conflict is not an insert race to retry');
+        }
+    }
+
+    /** Another driver error with error info stays what it was. */
+    public function anotherDatabaseErrorIsRethrownAsIs(): void
+    {
+        $connection = new InterceptingConnection($this->database->db);
+        $failure = new \Yiisoft\Db\Exception\Exception('gone away', ['HY000', 2006, 'MySQL server has gone away']);
+        $connection->onTransaction = static fn(): never => throw $failure;
+
+        try {
+            $this->ledgerOver($connection)->releaseFile('a', $this->at('01:00'));
+            Assert::fail('Expected the driver exception');
+        } catch (\Yiisoft\Db\Exception\Exception $e) {
+            Assert::same($e, $failure);
+        }
     }
 
     public function reserveRetriesOnceWhenAnotherWriterWonTheInsertRace(): void
@@ -920,6 +1190,11 @@ final class DbBlobLedgerTest
         yield 'missing' => [[], null];
     }
 
+    private function ledgerAt(string $time): DbBlobLedger
+    {
+        return new DbBlobLedger($this->database->db, $this->repository, new StaticClock($this->at($time)));
+    }
+
     private function ledgerOver(InterceptingConnection $connection): DbBlobLedger
     {
         return new DbBlobLedger($connection, $this->repository, new StaticClock($this->at('00:00')));
@@ -934,5 +1209,93 @@ final class DbBlobLedgerTest
     private function callPrivate(string $method, mixed ...$arguments): mixed
     {
         return (new \ReflectionMethod(DbBlobLedger::class, $method))->invoke($this->ledger, ...$arguments);
+    }
+
+    /**
+     * An unknown blob anywhere in the page is left out, not the end of the
+     * answer: `gc` asks about every object of a quarantine entry at once, and
+     * a blob after the unknown one is still referenced.
+     */
+    public function findManyAnswersPastAnUnknownBlob(): void
+    {
+        $this->ledger->commit($this->reserve(), SqliteDatabase::file('a'));
+        $unknown = BlobId::create('upload', 'sha/ff/ff/original');
+
+        $records = $this->ledger->findMany([$unknown, $this->blob()]);
+
+        Assert::same(array_keys($records), [$this->blob()->key()]);
+    }
+
+    /**
+     * Two collectors died mid-delete. A writer joining one of the expired
+     * deletions takes that blob back and leaves the other one leased — still
+     * the stale collector's to finish or the next one's to steal.
+     */
+    public function joiningAnExpiredDeletionTakesBackOnlyThatBlob(): void
+    {
+        $this->ledger->release($this->reserve(), $this->at('01:00'));
+        $this->ledger->release($this->reserveOther(), $this->at('01:00'));
+        Assert::instanceOf($this->ledger->claimForDeletion($this->at('01:00'), $this->at('01:05')), BlobLease::class);
+        Assert::instanceOf($this->ledger->claimForDeletion($this->at('01:00'), $this->at('01:05')), BlobLease::class);
+
+        $later = $this->ledgerAt('01:05');
+        $later->reserve($this->blob(), SqliteDatabase::HASH, 12, $this->at('01:20'));
+
+        Assert::same($later->find($this->blob())?->state, BlobState::Writing);
+        $other = $later->find($this->otherBlob());
+        Assert::same($other?->state, BlobState::Deleting);
+        Assert::equals($other?->leaseExpiresAt, $this->at('01:05'));
+    }
+
+    /**
+     * The re-read that settles a zero affected-row count reads this blob's
+     * row, not whichever row comes first: another blob created earlier and
+     * still `writing` must not make a claimed blob look committable.
+     */
+    public function commitReReadsItsOwnBlobBesideAnEarlierOne(): void
+    {
+        $this->reserveOther();
+        $reservation = $this->reserve();
+        $this->database->db->createCommand()->update(
+            'filestorage_blob',
+            ['state' => BlobState::Deleting->value, 'lease_token' => 'cafebabecafebabe', 'lease_expires_at' => '2026-01-01T01:05:00.000000+00:00'],
+            ['id' => BlobRowId::for($this->blob())],
+        )->execute();
+
+        try {
+            $this->ledger->commit($reservation, SqliteDatabase::file('a'));
+            Assert::fail('Expected LedgerException');
+        } catch (LedgerException $e) {
+            Assert::same(
+                $e->getMessage(),
+                sprintf('Blob "%s" is being deleted; its reservation cannot be committed', $this->blob()->key()),
+            );
+        }
+
+        Assert::null($this->repository->find('a'));
+    }
+
+    /**
+     * Off SQLite the re-read is a locking read (`FOR UPDATE`): inside an
+     * application's REPEATABLE READ transaction a plain SELECT answers from
+     * the snapshot. Driven here with the MySQL driver name over SQLite's
+     * query builder, whose refusal of a `FOR` clause is the evidence that the
+     * lock was asked for.
+     */
+    public function theReReadAsksForARowLockOffSqlite(): void
+    {
+        $connection = new InterceptingConnection($this->database->db);
+        $ledger = $this->ledgerOver($connection);
+        $reservation = $this->reserveWith($ledger);
+        $this->database->db->createCommand()->update(
+            'filestorage_blob',
+            ['state' => BlobState::Deleting->value, 'lease_token' => 'cafebabecafebabe', 'lease_expires_at' => '2026-01-01T01:05:00.000000+00:00'],
+            ['id' => BlobRowId::for($this->blob())],
+        )->execute();
+        $connection->driverName = 'mysql';
+
+        Expect::exception(\Yiisoft\Db\Exception\NotSupportedException::class)->withMessageContaining('FOR clause');
+
+        $ledger->commit($reservation, SqliteDatabase::file('a'));
     }
 }

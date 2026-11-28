@@ -12,6 +12,7 @@ use Rasuvaeff\Yii3Filestorage\Exception\InvalidConfigException;
 use Rasuvaeff\Yii3Filestorage\Exception\PolicyViolationException;
 use Rasuvaeff\Yii3Filestorage\Exception\RemoveException;
 use Rasuvaeff\Yii3Filestorage\Exception\StoreException;
+use Rasuvaeff\Yii3Filestorage\Exception\UploadSizeException;
 use Rasuvaeff\Yii3Filestorage\Id\Uuid7IdGenerator;
 use Rasuvaeff\Yii3Filestorage\Mime\ExtensionMap;
 use Rasuvaeff\Yii3Filestorage\Mime\FinfoMimeTypeDetector;
@@ -27,19 +28,29 @@ use Rasuvaeff\Yii3Filestorage\Store\BlobId;
 use Rasuvaeff\Yii3Filestorage\Store\BlobLedgerInterface;
 use Rasuvaeff\Yii3Filestorage\Store\BlobState;
 use Rasuvaeff\Yii3Filestorage\Store\ContentAddressableStoreInterface;
+use Rasuvaeff\Yii3Filestorage\Store\FileSystem\FileSystemStore;
+use Rasuvaeff\Yii3Filestorage\Store\FileSystem\PublicFileSystemStore;
+use Rasuvaeff\Yii3Filestorage\Store\Layout\FlatSiblingLayout;
 use Rasuvaeff\Yii3Filestorage\Store\StoreRegistry;
 use Rasuvaeff\Yii3Filestorage\Test\InMemoryStore;
 use Rasuvaeff\Yii3Filestorage\Test\MemoryBlobLedger;
 use Rasuvaeff\Yii3Filestorage\Upload;
+use Rasuvaeff\Yii3FilestorageDb\ContentKeyCheck;
 use Rasuvaeff\Yii3FilestorageDb\DbBlobLedger;
 use Rasuvaeff\Yii3FilestorageDb\DbRepository;
 use Rasuvaeff\Yii3FilestorageDb\DeduplicatingStorage;
 use Rasuvaeff\Yii3FilestorageDb\DeduplicatingStorageFactory;
 use Rasuvaeff\Yii3FilestorageDb\DedupScope;
+use Rasuvaeff\Yii3FilestorageDb\Exception\MissingScopeException;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\ContentAddressableInMemoryStore;
+use Rasuvaeff\Yii3FilestorageDb\Tests\Support\FaultyLedger;
+use Rasuvaeff\Yii3FilestorageDb\Tests\Support\FixedIdGenerator;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\FixedKeyGenerator;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\FixedScope;
+use Rasuvaeff\Yii3FilestorageDb\Tests\Support\ForwardingStorage;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\NoMimeTypeDetector;
+use Rasuvaeff\Yii3FilestorageDb\Tests\Support\PinnedProxyUrls;
+use Rasuvaeff\Yii3FilestorageDb\Tests\Support\SlashRefusingKeyGenerator;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\SpyStream;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\SqliteDatabase;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\UnsizedStream;
@@ -56,6 +67,7 @@ use Yiisoft\Test\Support\Clock\StaticClock;
 #[Covers(DeduplicatingStorage::class)]
 #[Covers(DeduplicatingStorageFactory::class)]
 #[Covers(DedupScope::class)]
+#[Covers(ContentKeyCheck::class)]
 final class DeduplicatingStorageTest
 {
     private SqliteDatabase $database;
@@ -188,6 +200,73 @@ final class DeduplicatingStorageTest
     }
 
     /**
+     * The probe from the 1.0 review (`unique.php`): a file above the cap took
+     * the unique path, and removing it dropped the row and left the bytes —
+     * where the base facade deletes them. The consumer must not see a
+     * difference.
+     */
+    public function removingAFileOnTheUniquePathDeletesItsBytes(): void
+    {
+        $storage = $this->factory()->create(dedupMaxBytes: 4);
+        $file = $storage->add($this->upload('hello'));
+
+        Assert::true($storage->remove($file->id));
+
+        Assert::null($this->store->bytesAt($file->relativePath));
+        Assert::null($this->repository->find($file->id));
+    }
+
+    public function removingAFileInAnotherStoreDeletesItsBytesThere(): void
+    {
+        $other = new InMemoryStore('archive', $this->factory, new StaticClock($this->at('00:00')));
+        $storage = $this->factory(stores: new StoreRegistry([$this->store, $other]))->create();
+        $file = $storage->add($this->upload('hello'), storeName: 'archive');
+
+        Assert::true($storage->remove($file->id));
+
+        Assert::false($other->exists($file));
+    }
+
+    /**
+     * A shared row's path is a ledger blob, and those bytes are only ever
+     * deleted by a collector. Checked against the path the row was read
+     * with, so a row repointed in between can only make an orphan go, never
+     * a blob.
+     */
+    /**
+     * The row is gone by the time the store is looked up, so a store the
+     * registry no longer knows is a failed remove, reported the way the base
+     * facade reports it — not the registry's own exception.
+     */
+    public function aRowInAStoreTheRegistryDoesNotKnowIsARemoveException(): void
+    {
+        $this->repository->save(SqliteDatabase::file('gone', relativePath: 'g/unique', storeName: 'archive'));
+
+        try {
+            $this->storage->remove('gone');
+            Assert::fail('Expected RemoveException');
+        } catch (RemoveException $e) {
+            Assert::same(
+                $e->getMessage(),
+                'Removed metadata for "gone" but could not delete "g/unique" from store "archive"; '
+                . 'it is now an orphan for filestorage:gc',
+            );
+            Assert::same($e->getCode(), 0);
+        }
+
+        Assert::null($this->repository->find('gone'));
+    }
+
+    public function removingASharedRowNeverDeletesItsBytes(): void
+    {
+        $file = $this->storage->add($this->upload('hello'));
+
+        Assert::true($this->storage->remove($file->id));
+
+        Assert::same($this->store->bytesAt($file->relativePath), 'hello');
+    }
+
+    /**
      * The scope decides how widely bytes are shared, and the default keeps
      * tenants apart — sharing across them tells an uploader whether content
      * they suspect exists already does.
@@ -203,6 +282,58 @@ final class DeduplicatingStorageTest
 
         Assert::true($first->relativePath !== $second->relativePath);
         Assert::same($this->store->writeCount(), 2);
+    }
+
+    /**
+     * The content key mixes the tenant in. A bound provider returning null
+     * used to key the upload into the `shared` pool — every unresolved tenant's
+     * uploads joining one another's blobs — before the repository was even
+     * asked. Refused before anything is read or reserved.
+     */
+    public function aBoundProviderReturningNullIsRefusedBeforeAnythingIsWritten(): void
+    {
+        $storage = $this->factory(scopes: new FixedScope())->create();
+
+        $refused = null;
+
+        try {
+            $storage->add($this->upload('hello'));
+        } catch (MissingScopeException $e) {
+            $refused = $e->getMessage();
+        }
+
+        Assert::same(
+            $refused,
+            \Rasuvaeff\Yii3Filestorage\Repository\FileScopeProviderInterface::class . ' is bound but returned no scope, '
+            . 'and the content key of a deduplicated upload is built from the tenant. Establish the tenant before '
+            . 'adding files',
+        );
+        Assert::same($this->store->writeCount(), 0);
+        Assert::null($this->ledger->find($this->blobOf((new \Rasuvaeff\Yii3Filestorage\Path\Sha256KeyGenerator())->generate(
+            DedupScope::TenantGroup->keyFor('common', null),
+            hash('sha256', 'hello'),
+        ))));
+    }
+
+    /**
+     * @return iterable<string, array{string, string}>
+     */
+    public static function zeroIntervalProvider(): iterable
+    {
+        yield 'zero grace' => ['deleteGracePeriod', 'PT0S'];
+        yield 'zero reservation ttl' => ['reservationTtl', 'PT0S'];
+    }
+
+    /**
+     * A zero grace period makes "scheduled" and "collectable" one instant,
+     * and a zero reservation TTL lets the sweep drop a claim mid-upload.
+     */
+    #[DataProvider('zeroIntervalProvider')]
+    public function anIntervalThatIsNotPositiveIsRefused(string $name, string $interval): void
+    {
+        Expect::exception(\InvalidArgumentException::class)->withMessageContaining($name);
+
+        $this->factory()->create(...[$name => new DateInterval($interval)]);
     }
 
     public function aGlobalScopeSharesAcrossTenants(): void
@@ -350,11 +481,11 @@ final class DeduplicatingStorageTest
      */
     public function anInjectedKeyGeneratorDecidesTheLayout(): void
     {
-        $storage = $this->factory(keys: new FixedKeyGenerator('shared/one/original.bin'))->create();
+        $storage = $this->factory(keys: new FixedKeyGenerator('shared/one'))->create();
 
         $file = $storage->add($this->upload('hello'));
 
-        Assert::same($file->relativePath, 'shared/one/original.bin');
+        Assert::same($file->relativePath, 'shared/one/' . hash('sha256', 'hello') . '/original.bin');
     }
 
     /**
@@ -363,7 +494,7 @@ final class DeduplicatingStorageTest
      */
     public function theContentKeyCarriesTheDetectedExtension(): void
     {
-        $storage = $this->factory(keys: new FlatSha256KeyGenerator())->create();
+        $storage = $this->factory(stores: $this->flatStores(), keys: new FlatSha256KeyGenerator())->create();
 
         $file = $storage->add($this->upload('hello'));
 
@@ -381,6 +512,7 @@ final class DeduplicatingStorageTest
     public function theExtensionMapOverridesReachTheContentKey(): void
     {
         $storage = $this->factory(
+            stores: $this->flatStores(),
             keys: new FlatSha256KeyGenerator(),
             extensions: new ExtensionMap(['text/plain' => 'text']),
         )->create();
@@ -509,6 +641,226 @@ final class DeduplicatingStorageTest
         $storage->add($this->upload('hello'));
     }
 
+    /**
+     * Summary A1: a flat `<prefix>/ab/cd/<sha>.ext` key under the default
+     * {@see \Rasuvaeff\Yii3Filestorage\Store\Layout\DirectoryLayout} makes
+     * deleting one blob delete its whole fan-out bucket. The pair is refused
+     * when the storage is assembled, before a single byte is written.
+     */
+    public function aFlatKeyGeneratorOnTheDirectoryLayoutIsRefusedBeforeAnythingIsWritten(): void
+    {
+        $refused = null;
+
+        try {
+            $this->factory(keys: new FlatSha256KeyGenerator())->create()->add($this->upload('hello'));
+        } catch (InvalidConfigException $e) {
+            $refused = $e->getMessage();
+        }
+
+        Assert::string((string) $refused)->contains('Store "upload"');
+        Assert::string((string) $refused)->contains(FlatSha256KeyGenerator::class);
+        Assert::string((string) $refused)->contains('cannot share a store');
+        Assert::same($this->store->writeCount(), 0);
+    }
+
+    /**
+     * A generator that drops the tenant from the key (`FlatSha256KeyGenerator`
+     * with a prefix) turns a tenant-separated scope into cross-tenant sharing —
+     * the content-existence oracle {@see DedupScope} exists to prevent. With a
+     * provider bound that is refused; `Global` states the sharing on purpose.
+     */
+    public function aGeneratorThatIgnoresTheTenantIsRefusedUnderATenantScope(): void
+    {
+        Expect::exception(InvalidConfigException::class)->withMessageContaining(
+            'ignores the tenant: identical bytes under the scopes "sha/',
+        );
+
+        $this->factory(
+            stores: $this->flatStores(),
+            scopes: new FixedScope('tenant-a'),
+            keys: new FlatSha256KeyGenerator(prefix: 'blobs'),
+        )->create();
+    }
+
+    /**
+     * Core 0.10 has `Storage::withProxyUrls()` for links minted outside the
+     * tenant's request (review 1.0 pass 2, flysystem-web-images N10). With
+     * deduplication on, `StorageInterface` resolves to this decorator, and
+     * `$storage->withProxyUrls($urls->forScope($tenant))->urlFor($file)` has
+     * to work on it too: a copy whose wrapped facade mints through the given
+     * generator, sharing the ledger, the store and everything else.
+     */
+    public function withProxyUrlsMintsThroughTheGivenGeneratorAndLeavesTheOriginalAlone(): void
+    {
+        $file = $this->storage->add($this->upload('hello'));
+
+        $pinned = $this->storage->withProxyUrls(new PinnedProxyUrls('tenant-a'));
+
+        Assert::instanceOf($pinned, DeduplicatingStorage::class);
+        Assert::same($pinned->urlFor($file, $this->at('02:00')), "/files/tenant-a/{$file->id}");
+        Assert::null($this->storage->urlFor($file, $this->at('02:00')));
+        Assert::same($pinned->add($this->upload('hello'))->relativePath, $file->relativePath);
+        Assert::same($this->store->writeCount(), 1);
+    }
+
+    /**
+     * A decorator over a decorator delegates down to core's facade; a wrapped
+     * facade that cannot swap its generator is refused by name rather than
+     * silently minting through the unpinned one.
+     */
+    public function withProxyUrlsReachesCoresFacadeOrRefuses(): void
+    {
+        $file = $this->storage->add($this->upload('hello'));
+        Assert::instanceOf($this->storage, DeduplicatingStorage::class);
+        $outer = $this->wrapping($this->storage);
+
+        Assert::same(
+            $outer->withProxyUrls(new PinnedProxyUrls('tenant-b'))->urlFor($file, $this->at('02:00')),
+            "/files/tenant-b/{$file->id}",
+        );
+
+        Expect::exception(InvalidConfigException::class)->withMessage(
+            'withProxyUrls() needs the wrapped facade to be ' . Storage::class . ' or another '
+            . DeduplicatingStorage::class . '; ' . ForwardingStorage::class . ' cannot change its proxy URL generator',
+        );
+
+        $this->wrapping(new ForwardingStorage($this->storage))->withProxyUrls(new PinnedProxyUrls('tenant-c'));
+    }
+
+    /**
+     * Review pass 2 N-B3: the constructor is public, and the checks used to
+     * live only in the factory and the command. Built directly, a flat key
+     * generator on the directory layout wrote blobs `gc` can never collect,
+     * and a tenant-dropping one pooled every tenant without a signal.
+     */
+    public function theConstructorRefusesAFlatKeyGeneratorOnTheDirectoryLayout(): void
+    {
+        Expect::exception(InvalidConfigException::class)->withMessageContaining('cannot share a store');
+
+        $this->direct(store: $this->store, keys: new FlatSha256KeyGenerator());
+    }
+
+    public function theConstructorRefusesAGeneratorThatIgnoresTheTenant(): void
+    {
+        Expect::exception(InvalidConfigException::class)->withMessageContaining('ignores the tenant');
+
+        $store = $this->flatStores()->get('upload');
+        Assert::instanceOf($store, ContentAddressableStoreInterface::class);
+        $this->direct(
+            store: $store,
+            keys: new FlatSha256KeyGenerator(prefix: 'blobs'),
+            scopes: new FixedScope('tenant-a'),
+        );
+    }
+
+    /**
+     * Review pass 2 N-C3: the ledger is read once more after the row is gone,
+     * to tell a shared blob from a unique object. A failure there escaped as
+     * the raw driver exception instead of the promised `RemoveException`.
+     */
+    public function aLedgerFailingAfterTheReleaseIsARemoveException(): void
+    {
+        $ledger = new DbBlobLedger($this->database->db, $this->repository, new StaticClock($this->at('00:00')));
+        $storage = $this->direct(store: $this->store, keys: new \Rasuvaeff\Yii3Filestorage\Path\Sha256KeyGenerator(), ledger: new FaultyLedger($ledger, find: true));
+        $file = $this->storage->add($this->upload('hello'));
+
+        Expect::exception(RemoveException::class);
+
+        $storage->remove($file->id);
+    }
+
+    /**
+     * A commit that fails is followed by a release, and on MariaDB inside an
+     * application transaction the release can fail on the same snapshot
+     * conflict. The caller must still get the `AddException` for the commit —
+     * the reservation's TTL takes care of a release that never happened.
+     */
+    public function aReleaseFailingAfterAFailedCommitStillReportsTheCommit(): void
+    {
+        $ledger = new DbBlobLedger($this->database->db, $this->repository, new StaticClock($this->at('00:00')));
+        $storage = $this->direct(
+            store: $this->store,
+            keys: new \Rasuvaeff\Yii3Filestorage\Path\Sha256KeyGenerator(),
+            ledger: new FaultyLedger($ledger, commit: true, release: true),
+        );
+
+        try {
+            $storage->add($this->upload('hello'));
+            Assert::fail('Expected AddException');
+        } catch (AddException $e) {
+            Assert::same($e->getPrevious()?->getMessage(), 'commit failed');
+        }
+    }
+
+    public function aGeneratorRefusingTheTenantProbeIsAConfigurationError(): void
+    {
+        Expect::exception(InvalidConfigException::class)
+            ->withMessageContaining(SlashRefusingKeyGenerator::class . ' refused a probe scope: Nested scope');
+
+        $this->factory(scopes: new FixedScope('tenant-a'), keys: new SlashRefusingKeyGenerator())->create();
+    }
+
+    public function aGeneratorThatIgnoresTheTenantIsAcceptedUnderTheGlobalScopeOrWithoutAProvider(): void
+    {
+        $stores = $this->flatStores();
+        $keys = new FlatSha256KeyGenerator(prefix: 'blobs');
+
+        $global = $this->factory(stores: $stores, scopes: new FixedScope('tenant-a'), keys: $keys)
+            ->create(scope: DedupScope::Global);
+        $single = $this->factory(stores: $stores, keys: $keys)->create();
+
+        Assert::true(str_starts_with($global->add($this->upload('hello'))->relativePath, 'blobs/'));
+        Assert::true(str_starts_with($single->add($this->upload('bye'))->relativePath, 'blobs/'));
+    }
+
+    /**
+     * The setup the cska-one adoption targets: a public local store whose root
+     * is a shared web directory, flat sibling layout, one `blobs/` pool. Core
+     * 0.10 made the local stores content-addressable, so the factory accepts
+     * them; this pins the whole path — share, serve, remove — on real files.
+     */
+    public function aPublicLocalStoreWithFlatBlobsDeduplicatesEndToEnd(): void
+    {
+        $root = sys_get_temp_dir() . '/filestorage-db-' . bin2hex(random_bytes(6));
+        $public = new PublicFileSystemStore(
+            new FileSystemStore(
+                name: 'upload',
+                rootPath: $root,
+                streamFactory: $this->factory,
+                layout: new FlatSiblingLayout(),
+                ownedPrefixes: ['blobs', 'common'],
+            ),
+            baseUrl: '/uploads',
+        );
+
+        try {
+            $storage = $this->factory(
+                stores: new StoreRegistry([$public]),
+                keys: new FlatSha256KeyGenerator(prefix: 'blobs'),
+            )->create();
+
+            $first = $storage->add($this->upload('hello'));
+            $second = $storage->add($this->upload('hello'));
+            $sha = hash('sha256', 'hello');
+            $path = 'blobs/' . substr($sha, 0, 2) . '/' . substr($sha, 2, 2) . "/{$sha}.txt";
+
+            Assert::same($first->relativePath, $path);
+            Assert::same($second->relativePath, $path);
+            Assert::true(is_file("{$root}/{$path}"));
+            Assert::same($this->filesUnder("{$root}/blobs"), 1);
+            Assert::same($public->publicUrl($second), "/uploads/{$path}");
+            Assert::same((string) $storage->stream($second), 'hello');
+
+            Assert::true($storage->remove($first->id));
+            Assert::true($storage->remove($second->id));
+
+            Assert::same($this->ledger->find(BlobId::create('upload', $path))?->state, BlobState::PendingDelete);
+            Assert::true(is_file("{$root}/{$path}"), 'only a collector deletes shared bytes');
+        } finally {
+            $this->removeTree($root);
+        }
+    }
+
     private function factory(
         ?StoreRegistry $stores = null,
         ?FixedScope $scopes = null,
@@ -517,6 +869,7 @@ final class DeduplicatingStorageTest
         ?PolicyRegistry $policies = null,
         ?MimeTypeDetectorInterface $mimeTypeDetector = null,
         ?ExtensionMap $extensions = null,
+        ?\Rasuvaeff\Yii3Filestorage\Id\IdGeneratorInterface $idGenerator = null,
     ): DeduplicatingStorageFactory {
         $stores ??= new StoreRegistry([$this->store]);
         $clock = new StaticClock($this->at('00:00'));
@@ -528,12 +881,50 @@ final class DeduplicatingStorageTest
             repository: $repository,
             ledger: $ledger ?? new DbBlobLedger($this->database->db, $repository, $clock),
             mimeTypeDetector: $mimeTypeDetector ?? new FinfoMimeTypeDetector(),
-            idGenerator: new Uuid7IdGenerator($clock),
+            idGenerator: $idGenerator ?? new Uuid7IdGenerator($clock),
             policies: $policies ?? new PolicyRegistry(),
             clock: $clock,
             scopes: $scopes,
             keys: $keys,
             extensions: $extensions,
+        );
+    }
+
+    private function direct(
+        ContentAddressableStoreInterface $store,
+        ContentAddressedKeyGeneratorInterface $keys,
+        ?FixedScope $scopes = null,
+        ?BlobLedgerInterface $ledger = null,
+    ): DeduplicatingStorage {
+        $clock = new StaticClock($this->at('00:00'));
+        $stores = new StoreRegistry([$store]);
+
+        return new DeduplicatingStorage(
+            unique: $this->baseStorage($stores, $this->repository),
+            ledger: $ledger ?? new DbBlobLedger($this->database->db, $this->repository, $clock),
+            store: $store,
+            keys: $keys,
+            mimeTypeDetector: new FinfoMimeTypeDetector(),
+            idGenerator: new Uuid7IdGenerator($clock),
+            policies: new PolicyRegistry(),
+            clock: $clock,
+            scopes: $scopes,
+        );
+    }
+
+    private function wrapping(StorageInterface $unique): DeduplicatingStorage
+    {
+        $clock = new StaticClock($this->at('00:00'));
+
+        return new DeduplicatingStorage(
+            unique: $unique,
+            ledger: $this->ledger,
+            store: $this->store,
+            keys: new \Rasuvaeff\Yii3Filestorage\Path\Sha256KeyGenerator(),
+            mimeTypeDetector: new FinfoMimeTypeDetector(),
+            idGenerator: new Uuid7IdGenerator($clock),
+            policies: new PolicyRegistry(),
+            clock: $clock,
         );
     }
 
@@ -552,6 +943,41 @@ final class DeduplicatingStorageTest
             clock: $clock,
             defaultUrlTtl: new DateInterval('PT1H'),
         );
+    }
+
+    private function filesUnder(string $directory): int
+    {
+        return iterator_count(new \RecursiveIteratorIterator(
+            new \RecursiveDirectoryIterator($directory, \FilesystemIterator::SKIP_DOTS),
+        ));
+    }
+
+    private function removeTree(string $directory): void
+    {
+        if (!is_dir($directory)) {
+            return;
+        }
+
+        $entries = new \RecursiveIteratorIterator(
+            new \RecursiveDirectoryIterator($directory, \FilesystemIterator::SKIP_DOTS),
+            \RecursiveIteratorIterator::CHILD_FIRST,
+        );
+        foreach ($entries as $entry) {
+            \assert($entry instanceof \SplFileInfo);
+            $entry->isDir() ? rmdir($entry->getPathname()) : unlink($entry->getPathname());
+        }
+        rmdir($directory);
+    }
+
+    /**
+     * Flat content keys need the sibling layout; under `DirectoryLayout` the
+     * factory refuses them (summary A1).
+     */
+    private function flatStores(): StoreRegistry
+    {
+        return new StoreRegistry([new ContentAddressableInMemoryStore(
+            new InMemoryStore('upload', $this->factory, new StaticClock($this->at('00:00')), new FlatSiblingLayout()),
+        )]);
     }
 
     private function upload(string $contents): Upload
@@ -577,8 +1003,8 @@ final class DeduplicatingStorageTest
     public function aFailedWriteReleasesTheReservationAndSurfacesAnAddException(): void
     {
         $this->store->failNextPut();
-        $storage = $this->factory(keys: new FixedKeyGenerator('shared/one/original.bin'))->create();
-        $blob = BlobId::create('upload', 'shared/one/original.bin');
+        $storage = $this->factory(keys: new FixedKeyGenerator('shared/one'))->create();
+        $blob = BlobId::create('upload', 'shared/one/' . hash('sha256', 'hello') . '/original.bin');
 
         try {
             $storage->add($this->upload('hello'));
@@ -635,5 +1061,263 @@ final class DeduplicatingStorageTest
 
         Assert::same($file->size, 5);
         Assert::same($file->contentHash, hash('sha256', 'hello'));
+    }
+
+    /**
+     * Too large to hash, so the unique path — but in the store deduplication
+     * was configured for, not the registry's default. The two used to be
+     * assumed to be one physical target.
+     */
+    public function anUploadTooLargeToHashStaysInTheDeduplicatingStore(): void
+    {
+        $other = new InMemoryStore('archive', $this->factory, new StaticClock($this->at('00:00')));
+        $storage = $this->factory(stores: new StoreRegistry([$other, $this->store], 'archive'))
+            ->create(storeName: 'upload', dedupMaxBytes: 4);
+
+        $file = $storage->add($this->upload('hello'));
+
+        Assert::same($file->storeName, 'upload');
+        Assert::same($this->store->bytesAt($file->relativePath), 'hello');
+    }
+
+    /**
+     * A body that does not declare its length is bounded by the group's
+     * `maxBytes` while it is hashed, not only by `dedupMaxBytes` — the policy
+     * limit is usually far smaller, and reading 100 MB to refuse 1 MB is the
+     * cost the policy exists to avoid. The base facade's exception, before
+     * anything is reserved.
+     */
+    public function anUndeclaredBodyOverThePolicyLimitIsRefusedWhileHashing(): void
+    {
+        $storage = $this->factory(policies: PolicyRegistry::fromArray(['*' => ['maxBytes' => 300_000]]))->create();
+        $stream = new SpyStream($this->factory->createStream(str_repeat('x', 900_000)));
+
+        try {
+            $storage->add(Upload::fromStream(new UnsizedStream($stream), 'a.txt', $this->factory));
+            Assert::fail('Expected UploadSizeException');
+        } catch (UploadSizeException $e) {
+            Assert::string($e->getMessage())->contains('300000 byte limit');
+        }
+
+        Assert::same($this->store->writeCount(), 0);
+        Assert::same((new \Yiisoft\Db\Query\Query($this->database->db))->from('filestorage_blob_reservation')->count(), 0);
+        Assert::true($stream->tell() < 900_000, 'the tail must not have been read');
+    }
+
+    /**
+     * A stream that cannot be rewound after hashing is the add failing, and
+     * the caller is promised an `AddException` for that — not the stream's
+     * own exception.
+     */
+    public function aStreamThatCannotBeRewoundIsAnAddException(): void
+    {
+        $stream = new SpyStream($this->factory->createStream('hello'), rewindFailsAfterRead: true);
+        // no detector: it reads the head and rewinds too, exactly as in the
+        // base facade, and this is about the hashing pass
+        $storage = $this->factory(mimeTypeDetector: new NoMimeTypeDetector())->create();
+
+        try {
+            $storage->add(Upload::fromStream($stream, 'a.txt', $this->factory));
+            Assert::fail('Expected AddException');
+        } catch (AddException $e) {
+            Assert::same($e->getMessage(), 'Failed to read the upload while hashing it');
+            Assert::same($e->getCode(), 0);
+            Assert::instanceOf($e->getPrevious(), \RuntimeException::class);
+        }
+
+        Assert::same($this->store->writeCount(), 0);
+    }
+
+    /**
+     * Same ordering bug as core's review A2: the row was only built after
+     * the bytes were published, so metadata `File::create()` refuses — or an
+     * id generator or clock that fails — left a reserved, written blob behind
+     * for the collector. Everything the caller supplied is validated first.
+     */
+    public function invalidMetadataIsRefusedBeforeAnythingIsReservedOrWritten(): void
+    {
+        $refused = false;
+
+        try {
+            $this->storage->add($this->upload('hello'), metadata: ['nested' => ['not' => 'scalar']]);
+        } catch (\InvalidArgumentException) {
+            $refused = true;
+        }
+
+        Assert::true($refused);
+        Assert::same($this->store->writeCount(), 0);
+        Assert::same((new \Yiisoft\Db\Query\Query($this->database->db))->from('filestorage_blob')->count(), 0);
+    }
+
+    /**
+     * After the write, a failure is the add-failure path: the reservation is
+     * released (scheduled, never deleted — the bytes may already be shared)
+     * and the caller gets `AddException`.
+     */
+    public function aFailureAfterTheWriteReleasesTheReservation(): void
+    {
+        // the id is taken by another tenant's row: the scoped update finds
+        // nothing and the insert collides on the primary key — after the bytes
+        // were published
+        (new DbRepository($this->database->db, scopes: new FixedScope('tenant-b')))->save(SqliteDatabase::file('taken'));
+        $storage = $this->factory(scopes: new FixedScope('tenant-a'), idGenerator: new FixedIdGenerator('taken'))->create();
+
+        try {
+            $storage->add($this->upload('hello'));
+            Assert::fail('Expected AddException');
+        } catch (AddException) {
+        }
+
+        $blob = $this->blobOf((new \Rasuvaeff\Yii3Filestorage\Path\Sha256KeyGenerator())->generate(
+            DedupScope::TenantGroup->keyFor('common', 'tenant-a'),
+            hash('sha256', 'hello'),
+        ));
+        Assert::same($this->store->writeCount(), 1);
+        Assert::same($this->ledger->find($blob)?->reservationCount, 0, 'the reservation must be released');
+        Assert::same($this->ledger->find($blob)?->state, BlobState::PendingDelete);
+    }
+
+    /**
+     * The media-type half of the policy runs on the shared path too: the
+     * size half is enforced again while hashing, the type only here.
+     */
+    public function theMediaTypePolicyStillApplies(): void
+    {
+        $storage = $this->factory(policies: PolicyRegistry::fromArray(['*' => ['allowedMimeTypes' => ['image/png']]]))->create();
+
+        try {
+            $storage->add($this->upload('hello'));
+            Assert::fail('Expected UnsupportedMediaTypeException');
+        } catch (\Rasuvaeff\Yii3Filestorage\Exception\UnsupportedMediaTypeException $e) {
+            Assert::string($e->getMessage())->contains('is not accepted here. Allowed: image/png');
+        }
+
+        Assert::same($this->store->writeCount(), 0);
+    }
+
+    /**
+     * A body that never declares its length, exactly at the group's limit, is
+     * within it — the counted bytes are compared the way the declared ones
+     * are.
+     */
+    public function anUndeclaredBodyExactlyAtThePolicyLimitIsShared(): void
+    {
+        $storage = $this->factory(policies: PolicyRegistry::fromArray(['*' => ['maxBytes' => 5]]))->create();
+
+        $file = $storage->add(Upload::fromStream(new UnsizedStream($this->factory->createStream('hello')), 'a.txt', $this->factory));
+
+        Assert::same($file->contentHash, hash('sha256', 'hello'));
+        Assert::same($file->size, 5);
+    }
+
+    /**
+     * A store may answer with its own id for the object (a versioned bucket).
+     * The row carries it; dropping it would leave a row that addresses the
+     * object by path alone.
+     */
+    public function theExternalIdTheStoreAnswersReachesTheRow(): void
+    {
+        $this->store->answerNextPutWith($this->sharedPathOf('hello'), 'version-7');
+
+        $file = $this->storage->add($this->upload('hello'));
+
+        Assert::same($file->externalId, 'version-7');
+        Assert::same($file->relativePath, $this->sharedPathOf('hello'));
+        Assert::same($this->repository->find($file->id)?->externalId, 'version-7');
+    }
+
+    /**
+     * @return iterable<string, array{?string}>
+     */
+    public static function externalIdProvider(): iterable
+    {
+        yield 'without an external id' => [null];
+        yield 'with an external id' => ['version-7'];
+    }
+
+    /**
+     * A store that filed the object somewhere other than its content key
+     * produced a row the ledger cannot protect: the commit refuses it rather
+     * than recording the key the store did not use.
+     */
+    #[DataProvider('externalIdProvider')]
+    public function anObjectFiledElsewhereThanItsContentKeyIsRefused(?string $externalId): void
+    {
+        $this->store->answerNextPutWith('elsewhere/original', $externalId);
+
+        try {
+            $this->storage->add($this->upload('hello'));
+            Assert::fail('Expected AddException');
+        } catch (AddException $e) {
+            Assert::instanceOf($e->getPrevious(), \Rasuvaeff\Yii3Filestorage\Exception\LedgerException::class);
+        }
+
+        Assert::same(iterator_to_array($this->repository->files(), preserve_keys: false), []);
+    }
+
+    /**
+     * Built directly, without a store registry: a file on the unique path of
+     * the deduplicating store is deleted from that store.
+     */
+    public function withoutARegistryAUniqueFileIsDeletedFromTheDeduplicatingStore(): void
+    {
+        $file = $this->factory()->create(dedupMaxBytes: 4)->add($this->upload('hello'));
+        $storage = $this->direct(store: $this->store, keys: new \Rasuvaeff\Yii3Filestorage\Path\Sha256KeyGenerator());
+
+        Assert::true($storage->remove($file->id));
+
+        Assert::null($this->store->bytesAt($file->relativePath));
+        Assert::null($this->repository->find($file->id));
+    }
+
+    /**
+     * Without a registry a row in another store has no store to delete from:
+     * the row goes, and the bytes are left for that store's orphan sweep.
+     */
+    public function withoutARegistryARowInAnotherStoreIsRemovedWithoutError(): void
+    {
+        $this->repository->save(SqliteDatabase::file('gone', relativePath: 'g/unique', storeName: 'archive'));
+        $storage = $this->direct(store: $this->store, keys: new \Rasuvaeff\Yii3Filestorage\Path\Sha256KeyGenerator());
+
+        Assert::true($storage->remove('gone'));
+
+        Assert::null($this->repository->find('gone'));
+    }
+
+    /**
+     * Another remove deleted the row between this one's read and its
+     * release. The release answers false, and that is the answer: the
+     * bytes are the other remove's to delete, not this one's.
+     */
+    public function aRowRemovedConcurrentlyIsNotReportedOrDeletedAgain(): void
+    {
+        $file = $this->factory()->create(dedupMaxBytes: 4)->add($this->upload('hello'));
+        $connection = new \Rasuvaeff\Yii3FilestorageDb\Tests\Support\InterceptingConnection($this->database->db);
+        $connection->onTransaction = function (\Closure $proceed) use ($file): mixed {
+            $this->database->db->createCommand()->delete('filestorage_file', ['id' => $file->id])->execute();
+
+            return $proceed();
+        };
+        $storage = $this->direct(
+            store: $this->store,
+            keys: new \Rasuvaeff\Yii3Filestorage\Path\Sha256KeyGenerator(),
+            ledger: new DbBlobLedger($connection, $this->repository, new StaticClock($this->at('00:00'))),
+        );
+
+        Assert::false($storage->remove($file->id));
+
+        Assert::same($this->store->bytesAt($file->relativePath), 'hello');
+    }
+
+    /**
+     * @return non-empty-string
+     */
+    private function sharedPathOf(string $contents): string
+    {
+        return (new \Rasuvaeff\Yii3Filestorage\Path\Sha256KeyGenerator())->generate(
+            DedupScope::TenantGroup->keyFor('common', null),
+            hash('sha256', $contents),
+            (new ExtensionMap())->extensionFor((new FinfoMimeTypeDetector())->detect($this->upload($contents))),
+        );
     }
 }

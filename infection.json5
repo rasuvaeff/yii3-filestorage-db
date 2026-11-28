@@ -9,9 +9,9 @@
     },
     "testFramework": "testo",
     // 89, not 100. `composer mutation` runs with --with-uncovered, and the
-    // threshold is what the suite honestly achieves: 590 mutants, 37 undetected
-    // (21 Escaped, 16 Not Covered), 6 Ignored, overall MSI 93% (measured with
-    // zend.assertions=-1 as in CI). The survivors are documented in AGENTS.md;
+    // threshold is what the suite honestly achieves: 891 mutants, 82 undetected
+    // (43 Escaped, 39 Not Covered), 7 Ignored, overall MSI 90.72% (measured with
+    // zend.assertions=-1 as in CI, 2026-11-28). The survivors are documented in AGENTS.md;
     // they are guard branches the schema's NOT NULL columns and `yiisoft/db`'s
     // read-time typecasting make unreachable, predicates a single process cannot
     // weaken observably, redundant rewinds (`Upload::stream()` rewinds on every

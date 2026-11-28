@@ -8,6 +8,7 @@ use DateInterval;
 use Override;
 use Psr\Clock\ClockInterface;
 use Psr\Http\Message\StreamFactoryInterface;
+use Rasuvaeff\Yii3Filestorage\Exception\InvalidConfigException;
 use Rasuvaeff\Yii3Filestorage\File;
 use Rasuvaeff\Yii3Filestorage\Mime\ExtensionMap;
 use Rasuvaeff\Yii3Filestorage\Path\ContentAddressedKeyGeneratorInterface;
@@ -19,9 +20,11 @@ use Rasuvaeff\Yii3Filestorage\Store\ContentAddressableStoreInterface;
 use Rasuvaeff\Yii3Filestorage\Store\StoredObjectId;
 use Rasuvaeff\Yii3Filestorage\Store\StoreRegistry;
 use Rasuvaeff\Yii3Filestorage\Upload;
+use Rasuvaeff\Yii3FilestorageDb\ContentKeyCheck;
 use Rasuvaeff\Yii3FilestorageDb\DbRepository;
 use Rasuvaeff\Yii3FilestorageDb\DedupScope;
 use Rasuvaeff\Yii3FilestorageDb\Exception\InvalidFileRowException;
+use Rasuvaeff\Yii3FilestorageDb\PositiveInterval;
 use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputInterface;
@@ -80,6 +83,8 @@ final class DeduplicateCommand extends Command
         private readonly DateInterval $deleteGracePeriod = new DateInterval('PT1H'),
         private readonly ?ExtensionMap $extensions = null,
     ) {
+        PositiveInterval::require($reservationTtl, 'reservationTtl');
+        PositiveInterval::require($deleteGracePeriod, 'deleteGracePeriod');
         parent::__construct();
     }
 
@@ -138,12 +143,51 @@ final class DeduplicateCommand extends Command
             return Command::FAILURE;
         }
 
+        // The content key mixes the tenant in, and the rows come from the
+        // repository. A bound provider with no tenant would key every row into
+        // the `shared` pool — and under the repository's global opt-in, page
+        // every tenant's rows into it.
+        if ($this->scopes instanceof FileScopeProviderInterface && $this->scopes->currentScopeId() === null) {
+            $io->error(sprintf(
+                '%s is bound but returned no scope. This command keys rows by the tenant in force, so establish '
+                    . 'the tenant first and run it once per tenant — or, for a single-tenant installation, leave '
+                    . 'the provider unbound.',
+                FileScopeProviderInterface::class,
+            ));
+
+            return Command::FAILURE;
+        }
+
         $store = $this->stores->get($this->stringOption($options, 'store'));
         if (!$store instanceof ContentAddressableStoreInterface) {
             $io->error(sprintf(
                 'Store "%s" cannot deduplicate: it does not implement %s, so there is nothing to migrate onto.',
                 $store->name(),
                 ContentAddressableStoreInterface::class,
+            ));
+
+            return Command::FAILURE;
+        }
+
+        try {
+            ContentKeyCheck::assert($this->keys ?? new Sha256KeyGenerator(), $store, $scope, tenantBound: $this->scopes !== null);
+        } catch (InvalidConfigException $e) {
+            $io->error($e->getMessage());
+
+            return Command::FAILURE;
+        }
+
+        // Without a provider the repository pages every row and the key gets
+        // the `shared` tenant — so in a multi-tenant table every tenant's rows
+        // would land in one pool, which a tenant-separating scope promises
+        // never happens. Only `Global` pools them on purpose.
+        if ($this->scopes === null && $scope !== DedupScope::Global && $this->repository->hasTenantRows()) {
+            $io->error(sprintf(
+                'No %s is bound, but rows belong to tenants. Run this command once per tenant with the tenant '
+                    . 'established, as the application\'s other CLI jobs do, or pass --scope=%s to share across '
+                    . 'tenants on purpose.',
+                FileScopeProviderInterface::class,
+                DedupScope::Global->value,
             ));
 
             return Command::FAILURE;
@@ -405,7 +449,9 @@ final class DeduplicateCommand extends Command
                 groupName: $file->groupName,
                 relativePath: $result->relativePath,
                 originalName: $file->originalName,
-                size: $result->size,
+                // the counted size, which the reservation went out with — on
+                // the reuse branch the store measures the existing object
+                size: $size,
                 createdAt: $file->createdAt,
                 externalId: $result->externalId,
                 mimeType: $file->mimeType,

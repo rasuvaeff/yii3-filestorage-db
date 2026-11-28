@@ -14,6 +14,14 @@ return [
         // prepended to every name above; set it once to keep every rasuvaeff
         // table out of the way of your application's own
         'tablePrefix' => '',
+        // With a FileScopeProviderInterface bound, a null scope is refused.
+        // true lets a null scope mean "every tenant" for reads, updates and
+        // deletes — through MaintenanceRepositoryInterface and
+        // BlobLedgerInterface only, the keys core's maintenance commands
+        // resolve. RepositoryInterface, DbRepository and the deduplicating
+        // storage keep refusing, so a queue worker sharing the console params
+        // is not opened up.
+        'globalMaintenanceAccess' => false,
     ],
     'yiisoft/yii-console' => [
         'commands' => [

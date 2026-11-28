@@ -21,25 +21,23 @@ use Rasuvaeff\Yii3Filestorage\Test\InMemoryStore;
 use Rasuvaeff\Yii3Filestorage\Upload;
 use Rasuvaeff\Yii3FilestorageDb\DbBlobLedger;
 use Rasuvaeff\Yii3FilestorageDb\DbRepository;
+use Rasuvaeff\Yii3FilestorageDb\DbScopedFileResolver;
 use Rasuvaeff\Yii3FilestorageDb\DeduplicatingStorage;
 use Rasuvaeff\Yii3FilestorageDb\DeduplicatingStorageFactory;
 use Rasuvaeff\Yii3FilestorageDb\Migration\M260807000000CreateFilestorageFileTable;
 use Rasuvaeff\Yii3FilestorageDb\Migration\M260807000001CreateFilestorageBlobTables;
 use Rasuvaeff\Yii3FilestorageDb\Migration\M261127000000AddFilestorageFileStorePathIndex;
+use Rasuvaeff\Yii3FilestorageDb\Migration\M261128000000MakeFilestorageFileScopeIdCaseSensitive;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\ContentAddressableInMemoryStore;
+use Rasuvaeff\Yii3FilestorageDb\Tests\Support\FixedScope;
+use Rasuvaeff\Yii3FilestorageDb\Tests\Support\ServerDatabase;
 use Testo\Assert;
 use Testo\Codecov\CoversNothing;
 use Testo\Test;
-use Yiisoft\Db\Cache\SchemaCache;
 use Yiisoft\Db\Connection\ConnectionInterface;
 use Yiisoft\Db\Migration\Informer\NullMigrationInformer;
 use Yiisoft\Db\Migration\MigrationBuilder;
-use Yiisoft\Db\Mysql\Connection as MysqlConnection;
-use Yiisoft\Db\Mysql\Driver as MysqlDriver;
-use Yiisoft\Db\Pgsql\Connection as PgsqlConnection;
-use Yiisoft\Db\Pgsql\Driver as PgsqlDriver;
 use Yiisoft\Test\Support\Clock\StaticClock;
-use Yiisoft\Test\Support\SimpleCache\MemorySimpleCache;
 
 /**
  * The migrations and the whole ledger lifecycle on MySQL and PostgreSQL.
@@ -64,16 +62,15 @@ final class CrossDatabaseMigrationTest
 
     public function migrationsAndTheLedgerLifecycleWorkOnTheConfiguredDatabase(): void
     {
-        $database = getenv('FILESTORAGE_TEST_DB');
+        $database = ServerDatabase::engine();
 
-        if ($database !== 'mysql' && $database !== 'pgsql') {
-            Assert::true($database === false || $database === '');
+        if ($database === null) {
+            Assert::true(getenv('FILESTORAGE_TEST_DB') === false || getenv('FILESTORAGE_TEST_DB') === '');
 
             return;
         }
 
-        $db = $this->connection($database);
-        $db->open();
+        $db = ServerDatabase::connect($database);
 
         try {
             $this->dropTables($db);
@@ -82,9 +79,11 @@ final class CrossDatabaseMigrationTest
             $files = new M260807000000CreateFilestorageFileTable();
             $blobs = new M260807000001CreateFilestorageBlobTables();
             $storePath = new M261127000000AddFilestorageFileStorePathIndex();
+            $scopeCase = new M261128000000MakeFilestorageFileScopeIdCaseSensitive();
             $files->up($builder);
             $blobs->up($builder);
             $storePath->up($builder);
+            $scopeCase->up($builder);
 
             foreach (self::TABLES as $table) {
                 Assert::notNull($db->getTableSchema($table, true), "{$table} was not created");
@@ -96,8 +95,19 @@ final class CrossDatabaseMigrationTest
 
             $this->deduplicatedAddsAndRemoves($db);
             $this->reservationsAndCollection($db);
+            $this->tenantsDifferingInCaseOrTrailingSpaceAreApart($db);
             $this->referencedPaths($db);
+            if ($database !== 'pgsql') {
+                // `LIKE` without `ESCAPE` on MySQL relies on the backslash
+                // being the escape character, which this mode switches off:
+                // a directory with `_` then found nothing, and the orphan
+                // sweep quarantined bytes live rows point at
+                $db->createCommand("SET SESSION sql_mode = CONCAT(@@sql_mode, ',NO_BACKSLASH_ESCAPES')")->execute();
+                $this->referencedPaths($db);
+                $db->createCommand('SET SESSION sql_mode = DEFAULT')->execute();
+            }
 
+            $scopeCase->down($builder);
             $storePath->down($builder);
             Assert::false(
                 \in_array('idx_filestorage_file_store_path', $this->indexNames($db), strict: true),
@@ -137,6 +147,11 @@ final class CrossDatabaseMigrationTest
         Assert::same($store->writeCount(), 1);
         Assert::same($ledger->find($blob)?->referenceCount, 2);
         Assert::same($ledger->find($blob)?->size, 5);
+        // the batch lookup gc uses: one statement with correlated counts
+        Assert::equals(
+            $ledger->findMany([BlobId::create('upload', 'sha/00/00/none'), $blob]),
+            [$blob->key() => $ledger->find($blob)],
+        );
 
         // re-setting the hash a row already holds still finds the row
         Assert::true($repository->updateContentHash($second->id, (string) $second->contentHash));
@@ -176,6 +191,7 @@ final class CrossDatabaseMigrationTest
         $reservation = $ledger->reserve($blob, $hash, 6, $this->at('00:10'));
         Assert::same($ledger->find($blob)?->state, BlobState::Writing);
         Assert::same($ledger->find($blob)?->reservationCount, 1);
+        Assert::same($ledger->findMany([$blob])[$blob->key()]->reservationCount, 1);
 
         $ledger->release($reservation, $this->at('01:00'));
         Assert::same($ledger->find($blob)?->state, BlobState::PendingDelete);
@@ -222,6 +238,9 @@ final class CrossDatabaseMigrationTest
             'r4' => 'G/AB/CD/K1/original',
             'r5' => 'a_b/original',
             'r6' => 'axb/original',
+            'r9' => 'user_avatars/ab/cd/k1/original',
+            'r10' => '50%!/x',
+            'r11' => '50x!/x',
             'r7' => 'root.txt',
             'r8' => $long . '/original',
         ];
@@ -237,10 +256,21 @@ final class CrossDatabaseMigrationTest
             ));
         }
 
-        $paths = $repository->referencedPaths('upload', ['g/ab/cd/k1', 'a_b', 'root.txt', $long]);
+        $paths = $repository->referencedPaths(
+            'upload',
+            ['g/ab/cd/k1', 'a_b', 'root.txt', $long, 'user_avatars/ab/cd/k1', '50%!'],
+        );
         sort($paths);
 
-        $expected = ['a_b/original', 'g/ab/cd/k1/original', 'g/ab/cd/k1/thumb.webp', $long . '/original', 'root.txt'];
+        $expected = [
+            'a_b/original',
+            'g/ab/cd/k1/original',
+            'g/ab/cd/k1/thumb.webp',
+            $long . '/original',
+            'root.txt',
+            'user_avatars/ab/cd/k1/original',
+            '50%!/x',
+        ];
         sort($expected);
 
         Assert::same($paths, $expected);
@@ -250,6 +280,43 @@ final class CrossDatabaseMigrationTest
         foreach (array_keys($rows) as $id) {
             $repository->delete($id);
         }
+    }
+
+    /**
+     * MySQL's default collation compares `Acme` and `acme` — and `acme` and
+     * `acmé` — as equal, which made two tenants one for every scoped
+     * statement. The scope column is compared byte for byte — trailing spaces
+     * included: `utf8mb4_bin` is PAD SPACE, so it made `acme ` and `acme` one
+     * tenant, a match MySQL 8's NO PAD default had never made.
+     */
+    private function tenantsDifferingInCaseOrTrailingSpaceAreApart(ConnectionInterface $db): void
+    {
+        $scope = new FixedScope('Acme');
+        $repository = new DbRepository($db, scopes: $scope);
+        $repository->save(File::create(
+            id: 'tenant-row',
+            storeName: 'upload',
+            groupName: 'common',
+            relativePath: 'g/tenant-row',
+            originalName: 'a.txt',
+            size: 1,
+            createdAt: $this->at('00:00'),
+        ));
+
+        Assert::true((new DbRepository($db))->hasTenantRows());
+
+        foreach (['acme', 'ACME', 'Acmé', 'Acme ', 'Acme  '] as $other) {
+            $scope->switchTo($other);
+            Assert::null($repository->find('tenant-row'), "tenant \"{$other}\" must not see the row of \"Acme\"");
+            Assert::false($repository->hasTenantRows());
+            Assert::false($repository->delete('tenant-row'));
+        }
+
+        Assert::null((new DbScopedFileResolver($db))->findInScope('tenant-row', 'acme'));
+        Assert::null((new DbScopedFileResolver($db))->findInScope('tenant-row', 'Acme '));
+
+        $scope->switchTo('Acme');
+        Assert::true($repository->delete('tenant-row'));
     }
 
     /**
@@ -305,30 +372,5 @@ final class CrossDatabaseMigrationTest
     private function at(string $time): DateTimeImmutable
     {
         return new DateTimeImmutable("2026-01-01T{$time}:00.000000+00:00");
-    }
-
-    private function connection(string $database): ConnectionInterface
-    {
-        $cache = new SchemaCache(psrCache: new MemorySimpleCache());
-        $mysqlPort = getenv('FILESTORAGE_TEST_MYSQL_PORT') ?: '3306';
-        $pgsqlPort = getenv('FILESTORAGE_TEST_PGSQL_PORT') ?: '5432';
-
-        return $database === 'mysql'
-            ? new MysqlConnection(
-                driver: new MysqlDriver(
-                    dsn: sprintf('mysql:host=127.0.0.1;port=%s;dbname=filestorage;charset=utf8mb4', $mysqlPort),
-                    username: 'root',
-                    password: 'filestorage',
-                ),
-                schemaCache: $cache,
-            )
-            : new PgsqlConnection(
-                driver: new PgsqlDriver(
-                    dsn: sprintf('pgsql:host=127.0.0.1;port=%s;dbname=filestorage', $pgsqlPort),
-                    username: 'postgres',
-                    password: 'filestorage',
-                ),
-                schemaCache: $cache,
-            );
     }
 }

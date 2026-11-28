@@ -8,6 +8,7 @@ use DateTimeImmutable;
 use Nyholm\Psr7\Factory\Psr17Factory;
 use Psr\Clock\ClockInterface;
 use Psr\Http\Message\StreamFactoryInterface;
+use Rasuvaeff\Yii3Filestorage\Exception\RemoveException;
 use Rasuvaeff\Yii3Filestorage\Repository\FileScopeProviderInterface;
 use Rasuvaeff\Yii3Filestorage\Repository\MaintenanceRepositoryInterface;
 use Rasuvaeff\Yii3Filestorage\Repository\RepositoryInterface;
@@ -27,6 +28,7 @@ use Rasuvaeff\Yii3FilestorageDb\DbScopedFileResolver;
 use Rasuvaeff\Yii3FilestorageDb\DeduplicatingStorage;
 use Rasuvaeff\Yii3FilestorageDb\DeduplicatingStorageFactory;
 use Rasuvaeff\Yii3FilestorageDb\DedupScope;
+use Rasuvaeff\Yii3FilestorageDb\Exception\MissingScopeException;
 use Rasuvaeff\Yii3FilestorageDb\FileTableName;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\ContentAddressableInMemoryStore;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\FixedScope;
@@ -82,10 +84,7 @@ final class ConfigWiringTest
     }
 
     /**
-     * Both repository contracts must be the same object: M5's commands resolve
-     * the maintenance one, and a second instance would be a second connection
-     * with its own transaction — the ledger's joint commit depends on there
-     * being exactly one.
+     * Without the maintenance opt-in both repository contracts are one object.
      */
     public function bothRepositoryContractsResolveToOneInstance(): void
     {
@@ -229,6 +228,87 @@ final class ConfigWiringTest
     }
 
     /**
+     * The global opt-in is off by default — a bound provider returning null
+     * is refused everywhere.
+     */
+    public function aNullScopeIsRefusedByDefault(): void
+    {
+        [$container] = $this->tenantRowAndNullScope();
+
+        foreach ([RepositoryInterface::class, MaintenanceRepositoryInterface::class, DbRepository::class] as $id) {
+            $refused = false;
+
+            try {
+                $container->get($id)->find('a');
+            } catch (MissingScopeException) {
+                $refused = true;
+            }
+
+            Assert::true($refused, "{$id} must refuse a null scope");
+        }
+    }
+
+    /**
+     * Review pass 2 N-B2: console params are shared by every console process,
+     * queue workers included, so an opt-in that flipped the one repository
+     * gave a worker without a tenant every tenant's rows. The parameter now
+     * reaches only the two keys core's maintenance commands resolve —
+     * `MaintenanceRepositoryInterface` and `BlobLedgerInterface` — while the
+     * hot-path repository and the deduplicating storage keep refusing.
+     */
+    public function theGlobalOptInReachesOnlyTheMaintenanceKeys(): void
+    {
+        [$container] = $this->tenantRowAndNullScope(params: ['globalMaintenanceAccess' => true]);
+
+        foreach ([RepositoryInterface::class, DbRepository::class] as $id) {
+            $refused = false;
+
+            try {
+                $container->get($id)->find('a');
+            } catch (MissingScopeException) {
+                $refused = true;
+            }
+
+            Assert::true($refused, "{$id} must still refuse a null scope");
+        }
+
+        $removed = null;
+
+        try {
+            $container->get(DeduplicatingStorageFactory::class)->create()->remove('a');
+        } catch (RemoveException $e) {
+            $removed = $e->getPrevious();
+        }
+        Assert::instanceOf($removed, MissingScopeException::class);
+
+        Assert::same($container->get(MaintenanceRepositoryInterface::class)->find('a')?->id, 'a');
+        Assert::true(
+            $container->get(BlobLedgerInterface::class)
+                ->releaseFile('a', new DateTimeImmutable('2026-01-01T01:00:00.000000+00:00')),
+            'gc releases rows through the ledger, so the ledger it resolves must see them',
+        );
+    }
+
+    /**
+     * @param array<string, mixed> $params
+     *
+     * @return array{0: Container}
+     */
+    private function tenantRowAndNullScope(array $params = []): array
+    {
+        $scope = new FixedScope('tenant-a');
+        $extra = [
+            FileScopeProviderInterface::class => static fn(): FileScopeProviderInterface => $scope,
+            StoreInterface::class => static fn(StreamFactoryInterface $streams): StoreInterface
+                => new ContentAddressableInMemoryStore(inner: new InMemoryStore(name: 'upload', streamFactory: $streams)),
+        ];
+        $this->container($extra)->get(RepositoryInterface::class)->save(SqliteDatabase::file('a'));
+        $scope->switchTo(null);
+
+        return [$this->container($extra, params: $params, core: true)];
+    }
+
+    /**
      * The migration for existing data lives here rather than in core because it
      * has to produce byte-identical content keys to the storage the application
      * configured — same `DedupScope`, same scope provider.
@@ -251,7 +331,7 @@ final class ConfigWiringTest
     {
         $own = $this->params()['rasuvaeff/yii3-filestorage-db'];
 
-        foreach (['fileTable', 'blobTable', 'blobReservationTable', 'tablePrefix'] as $key) {
+        foreach (['fileTable', 'blobTable', 'blobReservationTable', 'tablePrefix', 'globalMaintenanceAccess'] as $key) {
             Assert::true(\array_key_exists($key, $own), "params is missing \"{$key}\"");
         }
     }

@@ -9,6 +9,7 @@ use Rasuvaeff\Yii3Filestorage\File;
 use Rasuvaeff\Yii3FilestorageDb\Migration\M260807000000CreateFilestorageFileTable;
 use Rasuvaeff\Yii3FilestorageDb\Migration\M260807000001CreateFilestorageBlobTables;
 use Rasuvaeff\Yii3FilestorageDb\Migration\M261127000000AddFilestorageFileStorePathIndex;
+use Rasuvaeff\Yii3FilestorageDb\Migration\M261128000000MakeFilestorageFileScopeIdCaseSensitive;
 use RuntimeException;
 use Yiisoft\Db\Cache\SchemaCache;
 use Yiisoft\Db\Connection\ConnectionInterface;
@@ -61,6 +62,7 @@ final readonly class SqliteDatabase
         (new M260807000000CreateFilestorageFileTable())->up($builder);
         (new M260807000001CreateFilestorageBlobTables())->up($builder);
         (new M261127000000AddFilestorageFileStorePathIndex())->up($builder);
+        (new M261128000000MakeFilestorageFileScopeIdCaseSensitive())->up($builder);
     }
 
     /**

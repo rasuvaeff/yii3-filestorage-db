@@ -153,6 +153,7 @@ jobs:
       matrix:
         database:
           - mysql
+          - mariadb
           - pgsql
 
     services:
@@ -165,6 +166,22 @@ jobs:
           - 3306:3306
         options: >-
           --health-cmd="mysqladmin ping -hlocalhost -uroot -pfilestorage"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+      # MariaDB separately from MySQL: 11.6.2+ enables innodb_snapshot_isolation
+      # by default, which fails a REPEATABLE READ read-then-update on a row
+      # changed in between (error 1020), its collations pad differently, and it
+      # creates foreign keys from a column-level REFERENCES — MySQL does none
+      mariadb:
+        image: mariadb:11.8@sha256:6422478cb8e159f080fb1d8ccf65101e26fe51385787fde7d16c3b165a331f15
+        env:
+          MARIADB_DATABASE: filestorage
+          MARIADB_ROOT_PASSWORD: filestorage
+        ports:
+          - 3307:3306
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
           --health-interval=10s
           --health-timeout=5s
           --health-retries=10

@@ -17,23 +17,38 @@ backend's) or `FileScopeProviderInterface` (the application's).
 
 ## Rules
 
-1. **Every statement carries the tenant predicate.** There is no method that
-   skips it. A signed download uses `ScopedFileResolverInterface`, which
+1. **Every statement carries the tenant predicate.** No method skips it for a
+   resolved tenant. A signed download uses `ScopedFileResolverInterface`, which
    matches the token's authenticated scope as a second predicate — never turn
    the filter off for downloads.
-2. **`scope_id = null` is a scope**, matching `scope_id IS NULL`. An unscoped
-   token is not a wildcard.
-3. **Shared bytes are never deleted inside a request.** `releaseFile()` only
-   schedules; only `claimForDeletion()` → `completeDeletion()` deletes.
-4. **Ledger guards live in the statement that acts**, and the decision is the
-   affected-row count. Never `SELECT` then `UPDATE`.
-5. **The ledger writes file rows through `DbRepository`, never itself.** Its
+2. **A bound `FileScopeProviderInterface` returning null is refused**
+   (`MissingScopeException`) by every `DbRepository` method,
+   `DeduplicatingStorage::add()` and `filestorage:deduplicate` — it is a tenant
+   that did not resolve, not "all tenants". The only global access with a
+   provider bound is the param `globalMaintenanceAccess: true`, which reaches
+   only the `MaintenanceRepositoryInterface` and `BlobLedgerInterface`
+   bindings (what core's gc/stat/verify/backfill-hash resolve) — never
+   `RepositoryInterface`, `DbRepository`, `DbBlobLedger` or the deduplicating
+   storage, so queue workers sharing console params stay refused. By hand:
+   `new DbRepository(allowGlobalAccess: true)`. A new row still needs a tenant.
+3. **`scope_id = null` is a scope** in `DbScopedFileResolver`, matching
+   `scope_id IS NULL`. An unscoped token is not a wildcard.
+4. **Shared bytes are never deleted inside a request.** `releaseFile()` only
+   schedules; only the collector deletes, in the order quarantine →
+   `completeDeletion()` → purge (restore when refused) — `filestorage:gc`.
+   Never `deleteObject()` before `completeDeletion()`.
+5. **Ledger guards live in the statement that acts**, and the decision is the
+   affected-row count. Never `SELECT` then `UPDATE`. The ledger's own
+   transactions run at READ COMMITTED on the MySQL driver (MariaDB 11.6.2+
+   fails a REPEATABLE READ read-then-update with error 1020); inside an
+   application transaction that 1020 is a `LedgerException`.
+6. **The ledger writes file rows through `DbRepository`, never itself.** Its
    own `DELETE ... WHERE id = :id` would bypass the tenant predicate.
-6. **`yiisoft/db-migration` ^2.1**, not ^2.0: on 2.0.x `setSourceNamespaces()`
+7. **`yiisoft/db-migration` ^2.1**, not ^2.0: on 2.0.x `setSourceNamespaces()`
    resolved to the core package's directory, found nothing and exited 0.
-7. Timestamps are `Y-m-d\TH:i:s.uP` text normalised to UTC. Microseconds are
+8. Timestamps are `Y-m-d\TH:i:s.uP` text normalised to UTC. Microseconds are
    part of the contract; string order must equal chronological order.
-8. A malformed row throws `InvalidFileRowException`; it is never coerced.
+9. A malformed row throws `InvalidFileRowException`; it is never coerced.
 
 ## Migrations
 
@@ -50,6 +65,11 @@ MigrationService::class => [
 `idx_<file table>_store_path` on `(store_name, relative_path)` for the orphan
 sweep: MySQL `relative_path(191)` prefix, PostgreSQL `varchar_pattern_ops` (a
 plain btree is not used for `LIKE 'x%'` under a non-`C` collation).
+`M261128000000MakeFilestorageFileScopeIdCaseSensitive` (0.4.0) → `scope_id` in
+a binary NO PAD collation on MySQL/MariaDB (`utf8mb4_0900_bin` on MySQL
+8.0.17+, `utf8mb4_nopad_bin` on MariaDB; `RuntimeException` on older MySQL):
+case, accents and trailing spaces count (`utf8mb4_bin` is PAD SPACE). Rebuilds
+the table (writes wait), needs `ROW_FORMAT=DYNAMIC`; no-op elsewhere.
 
 No `reference_count` column: a reference is a `filestorage_file` row with the
 blob's id, and guards ask `NOT EXISTS`. No foreign keys.
@@ -62,6 +82,7 @@ blob's id, and guards ask `NOT EXISTS`. No foreign keys.
     'blobTable' => 'filestorage_blob',
     'blobReservationTable' => 'filestorage_blob_reservation',
     'tablePrefix' => '',   // prepended to all three
+    'globalMaintenanceAccess' => false,   // true: null scope = every tenant, maintenance keys only
 ],
 ```
 
@@ -76,6 +97,7 @@ new DbRepository(
     ConnectionInterface $db,
     FileTableName $table = new FileTableName(),
     ?FileScopeProviderInterface $scopes = null,   // unbound = single tenant
+    bool $allowGlobalAccess = false,              // bound + null: refuse (default) or every tenant; DI sets it only on the maintenance bindings
 );
 
 $repository->find(string $id): ?File;
@@ -85,12 +107,14 @@ $repository->files(?string $afterId = null, int $limit = 1000): iterable<File>;
 $repository->referencedPaths(string $storeName, array $directories): list<string>;  // gc --orphans, per page
 $repository->updateContentHash(string $id, string $contentHash): bool;
 $repository->findBlobRowId(string $id): ?string;            // scoped, for the ledger
+$repository->findMany(list<string> $ids): list<File>;       // scoped, one statement per 500 ids
 ```
 
 `referencedPaths()`: paths of the store's rows whose `File::directory()` is one
 of `$directories`. One parameterized statement per 200 directories
-(`LIKE '<dir>/%'` via `LikeMode::StartsWith`, plus `IN` for root-level rows);
-`_`/`%` are literal; store and directory are compared **exactly in PHP**
+(`relative_path LIKE '<dir>/%' ESCAPE '!'`, plus `IN` for root-level rows);
+`_`/`%`/`!` are literal under every engine and MySQL `sql_mode` (yiisoft/db's
+`Like` relies on the backslash, which `NO_BACKSLASH_ESCAPES` disables); store and directory are compared **exactly in PHP**
 (MySQL's default collation is case-insensitive), no `DISTINCT` (it would fold
 case variants before the exact check). Scoped like every other statement.
 
@@ -105,11 +129,13 @@ new DbScopedFileResolver(ConnectionInterface $db, FileTableName $table = new Fil
 $resolver->findInScope(string $id, ?string $scopeId): ?File;
 ```
 
-Both values in one query. No code path here queries by id alone.
+Both values in one query. No code path here queries by id alone. Agrees with
+`DbRepository`: null never means "every tenant".
 
 ### `DbBlobLedger`
 
-Implements core's `BlobLedgerInterface`.
+Implements core's `BlobLedgerBatchLookupInterface` (extends
+`BlobLedgerInterface`), so `filestorage:gc` batches its lookups.
 
 ```php
 new DbBlobLedger(
@@ -119,6 +145,7 @@ new DbBlobLedger(
     FileTableName $fileTable = new FileTableName(),
     BlobTableName $blobTable = new BlobTableName(),
     BlobReservationTableName $reservationTable = new BlobReservationTableName(),
+    DateInterval $deleteGracePeriod = new DateInterval('PT1H'),   // > 0; for blobs commit() repoints away from
 );
 ```
 
@@ -128,11 +155,12 @@ Add protocol: `reserve()` → store `putIfAbsent()` → `commit()`; on failure
 
 | Method | Notes |
 |---|---|
-| `reserve(BlobId, string $sha256, int $size, DateTimeImmutable $expiresAt)` | Creates or joins. `BlobBusyException` on a `deleting` blob (retry); `LedgerException` on a hash/size mismatch. A `pending_delete` blob is revived |
-| `commit(BlobReservation, File)` | One transaction: claim the reservation row, write the file row through the repository, mark the blob active. `LedgerException` if the reservation is gone or the file does not point at the blob |
+| `reserve(BlobId, string $sha256, int $size, DateTimeImmutable $expiresAt)` | Creates or joins. `BlobBusyException` on a `deleting` blob whose lease is live (retry after it expires); an expired lease is taken over. `LedgerException` on a hash/size mismatch. A `pending_delete` blob is revived |
+| `commit(BlobReservation, File)` | One transaction: claim the reservation row, write the file row through the repository, mark the blob active, schedule the blob the row pointed at before if it moved. `LedgerException` if the reservation is gone, the file does not point at the blob, or a collector claimed the blob meanwhile |
 | `release(BlobReservation, DateTimeImmutable $deleteAfter)` | Idempotent. Never deletes bytes |
 | `releaseFile(string $fileId, DateTimeImmutable $deleteAfter)` | Scoped delete + conditional schedule. `false` when there was no such row |
 | `find(BlobId): ?BlobRecord` | Counts are derived, not stored |
+| `findMany(list<BlobId>): array<string, BlobRecord>` | What `find()` answers per blob, keyed by `BlobId::key()`, in the order asked, unknown blobs left out; one statement per `FIND_MANY_CHUNK` (500) blobs, counts as correlated subqueries |
 | `expireReservations(DateTimeImmutable $now, DateTimeImmutable $deleteAfter): int` | Run before any collection pass |
 | `claimForDeletion(DateTimeImmutable $now, DateTimeImmutable $leaseExpiresAt): ?BlobLease` | One conditional update per candidate; steals an expired lease |
 | `completeDeletion(BlobLease): bool` | `false` if the lease was lost or the blob was revived |
@@ -154,26 +182,49 @@ StorageInterface::class => static fn (DeduplicatingStorageFactory $f): StorageIn
         storeName: null,                  // defaults to the registry's default
         dedupMaxBytes: 104_857_600,       // above this: the unique path
         reservationTtl: new DateInterval('PT15M'),
-        deleteGracePeriod: new DateInterval('PT1H'),
+        deleteGracePeriod: new DateInterval('PT1H'),   // > 0, as reservationTtl
     );
 ```
 
+`DeduplicatingStorage::withProxyUrls(?ProxyUrlGeneratorInterface): self` —
+core's `Storage::withProxyUrls()` through the decorator (links minted outside
+the tenant's request: `$storage->withProxyUrls($urls->forScope($tenantId))->urlFor($file)`);
+the wrapped facade must be core's `Storage` or another `DeduplicatingStorage`,
+else `InvalidConfigException`.
+
 `create()` throws `InvalidConfigException` when the store does not implement
-`ContentAddressableStoreInterface`, when the bound `BlobLedgerInterface` is not
+`ContentAddressableStoreInterface`, when the ledger it is given (DI: `DbBlobLedger::class`; `BlobLedgerInterface` is what core's `gc` resolves, so rebinding it changes `gc` only) is not
 this package's `DbBlobLedger`, or when the ledger and the repository are on
-different connections (which would make `commit()` two transactions).
+different connections (which would make `commit()` two transactions), when
+the key generator's keys do not fit the store's layout (core's
+`LayoutCompatibility::assertContentKeys()`), or when a scope provider is bound,
+the scope is not `Global` and the generator leaves the tenant out of the key
+(`FlatSha256KeyGenerator` with a prefix); `InvalidArgumentException` for a zero or negative `reservationTtl` /
+`deleteGracePeriod`. The last two checks run in `DeduplicatingStorage`'s own
+constructor, so `new DeduplicatingStorage(...)` is refused the same way.
 
 Content key: `ContentAddressedKeyGeneratorInterface::generate(scope, sha256,
 extension)` — the factory's optional `keys` (default `Sha256KeyGenerator`,
 which ignores the extension) and `extensions` (core's `ExtensionMap`, bound by
 core with `extensionOverrides`). The extension is
 `ExtensionMap::extensionFor($detectedMediaType)` (`bin` for an unknown type).
-Bind core's `FlatSha256KeyGenerator` for `<scope>/ab/cd/<sha>.<ext>` with a
-store on `FlatSiblingLayout`.
+Bind core's `FlatSha256KeyGenerator` for `<scope>/ab/cd/<sha>.<ext>` **only**
+with a store on `FlatSiblingLayout` — with `DirectoryLayout` collecting one blob
+would remove its `ab/cd/` neighbours, so `create()` and `filestorage:deduplicate`
+refuse that pair. Core's local `FileSystemStore` / `PublicFileSystemStore` are
+content-addressable since core 0.10 and accepted; a single-tenant web root can
+use `new FlatSha256KeyGenerator(prefix: 'blobs')` + `FlatSiblingLayout`.
 
-`add()`: hash → `reserve()` → `putIfAbsent()` → `commit()`; `release()` on any
-failure. `remove()` is `releaseFile()` — it never deletes bytes. Everything
-else delegates to the base facade.
+`add()`: hash (stops at the group's `maxBytes` → `UploadSizeException`) →
+`reserve()` → `putIfAbsent()` → `commit()`; `release()` on any failure. Above
+`dedupMaxBytes`: the base facade's `add()` into this same store. `remove()`:
+`releaseFile()`; shared bytes are never deleted there, a unique-path row's
+object is deleted as the base facade would. Everything else delegates to the
+base facade.
+
+Not provided: keys without the tenant for a multi-tenant installation (the
+prefixed `FlatSha256KeyGenerator` is single-tenant), a `filestorage:adopt`
+command (planned).
 
 `DedupScope`: `TenantGroup` (default, the only one safe for untrusted tenants),
 `Tenant`, `Global`. Global discloses content existence across tenants through
@@ -211,9 +262,14 @@ Rules:
 1. The old unique object is **not** deleted. It becomes an orphan; `gc --orphans`
    reclaims it. Deleting it here would race readers holding the old path.
 2. A second run over the same range is a no-op — a row already at its content key
-   is skipped.
+   is skipped. A run with another key (scope, generator, extension map) moves
+   shared rows again and `commit()` schedules the blob each one left.
 3. The tenant scope is the ambient one (`FileScopeProviderInterface`). Multi-tenant
-   installations run it once per tenant. The scope is printed before any work.
+   installations run it once per tenant. The scope is printed before any work; a
+   bound provider returning null is refused. With no provider bound, it refuses
+   while any row has a `scope_id` (`DbRepository::hasTenantRows()`) unless
+   `--scope=global`. The generator/layout pair and the tenant-in-key check are
+   the factory's (above).
 4. **Under tenancy the reclaim step moves.** `gc --orphans` refuses while a scope
    provider is bound, so run the migration per tenant and the sweep once, from a
    maintenance entry point with the provider unbound. The closing line says so.
@@ -227,3 +283,4 @@ Rules:
 | `FileRowMapper` | `toRow()` / `fromRow()` / `blobRowId()`. `@internal` |
 | `Timestamps` | `FORMAT`, `toStorage()`, `fromStorage()`, `fromStorageOrNull()`. `@internal` |
 | `Exception\InvalidFileRowException` | Implements core's `FilestorageException` marker |
+| `Exception\MissingScopeException` | A bound scope provider returned null. Implements `FilestorageException` |

@@ -24,7 +24,7 @@ Flysystem и web.
 
 - PHP 8.3+
 - `ext-json`
-- `rasuvaeff/yii3-filestorage` ^0.9
+- `rasuvaeff/yii3-filestorage` ^0.10
 - `yiisoft/db` ^2.0 (плюс драйвер: `yiisoft/db-sqlite`, `-mysql`, `-pgsql`, …)
 - `symfony/console` ^6.4 || ^7.0 || ^8.0, `psr/http-factory` ^1.0 и
   `psr/http-message` ^2.0 — для `filestorage:deduplicate`, которая читает
@@ -38,8 +38,11 @@ composer require rasuvaeff/yii3-filestorage-db
 ```
 
 Пакет биндит `RepositoryInterface`, `MaintenanceRepositoryInterface`,
-`ScopedFileResolverInterface` и `BlobLedgerInterface`. Ядро биндит фасад —
-этот пакет его не трогает.
+`ScopedFileResolverInterface` и `BlobLedgerInterface`, а также `DbRepository` и
+`DbBlobLedger` по классу. Ядро биндит фасад — этот пакет его не трогает.
+`BlobLedgerInterface` резолвит `filestorage:gc` ядра; дедуплицирующее хранилище
+и `filestorage:deduplicate` получают `DbBlobLedger::class` — поэтому
+перепривязка `BlobLedgerInterface` (например, декоратором) меняет только `gc`.
 `StoreInterface` вы биндите сами — локальный `FileSystemStore` или
 `rasuvaeff/yii3-filestorage-flysystem` для S3 и подобных.
 
@@ -63,7 +66,7 @@ return [
 ```
 
 Три таблицы: `filestorage_file`, `filestorage_blob` и
-`filestorage_blob_reservation`, и индекс на `filestorage_file`
+`filestorage_blob_reservation`, индекс на `filestorage_file`
 `(store_name, relative_path)` для зачистки сирот (`M261127000000…`, добавлен в
 0.3.0 — существующая установка получит его при следующем `migrate:up`). На
 MySQL он индексирует первые 191 символ пути, на PostgreSQL использует
@@ -73,6 +76,17 @@ MySQL он индексирует первые 191 символ пути, на P
 `CREATE INDEX CONCURRENTLY idx_filestorage_file_store_path ON filestorage_file
 (store_name, relative_path varchar_pattern_ops)` — миграция использует
 `IF NOT EXISTS` и тогда только отметит себя применённой.
+
+`M261128000000…` (0.4.0) переводит `filestorage_file.scope_id` в бинарную NO
+PAD collation на MySQL и MariaDB, чьи collation по умолчанию считают `Acme`,
+`acme` и `Acmé` одним тенантом: `utf8mb4_0900_bin` на MySQL 8.0.17+,
+`utf8mb4_nopad_bin` на MariaDB. Не `utf8mb4_bin` — она PAD SPACE и сделала бы
+`acme ` и `acme` одним тенантом, чего дефолт MySQL 8 никогда не делал. В MySQL
+старше 8.0.17 такой collation нет, и миграция там бросает исключение. Сравнение
+только становится строже, поэтому на существующих строках миграция упасть не
+может; на SQLite и PostgreSQL она ничего не делает. На MySQL и MariaDB она
+пересобирает таблицу и на это время блокирует запись в неё — см.
+[UPGRADE.md](UPGRADE.md).
 
 > **`yiisoft/db-migration` ^2.1 — жёсткое требование.** На 2.0.x ровно эта
 > регистрация молча не находила ничего: резолв namespace принимал *соседний*
@@ -92,6 +106,7 @@ return [
         'blobTable' => 'filestorage_blob',
         'blobReservationTable' => 'filestorage_blob_reservation',
         'tablePrefix' => '',
+        'globalMaintenanceAccess' => false,
     ],
 ];
 ```
@@ -99,13 +114,18 @@ return [
 Префикс подставляется ко всем трём именам. Имена валидируются типизированными
 VO — `FileTableName`, `BlobTableName`, `BlobReservationTableName`, — которые
 миграции резолвят из контейнера, поэтому схема и запросы не могут разойтись в
-имени.
+имени. `globalMaintenanceAccess` — opt-in для обслуживания, описанный в
+разделе [Тенантный scope](#тенантный-scope).
 
 ## Тенантный scope
 
 Забиндите `FileScopeProviderInterface` — и каждый запрос пакета получит
 предикат по `scope_id`. Не биндите — установка однотенантная: ни предиката, ни
-накладных расходов.
+накладных расходов. Колонка сравнивается побайтно, на MySQL и MariaDB тоже —
+регистр, акценты и хвостовые пробелы значимы: `Acme`, `acme` и `acme ` — три
+тенанта. Миграция `M261128…` даёт `scope_id` бинарную NO PAD collation
+(`utf8mb4_0900_bin` на MySQL 8.0.17+, `utf8mb4_nopad_bin` на MariaDB; более
+старый MySQL получает отказ, см. [UPGRADE.md](UPGRADE.md)).
 
 ```php
 // config/common/di/filestorage.php
@@ -128,12 +148,46 @@ return [
 сессия, поддомен, — поэтому пакет не может забиндить это за вас, не ошибившись
 в каждой установке, где сделано иначе.
 
-**Метода, обходящего предикат, нет.** Ни для скачивания, ни для обслуживания. У
-подписанной загрузки нет окружающего тенанта — в этом и смысл подписи, — а
-соблазнительный обходной путь (поиск по id с отключённым фильтром) читает любой
-файл, чей id утёк. Вместо этого — `ScopedFileResolverInterface`: scope был
-аутентифицирован при выпуске токена, едет внутри HMAC и сверяется вторым
-предикатом.
+**Привязанный провайдер, вернувший `null`, получает отказ, а не исполнение.**
+Привязан — значит, установка мультитенантная, и null там — тенант, который не
+определился: анонимный маршрут, сбой поиска, задача, запущенная без контекста.
+Все методы `DbRepository`, `DeduplicatingStorage::add()` и
+`filestorage:deduplicate` тогда бросают `MissingScopeException` (команда —
+завершается с ошибкой), а не снимают предикат. До 0.4.0 предикат там молча
+снимался, и `find()`/`remove()` доставали строки всех тенантов.
+
+**Глобальный доступ — явный opt-in и только для обслуживания.** Команды ядра
+`filestorage:gc`, `stat`, `verify` и `backfill-hash` (и
+`filestorage:images:warm` из `-images`) читают через
+`MaintenanceRepositoryInterface`, поэтому мультитенантная cron-задача, где
+тенант не определился, падает, пока её точка входа не оставит провайдер
+непривязанным или не включит `globalMaintenanceAccess` — см.
+[UPGRADE.md](UPGRADE.md):
+
+```php
+// config/console/params.php
+return [
+    'rasuvaeff/yii3-filestorage-db' => ['globalMaintenanceAccess' => true],
+];
+```
+
+Тогда null-scope означает «все тенанты» для чтения, обновления и удаления
+(новой строке тенант всё равно нужен) — но только через два ключа, которые
+резолвят эти команды: `MaintenanceRepositoryInterface` и `BlobLedgerInterface`
+(`gc` освобождает просроченные строки через реестр). `RepositoryInterface`,
+`DbRepository`, `DbBlobLedger` и дедуплицирующее хранилище по-прежнему
+отказывают. Поэтому консольные params — безопасное место для флага: Yii3 делит
+их между всеми консольными процессами, включая воркеры очередей, и воркер без
+тенанта по-прежнему получает `MissingScopeException`, а не строки всех
+тенантов. Собрать `DbRepository(allowGlobalAccess: true)` вручную — тот же
+opt-in, но без этой ограды.
+
+**Для определившегося тенанта метода, обходящего предикат, нет.** Ни для
+скачивания, ни для обслуживания. У подписанной загрузки нет окружающего
+тенанта — в этом и смысл подписи, — а соблазнительный обходной путь (поиск по
+id с отключённым фильтром) читает любой файл, чей id утёк. Вместо этого —
+`ScopedFileResolverInterface`: scope был аутентифицирован при выпуске токена,
+едет внутри HMAC и сверяется вторым предикатом.
 
 ```php
 $file = $resolver->findInScope($payload->fileId, $payload->scopeId);
@@ -141,7 +195,8 @@ $file = $resolver->findInScope($payload->fileId, $payload->scopeId);
 
 `null` — это scope, а не его отсутствие: он матчится в `scope_id IS NULL`,
 именно это лежит в строках приложения без тенантов. Токен без scope никогда не
-становится wildcard.
+становится wildcard — резолвер и репозиторий согласны, что null не означает
+«все тенанты», если этого не сказал opt-in обслуживания.
 
 ## Дедупликация
 
@@ -169,21 +224,43 @@ $ledger->commit($reservation, $file);                                 // стр�
 | Владение — это `BlobId`, а не хеш содержимого | Хеш одинаков для разных хранилищ, групп и тенантов, поэтому счётчик по хешу позволяет одному тенанту удалить то, что читает другой |
 | Колонки `reference_count` нет | Ссылка — это и есть строка файла с этим `blob_id`, а проверки спрашивают `NOT EXISTS`. Счётчик — второй источник истины, который может разойтись с первым, и любая защита от underflow ловит расхождение уже постфактум |
 
-Состояния: `writing`, `active`, `pending_delete`, `deleting`. Писатель может
-присоединиться к любому, кроме последнего — там он получает
-`BlobBusyException` и повторяет после истечения lease.
+Состояния: `writing`, `active`, `pending_delete`, `deleting`. Писатель
+присоединяется к любому. Blob в `deleting` с ещё живым lease отвечает
+`BlobBusyException` — повторите после истечения lease; после этого писатель
+забирает blob себе (сборщик, умерший под lease, больше не блокирует содержимое
+до следующего `gc`, а его устаревший `completeDeletion()` получает отказ).
+`commit()` не активирует blob, который сборщик захватил после присоединения.
+Строка, которую `commit()` переносит на другой content-ключ, планирует к сборке
+покинутый blob.
 
-Проход сборки:
+Проход сборки — это `filestorage:gc` (ядро). Используйте его, не пишите свой.
+Если всё же пишете, порядок такой: **карантин → `completeDeletion()` → purge,
+либо restore при отказе**. Удаление объекта до `completeDeletion()` — та самая
+гонка, ради которой в ядре 0.9 появился карантин: сборщик, у которого
+перехватили lease, удаляет байты, только что заново опубликованные писателем, а
+отказ приходит уже после удаления.
 
 ```php
 $ledger->expireReservations($now, $deleteAfter);         // сначала смести брошенных писателей
 
 while ($lease = $ledger->claimForDeletion($now, $now->add($leaseTtl))) {
     try {
-        $store->deleteObject($lease->blob->object);
-        $ledger->completeDeletion($lease);               // откажет, если blob ожил
-    } catch (StoreException) {
+        // null, если ни одного члена blob уже не было
+        $entry = $store->quarantine($store->layout()->deletion($lease->blob->object), $now);
+    } catch (StoreException|\InvalidArgumentException) {
+        // InvalidArgumentException: раскладка отказала ключу — ошибка
+        // конфигурации, которая тоже не должна обрывать прогон
         $ledger->abandonDeletion($lease, $retryAfter);   // backoff, строка остаётся
+
+        continue;
+    }
+
+    if ($ledger->completeDeletion($lease)) {             // откажет, если blob ожил
+        if ($entry !== null) {
+            $store->purge($entry);
+        }
+    } elseif ($entry !== null) {
+        $store->restore($entry);                         // сохранит повторную публикацию писателя
     }
 }
 ```
@@ -219,22 +296,53 @@ return [
 биндит рядом с интерфейсом именно ради этого, начиная с 0.1.1. Настраивать
 нечего, и то же правило действует для любого декоратора, который вы напишете сами.
 
-`create()` отклоняет три конфигурации, которые иначе тихо теряют данные, и
+`reservationTtl` и `deleteGracePeriod` обязаны быть положительными (иначе
+`InvalidArgumentException`): при нулевой паузе «запланирован» и «можно собирать»
+— один момент, и писатель, присоединяющийся к blob, теряющему последнюю ссылку,
+гоняется со сборщиком, а не опережает его.
+
+`create()` отклоняет пять конфигураций, которые иначе тихо теряют данные, и
 говорит, что делать вместо: хранилище без `ContentAddressableStoreInterface`;
 реализацию `BlobLedgerInterface`, отличную от `DbBlobLedger` этого пакета, —
 гарантии дедупликации держатся на SQL-предикатах внутри действующих операторов,
 и реализация, хранящая состояние где-то ещё, того же обещать не может; и реестр
 на соединении, отличном от репозитория, — из-за чего `commit()` становится двумя
 транзакциями вместо одной, и падение между ними оставляет строку без ссылки либо
-ссылку без строки.
+ссылку без строки; content-ключи, которые раскладка хранилища не умеет удалять
+по одному (`LayoutCompatibility` ядра, см. ниже); и — при привязанном
+`FileScopeProviderInterface` и области, отличной от `Global`, — генератор
+ключей, выбрасывающий арендатора из ключа: он разделил бы байты между
+арендаторами в области, которая обещает этого не делать. Последние две проверяет
+сам конструктор `DeduplicatingStorage`, так что хранилище, собранное без
+фабрики, получает тот же отказ (`InvalidConfigException`).
+
+**Изоляция на MySQL и MariaDB.** Реестр читает строку blob и затем обновляет её
+под guard, который перепроверяет строку, поэтому свои транзакции он выполняет
+как `READ COMMITTED` на драйвере MySQL, каким бы ни был уровень сессии. Под
+REPEATABLE READ MariaDB 11.6.2+ с `innodb_snapshot_isolation=ON` (её дефолт)
+отвечает на такой `UPDATE` ошибкой 1020 «Record has changed since last read»,
+если другое соединение изменило строку в промежутке, — две одновременные
+загрузки одного файла или удаление файла во время загрузки тех же байтов.
+Внутри транзакции, которую открыли вы, уровень задать нельзя (`yiisoft/db`
+задаёт его только для внешней транзакции): там ошибка 1020 приходит как
+`LedgerException` с названной причиной — `AddException`/`RemoveException` из
+`DeduplicatingStorage`, — и вы повторяете свою транзакцию или открываете её с
+`READ COMMITTED`. PostgreSQL и так по умолчанию `READ COMMITTED`; SQLite не
+трогается. Запись под `READ COMMITTED` требует `binlog_format` `ROW` или
+`MIXED` (дефолты MySQL и MariaDB), а не `STATEMENT`.
 
 Ключ содержимого строит `ContentAddressedKeyGeneratorInterface` ядра
 (`Sha256KeyGenerator`, если ничего не привязано), и он получает расширение
 *определённого* медиатипа через `ExtensionMap` ядра — тот же, с теми же
 `extensionOverrides`, что именует уникальные файлы. `Sha256KeyGenerator` его
 игнорирует, так что существующие ключи не сдвигаются. Для плоского дерева вида
-`blobs/ab/cd/<sha>.<ext>` привяжите `FlatSha256KeyGenerator` ядра и дайте
-хранилищу `FlatSiblingLayout`:
+`sha/ab/cd/<sha>.<ext>` привяжите `FlatSha256KeyGenerator` ядра и дайте
+хранилищу `FlatSiblingLayout` — **оба, всегда**. С `DirectoryLayout` по
+умолчанию собранный blob унёс бы весь каталог `ab/cd/`, а с ним и все blob'ы с
+теми же первыми четырьмя hex-символами, поэтому `create()` и
+`filestorage:deduplicate` проверяют пару через
+`LayoutCompatibility::assertContentKeys()` ядра и отклоняют несовпадение
+(`InvalidConfigException`) до того, как что-либо записано:
 
 ```php
 use Rasuvaeff\Yii3Filestorage\Path\ContentAddressedKeyGeneratorInterface;
@@ -245,6 +353,35 @@ return [
 ];
 ```
 
+С ядра 0.10 локальные хранилища — `FileSystemStore` и `PublicFileSystemStore` —
+content-addressable, и `create()` принимает их тоже. Однотенантный сайт с одним
+плоским пулом внутри web-root:
+
+```php
+use Rasuvaeff\Yii3Filestorage\Path\FlatSha256KeyGenerator;
+use Rasuvaeff\Yii3Filestorage\Store\FileSystem\FileSystemStore;
+use Rasuvaeff\Yii3Filestorage\Store\FileSystem\PublicFileSystemStore;
+use Rasuvaeff\Yii3Filestorage\Store\Layout\FlatSiblingLayout;
+
+$store = new PublicFileSystemStore(
+    new FileSystemStore(
+        name: 'public',
+        rootPath: '/app/public/uploads',
+        streamFactory: $streams,
+        quarantinePath: '/app/runtime/quarantine',
+        layout: new FlatSiblingLayout(),
+        ownedPrefixes: ['blobs', 'avatars'],
+    ),
+    baseUrl: '/uploads',
+    webRoot: '/app/public',
+);
+// привязан как ContentAddressedKeyGeneratorInterface: ключи вида blobs/ab/cd/<sha>.<ext>
+$keys = new FlatSha256KeyGenerator(prefix: 'blobs');
+```
+
+Префикс заменяет область целиком, вместе с арендатором, — поэтому при
+привязанном `FileScopeProviderInterface` он отклоняется (см. таблицу ниже).
+
 `filestorage:deduplicate` берёт тот же генератор и тот же `ExtensionMap` и
 выводит расширение из медиатипа, записанного в строке, — определённого при
 добавлении файла, — так что мигрированная строка ложится ровно туда, куда лёг бы
@@ -254,7 +391,29 @@ return [
 своим id, группой, описанием и метаданными; просто две загрузки одинаковых байт
 указывают на один объект. Выше `dedupMaxBytes` загрузка молча уходит на
 уникальный путь: ключ содержимого *и есть* хеш, его нельзя выбрать, не прочитав
-тело целиком, а такое второе чтение того не стоит.
+тело целиком, а такое второе чтение того не стоит. Загрузка остаётся в
+хранилище дедупликации, и `remove()` удаляет её байты — ровно как базовый
+фасад; разделяемые байты удаляет только сборщик. Тело без объявленной длины
+при хешировании тоже останавливается на `maxBytes` группы — с тем же
+`UploadSizeException`, что у базового фасада.
+
+**Ссылки, выпущенные вне запроса тенанта.** При включённой дедупликации
+`StorageInterface` резолвится в `DeduplicatingStorage`, и у него тоже есть
+`withProxyUrls()` ядра: `$storage->withProxyUrls($urls->forScope($tenantId))->urlFor($file)`
+(`HmacProxyUrlGenerator::forScope()` из `-web`) возвращает тот же декоратор над
+базовым фасадом, выпускающим ссылки через закреплённый генератор, — ledger,
+хранилище и ключи общие. Он делегирует обёрнутому фасаду, поэтому тот должен
+быть `Storage` ядра (его и оборачивает `DeduplicatingStorageFactory`) или другим
+`DeduplicatingStorage`; иначе — `InvalidConfigException` с именем класса, а не
+ссылка через незакреплённый генератор.
+
+### Чего она не делает
+
+| Ожидание | На деле | Вместо этого |
+|---|---|---|
+| Существующие адреса `blobs/ab/cd/<sha>.<ext>` сохраняются в multi-tenant установке | `new FlatSha256KeyGenerator(prefix: 'blobs')` заменяет префикс `sha/<tenant>/<group>`, а с ним и арендатора — при привязанном провайдере это отклоняется, если область не `Global` | Однотенантная установка (провайдер не привязан): генератор с префиксом и `FlatSiblingLayout`. Иначе — генератор, сохраняющий арендатора в ключе |
+| Принять объекты, уже лежащие на своём content-ключе, без копирования | Команды `filestorage:adopt` нет; `filestorage:deduplicate` читает, хеширует и заново публикует каждую строку | В планах. Пока — `filestorage:deduplicate` |
+| Одинаковые байты делятся между группами | `TenantGroup` по умолчанию кладёт группу в ключ | `DedupScope::Global` (или `Tenant`), см. ниже |
 
 ### Насколько широко разделяются байты
 
@@ -297,7 +456,10 @@ content-ключ, опубликовать через `putIfAbsent()` и пер�
 `commit()` — тот же протокол, что и у живого `add()`, поэтому падение в любой
 точке оставляет либо старую строку, либо новую, но не строку в никуда. Повторный
 прогон по тому же диапазону — no-op: строка, уже стоящая на своём
-content-ключе, распознаётся и пропускается.
+content-ключе, распознаётся и пропускается. Прогон с другим ключом — другим
+`--scope`, генератором ключей или `extensionOverrides` — переносит уже
+разделённые строки ещё раз, и `commit()` планирует к сборке покинутый каждой
+строкой blob, так что `filestorage:gc` заберёт его после паузы.
 
 **Старый объект остаётся на месте намеренно.** Он становится orphan в момент
 перенаправления строки, и `filestorage:gc --orphans --apply` забирает его, когда
@@ -308,7 +470,12 @@ content-ключе, распознаётся и пропускается.
 фильтрует по тому, что сообщает `FileScopeProviderInterface`, и content-ключ
 подмешивает ту же область — поэтому multi-tenant установка запускает это по
 разу на арендатора, устанавливая арендатора так же, как это делают остальные её
-CLI-задачи. Действующая область печатается до начала работы.
+CLI-задачи. Действующая область печатается до начала работы, а привязанный
+провайдер без тенанта получает отказ — даже при opt-in обслуживания, который
+слил бы строки всех тенантов в один пул. Если провайдер **не** привязан, команда
+не различает арендаторов, поэтому отказывается, пока хоть одна строка несёт
+`scope_id` (`DbRepository::hasTenantRows()`), — кроме `--scope=global`, который
+объединяет их намеренно.
 
 **При аренде шаг уборки переезжает.** `filestorage:gc --orphans` отказывается
 работать, пока привязан `FileScopeProviderInterface`: строки, отфильтрованные по
@@ -339,11 +506,22 @@ do {
 `referencedPaths($storeName, $directories)` — то, что `filestorage:gc --orphans`
 спрашивает на каждой странице листинга: пути строк хранилища, лежащих в любом из
 указанных каталогов. Это один параметризованный запрос на 200 каталогов
-(`relative_path LIKE '<dir>/%'` или равенство пути корневого уровня), `_` и `%`
-в каталоге понимаются буквально, а затем хранилище и каталог сравниваются точно
-в PHP — иначе collation MySQL по умолчанию ответил бы про `A/x` на вопрос о `a`.
+(`relative_path LIKE '<dir>/%' ESCAPE '!'` или равенство пути корневого уровня),
+`_` и `%` в каталоге понимаются буквально — escape-символ объявлен в самом
+операторе, поэтому режим MySQL `NO_BACKSLASH_ESCAPES` не превращает их обратно в
+шаблоны, — а затем хранилище и каталог сравниваются точно в PHP — иначе collation MySQL по умолчанию ответил бы про `A/x` на вопрос о `a`.
 Тенантный предикат сохраняется и здесь — ещё одна причина запускать зачистку из
 точки входа без привязанного провайдера scope.
+
+`findMany($ids)` читает пачку строк одним запросом на 500 id, со scope как у
+`find()`; несуществующих id и id другого тенанта в результате просто нет.
+
+`DbBlobLedger` реализует необязательный `BlobLedgerBatchLookupInterface` ядра:
+`filestorage:gc` спрашивает его обо всех объектах страницы карантина одним
+`findMany($blobs)` — один запрос на 500 blob'ов, строки blob'ов со счётчиками
+ссылок и резерваций в коррелированных подзапросах — вместо трёх запросов на
+объект. Ответ — тот же, что дал бы `find()` для каждого blob'а; неизвестных
+blob'ов в нём нет.
 
 ## Формат хранения
 
@@ -372,8 +550,10 @@ make release-check
 ```
 
 `make test-integration` гоняет SQLite. Тот же suite идёт на MySQL или
-PostgreSQL, если `FILESTORAGE_TEST_DB` называет сервер (CI гоняет оба); образу
-нужны `pdo_mysql`/`pdo_pgsql`, которых в `composer:2` нет:
+PostgreSQL, если `FILESTORAGE_TEST_DB` называет сервер (CI гоняет оба), —
+случаи конкурентности реестра тогда идут через два серверных соединения, на
+MySQL — под `NO_BACKSLASH_ESCAPES,ANSI_QUOTES`; образу нужны
+`pdo_mysql`/`pdo_pgsql`, которых в `composer:2` нет:
 
 ```bash
 docker run --rm --network host -v "$PWD":/app -w /app \

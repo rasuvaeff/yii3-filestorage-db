@@ -39,12 +39,23 @@ final class InterceptingConnection implements ConnectionInterface
      */
     public ?Closure $onCreateCommand = null;
 
+    /**
+     * Reported instead of the inner driver's name. The isolation level is then
+     * recorded but not passed on: SQLite accepts no READ COMMITTED.
+     */
+    public ?string $driverName = null;
+
+    /** @var list<string|null> */
+    public array $isolationLevels = [];
+
     public function __construct(private readonly ConnectionInterface $inner) {}
 
     #[Override]
     public function transaction(Closure $closure, ?string $isolationLevel = null): mixed
     {
-        $proceed = fn(): mixed => $this->inner->transaction($closure, $isolationLevel);
+        $this->isolationLevels[] = $isolationLevel;
+        $level = $this->driverName === null ? $isolationLevel : null;
+        $proceed = fn(): mixed => $this->inner->transaction($closure, $level);
 
         return $this->onTransaction instanceof Closure ? ($this->onTransaction)($proceed) : $proceed();
     }
@@ -102,7 +113,7 @@ final class InterceptingConnection implements ConnectionInterface
     #[Override]
     public function getDriverName(): string
     {
-        return $this->inner->getDriverName();
+        return $this->driverName ?? $this->inner->getDriverName();
     }
 
     #[Override]

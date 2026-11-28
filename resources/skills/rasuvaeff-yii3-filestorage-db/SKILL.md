@@ -26,12 +26,21 @@ delete. Namespace `Rasuvaeff\Yii3FilestorageDb\`. Full API reference:
    scope was authenticated when the token was minted.
 
 2. **`scope_id = null` is a scope, not a wildcard.** It matches
-   `scope_id IS NULL`, which is what an unscoped application's rows carry.
+   `scope_id IS NULL`, which is what an unscoped application's rows carry. A
+   *bound* provider returning null is refused with `MissingScopeException` —
+   never turn that into "no predicate". The only exception is the explicit
+   maintenance opt-in — param `globalMaintenanceAccess`, which `config/di.php`
+   applies only to the `MaintenanceRepositoryInterface` and
+   `BlobLedgerInterface` bindings (console params are shared with queue
+   workers, so it must never reach `RepositoryInterface`/`DbRepository`) — and
+   even then a new row needs a tenant. Content keys (`DeduplicatingStorage`,
+   `filestorage:deduplicate`) refuse a null from a bound provider regardless.
 
 3. **Never delete shared bytes inside a request.** `releaseFile()` and
-   `release()` only *schedule* a blob. Deletion happens in a collection pass,
-   under an exclusive expiring lease, and `completeDeletion()` refuses if the
-   blob was referenced again.
+   `release()` only *schedule* a blob. Deletion happens in a collection pass
+   (`filestorage:gc`), under an exclusive expiring lease, in the order
+   quarantine → `completeDeletion()` → purge, or restore when it refuses.
+   Deleting before `completeDeletion()` is the race the quarantine closed.
 
 4. **Put ledger guards in the statement that acts.** The collectable test and
    both `NOT EXISTS` checks belong in the same `UPDATE`/`DELETE`, with the
@@ -53,6 +62,8 @@ delete. Namespace `Rasuvaeff\Yii3FilestorageDb\`. Full API reference:
    or every migrated row lands on a key no future upload will ever join. Under
    tenancy the reclaim step moves: `gc --orphans` refuses while a scope provider
    is bound, so migrate per tenant and sweep once with the provider unbound.
+   With no provider bound it refuses while any row carries a `scope_id`
+   (`DbRepository::hasTenantRows()`), unless `--scope=global`.
 
 8. **Sizes are counted while hashing, never read off the row.** `Upload::size()`
    is null for a body that never declares its length, and a row's recorded size
@@ -63,18 +74,35 @@ delete. Namespace `Rasuvaeff\Yii3FilestorageDb\`. Full API reference:
    content key.** Same `DedupScope`, same key generator, same `ExtensionMap`:
    the live path passes `extensionFor($detectedType)`, the command
    `extensionFor($file->mimeType)` — the type the row recorded at add time. Any
-   divergence puts migrated rows on keys no upload ever joins.
+   divergence puts migrated rows on keys no upload ever joins. Both refuse a
+   generator whose keys the store's layout cannot delete one by one (core's
+   `LayoutCompatibility`: flat keys need `FlatSiblingLayout`) and, with a scope
+   provider bound and a scope other than `Global`, a generator that leaves the
+   tenant out (`FlatSha256KeyGenerator(prefix: …)`). Tests that need flat keys
+   build the store with `FlatSiblingLayout`.
+
+- `DbBlobLedger::findMany()` (core's optional batch lookup, used by `gc`):
+  one statement per 500 blobs with correlated `COUNT(*)` subqueries; it must
+  answer exactly what `find()` answers per blob — cover any change on MySQL,
+  MariaDB and PostgreSQL. `DeduplicatingStorage::withProxyUrls()` delegates to
+  core's `Storage::withProxyUrls()`; refuse rather than mint unpinned.
 
 10. **`referencedPaths()` decides in PHP, not in SQL.** The database narrows
-    with `LIKE '<dir>/%'`; the exact store and directory comparison happens
+    with `LIKE '<dir>/%' ESCAPE '!'` — never yiisoft/db's `Like`, whose MySQL
+    form has no `ESCAPE` and breaks under `NO_BACKSLASH_ESCAPES`; the exact store and directory comparison happens
     after, because MySQL's default collation is case-insensitive and `LIKE`
     also matches subdirectories. Never add `DISTINCT` there — it would fold
     `A/x` and `a/x` before the check and can lose a real reference, which the
     orphan sweep turns into deleted bytes.
 
-11. **No suppressions.** No `@psalm-suppress`, no baseline. Fix the root cause.
+11. **Grace periods and reservation TTLs are positive.** Zero makes
+    "scheduled" and "collectable" one instant. `commit()` never activates a
+    `deleting` blob; a writer only takes over a `deleting` blob whose lease
+    has expired.
 
-12. **Verification is mandatory.** `make build` *and* `make test-integration` —
+12. **No suppressions.** No `@psalm-suppress`, no baseline. Fix the root cause.
+
+13. **Verification is mandatory.** `make build` *and* `make test-integration` —
     `composer build` runs the Unit suite only.
 
 ## Gotchas
@@ -100,4 +128,14 @@ delete. Namespace `Rasuvaeff\Yii3FilestorageDb\`. Full API reference:
 - SQLite is not enough for the ledger: it accepts `select('1')` (MySQL/PostgreSQL
   read it as a column) and reports matched rows where MySQL reports changed ones.
   Every new ledger statement goes into `tests/Integration/CrossDatabaseMigrationTest`
-  (`FILESTORAGE_TEST_DB=mysql|pgsql`), which CI runs on MySQL 8.4 and PostgreSQL.
+  (`FILESTORAGE_TEST_DB=mysql|mariadb|pgsql`), which CI runs on MySQL 8.4,
+  MariaDB 11.8 and PostgreSQL; `LedgerConcurrencyTest` runs there with two
+  connections, MySQL-family under `NO_BACKSLASH_ESCAPES,ANSI_QUOTES`.
+- Every ledger transaction goes through `DbBlobLedger::transaction()`: READ
+  COMMITTED on the MySQL driver, because MariaDB 11.6.2+ fails a REPEATABLE READ
+  read-then-update with error 1020. Never call `$db->transaction()` directly
+  there.
+- MySQL's default collation is case- and accent-insensitive. Anything compared
+  as an identifier (`scope_id`) is a binary NO PAD collation there
+  (`utf8mb4_0900_bin` / MariaDB `utf8mb4_nopad_bin` — not `utf8mb4_bin`, which
+  ignores trailing spaces); paths are compared exactly in PHP.

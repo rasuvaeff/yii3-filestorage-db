@@ -13,6 +13,7 @@ use Rasuvaeff\Yii3Filestorage\File;
 use Rasuvaeff\Yii3Filestorage\Store\BlobId;
 use Rasuvaeff\Yii3FilestorageDb\DbRepository;
 use Rasuvaeff\Yii3FilestorageDb\Exception\InvalidFileRowException;
+use Rasuvaeff\Yii3FilestorageDb\Exception\MissingScopeException;
 use Rasuvaeff\Yii3FilestorageDb\FileTableName;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\FixedScope;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\SqliteDatabase;
@@ -252,6 +253,18 @@ final class DbRepositoryTest
 
         Assert::same($this->repository->referencedPaths('upload', ['a_b']), ['a_b/original']);
         Assert::same($this->repository->referencedPaths('upload', ['50%']), []);
+
+        // `!` is the escape character the statement declares, so it is
+        // escaped too
+        $this->repository->save(SqliteDatabase::file('d', relativePath: 'x!_y/original'));
+        $this->repository->save(SqliteDatabase::file('e', relativePath: 'x!zy/original'));
+        Assert::same($this->repository->referencedPaths('upload', ['x!_y']), ['x!_y/original']);
+        Assert::same($this->repository->referencedPaths('upload', ['x!']), []);
+
+        // a `!` before an ordinary character would otherwise be read as an
+        // escape of that character, and `a!b` would look for `ab/...`
+        $this->repository->save(SqliteDatabase::file('f', relativePath: 'a!b/original'));
+        Assert::same($this->repository->referencedPaths('upload', ['a!b']), ['a!b/original']);
     }
 
     /**
@@ -307,6 +320,130 @@ final class DbRepositoryTest
         $scope->switchTo('tenant-b');
 
         Assert::same($scoped->referencedPaths('upload', ['g']), []);
+    }
+
+    /**
+     * `filestorage:deduplicate` asks this before keying every row into one
+     * pool without a provider: only a row with a tenant makes that wrong.
+     */
+    public function hasTenantRowsSeesOnlyRowsThatCarryATenant(): void
+    {
+        Assert::false($this->repository->hasTenantRows());
+
+        $this->repository->save(SqliteDatabase::file('untenanted'));
+        Assert::false($this->repository->hasTenantRows());
+
+        $scope = new FixedScope('acme');
+        (new DbRepository($this->database->db, scopes: $scope))->save(SqliteDatabase::file('tenanted'));
+        Assert::true($this->repository->hasTenantRows());
+        Assert::true((new DbRepository($this->database->db, scopes: $scope))->hasTenantRows());
+        Assert::false((new DbRepository($this->database->db, scopes: new FixedScope('beta')))->hasTenantRows());
+    }
+
+    /**
+     * The probe from the 1.0 review (`nullscope.php`): a bound provider that
+     * returns null used to drop the tenant predicate, so `find()` and
+     * `delete()` reached every tenant's rows. Bound means multi-tenant; a null
+     * there is a tenant that did not resolve, and it is refused.
+     */
+    public function aBoundProviderReturningNullIsRefusedRatherThanWidened(): void
+    {
+        $scope = new FixedScope('tenant-a');
+        $scoped = new DbRepository($this->database->db, scopes: $scope);
+        $scoped->save(SqliteDatabase::file('a', relativePath: 'g/original'));
+
+        $scope->switchTo(null);
+
+        $calls = [
+            'find' => static fn(): mixed => $scoped->find('a'),
+            'delete' => static fn(): mixed => $scoped->delete('a'),
+            'files' => static fn(): mixed => iterator_to_array($scoped->files(), preserve_keys: false),
+            'updateContentHash' => static fn(): mixed => $scoped->updateContentHash('a', SqliteDatabase::OTHER_HASH),
+            'referencedPaths' => static fn(): mixed => $scoped->referencedPaths('upload', ['g']),
+            'findBlobRowId' => static fn(): mixed => $scoped->findBlobRowId('a'),
+            'save (update)' => static fn(): mixed => $scoped->save(SqliteDatabase::file('a', relativePath: 'g/original')),
+            'save (insert)' => static fn(): mixed => $scoped->save(SqliteDatabase::file('new')),
+        ];
+        foreach ($calls as $name => $call) {
+            Assert::true($this->refusedForMissingScope($call), "{$name} must refuse a null scope");
+        }
+
+        $scope->switchTo('tenant-a');
+        Assert::same($scoped->find('a')?->id, 'a', 'nothing may have been deleted');
+        Assert::null((new DbRepository($this->database->db))->find('new'), 'nothing may have been inserted');
+    }
+
+    /**
+     * The opt-in for a maintenance entry point that shares the application's
+     * provider: a null scope then means every tenant — for reads, updates and
+     * deletes. A new row still needs a tenant.
+     */
+    public function globalAccessIsAnExplicitOptIn(): void
+    {
+        $scope = new FixedScope('tenant-a');
+        (new DbRepository($this->database->db, scopes: $scope))->save(SqliteDatabase::file('a', relativePath: 'g/original'));
+        $scope->switchTo('tenant-b');
+        (new DbRepository($this->database->db, scopes: $scope))->save(SqliteDatabase::file('b', relativePath: 'g/other'));
+
+        $scope->switchTo(null);
+        $maintenance = new DbRepository($this->database->db, scopes: $scope, allowGlobalAccess: true);
+
+        Assert::same(\count(iterator_to_array($maintenance->files(), preserve_keys: false)), 2);
+        Assert::same($maintenance->find('a')?->id, 'a');
+        $paths = $maintenance->referencedPaths('upload', ['g']);
+        sort($paths);
+        Assert::same($paths, ['g/original', 'g/other']);
+        Assert::true($maintenance->updateContentHash('a', SqliteDatabase::OTHER_HASH));
+        $maintenance->save(SqliteDatabase::file('b', relativePath: 'g/other', originalName: 'renamed.txt'));
+        Assert::true($this->refusedForMissingScope(
+            static fn(): mixed => $maintenance->save(SqliteDatabase::file('new')),
+        ), 'a new row without a tenant must still be refused');
+        Assert::true($maintenance->delete('a'));
+
+        // the tenant survives a global update, and a resolved scope still filters
+        $scope->switchTo('tenant-b');
+        Assert::same($maintenance->find('b')?->originalName, 'renamed.txt');
+        Assert::same(iterator_to_array($maintenance->files(), preserve_keys: false)[0]->id ?? null, 'b');
+    }
+
+    /**
+     * One statement for a page of ids instead of one per id — what
+     * `-attachments` lists an owner's files with — keyed by id, scoped like
+     * `find()`, and silent about ids it cannot see.
+     */
+    public function findManyReadsSeveralRowsAtOnceWithinTheScope(): void
+    {
+        $scope = new FixedScope('tenant-a');
+        $scoped = new DbRepository($this->database->db, scopes: $scope);
+        $scoped->save(SqliteDatabase::file('a'));
+        $scoped->save(SqliteDatabase::file('b'));
+        $scope->switchTo('tenant-b');
+        $scoped->save(SqliteDatabase::file('c'));
+        $scope->switchTo('tenant-a');
+
+        $ids = array_map(static fn(File $file): string => $file->id, $scoped->findMany(['b', 'a', 'c', 'missing', 'a']));
+        sort($ids);
+
+        Assert::same($ids, ['a', 'b']);
+        Assert::same($scoped->findMany([]), []);
+    }
+
+    public function findManyAnswersForMoreIdsThanOneStatementBinds(): void
+    {
+        $ids = [];
+        for ($i = 0; $i < 1_100; $i++) {
+            $ids[] = "f{$i}";
+            $this->repository->save(SqliteDatabase::file("f{$i}"));
+        }
+
+        Assert::same(\count($this->repository->findMany($ids)), 1_100);
+    }
+
+    public function findManyRefusesANullScopeFromABoundProvider(): void
+    {
+        $scoped = new DbRepository($this->database->db, scopes: new FixedScope());
+
+        Assert::true($this->refusedForMissingScope(static fn(): mixed => $scoped->findMany(['a'])));
     }
 
     public function aTenantSeesItsOwnRows(): void
@@ -515,6 +652,50 @@ final class DbRepositoryTest
         Assert::same($row['scope_id'], 'tenant-a');
     }
 
+    /**
+     * `RepositoryInterface::save()` is an upsert by id, and the scope is
+     * assigned once, on insert (core review B7 states it in the interface).
+     * Pinned here for this implementation: a replace by the owning tenant
+     * keeps the tenant, a replace from another tenant cannot take the row
+     * over, and a global-access replace keeps it too.
+     */
+    public function saveIsAnUpsertWhoseScopeIsAssignedOnlyOnInsert(): void
+    {
+        $scope = new FixedScope('tenant-a');
+        $scoped = new DbRepository($this->database->db, scopes: $scope);
+
+        $scoped->save(SqliteDatabase::file('a', originalName: 'first.txt'));
+        $scoped->save(SqliteDatabase::file('a', originalName: 'second.txt'));
+        Assert::same($scoped->find('a')?->originalName, 'second.txt');
+        Assert::same($this->scopeOf('a'), 'tenant-a');
+
+        $scope->switchTo('tenant-b');
+        $takenOver = true;
+
+        try {
+            $scoped->save(SqliteDatabase::file('a', originalName: 'hijacked.txt'));
+        } catch (\Throwable) {
+            $takenOver = false;
+        }
+
+        Assert::false($takenOver, 'another tenant must collide on the primary key, not replace');
+
+        $scope->switchTo(null);
+        (new DbRepository($this->database->db, scopes: $scope, allowGlobalAccess: true))
+            ->save(SqliteDatabase::file('a', originalName: 'third.txt'));
+
+        Assert::same($this->scopeOf('a'), 'tenant-a');
+        Assert::same($this->repository->find('a')?->originalName, 'third.txt');
+        Assert::same((new Query($this->database->db))->from('filestorage_file')->count(), 1);
+    }
+
+    private function scopeOf(string $id): mixed
+    {
+        return $this->database->db
+            ->createCommand('SELECT scope_id FROM filestorage_file WHERE id = :id', [':id' => $id])
+            ->queryScalar();
+    }
+
     public function reportsWhetherItWritesThroughThatExactConnection(): void
     {
         $other = new SqliteDatabase();
@@ -525,5 +706,50 @@ final class DbRepositoryTest
         } finally {
             $other->close();
         }
+    }
+
+    /**
+     * @param \Closure(): mixed $call
+     */
+    private function refusedForMissingScope(\Closure $call): bool
+    {
+        try {
+            $call();
+        } catch (MissingScopeException) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * An id repeated across more than one statement's worth of ids is still
+     * one file: the list is de-duplicated before it is split into batches.
+     */
+    public function findManyAnswersARepeatedIdOnceAcrossBatches(): void
+    {
+        $this->repository->save(SqliteDatabase::file('a'));
+
+        $files = $this->repository->findMany(array_fill(0, 501, 'a'));
+
+        Assert::same(array_map(static fn(File $file): string => $file->id, $files), ['a']);
+    }
+
+    /**
+     * The refusal says how to get the global view on purpose, in full.
+     */
+    public function theMissingScopeRefusalExplainsTheWayOut(): void
+    {
+        $scoped = new DbRepository($this->database->db, scopes: new FixedScope());
+
+        Expect::exception(MissingScopeException::class)->withMessage(
+            \Rasuvaeff\Yii3Filestorage\Repository\FileScopeProviderInterface::class . ' is bound but returned no '
+            . 'scope, so this repository will not run a statement without a tenant predicate. Establish the '
+            . 'tenant first. A maintenance command that must see every tenant gets it through the '
+            . 'globalMaintenanceAccess parameter (or ' . DbRepository::class . ' with allowGlobalAccess: true), '
+            . 'or runs with the provider unbound',
+        );
+
+        $scoped->find('a');
     }
 }

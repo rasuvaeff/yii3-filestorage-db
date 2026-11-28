@@ -38,6 +38,12 @@ final class ContentAddressableInMemoryStore implements ContentAddressableStoreIn
     /** @var (Closure(StreamInterface): StreamInterface)|null */
     private ?Closure $nextStreamWrapper = null;
 
+    /** @var int<0, max>|null */
+    private ?int $reuseSize = null;
+
+    /** @var array{non-empty-string, non-empty-string|null}|null */
+    private ?array $nextAnswer = null;
+
     public function __construct(private readonly InMemoryStore $inner) {}
 
     /**
@@ -45,6 +51,31 @@ final class ContentAddressableInMemoryStore implements ContentAddressableStoreIn
      * protocol is the case the reservation and its release exist for, and it
      * cannot be produced any other way in a single process.
      */
+    /**
+     * Reports this size for an existing object instead of its real one — a
+     * real store that skips the size check on reuse when the upload declared
+     * none would hand back whatever a truncated object measures.
+     *
+     * @param int<0, max> $size
+     */
+    public function misreportReuseSize(int $size): void
+    {
+        $this->reuseSize = $size;
+    }
+
+    /**
+     * Writes the next publish as usual but answers with this path and
+     * external id — a store that files the object somewhere else than asked,
+     * or that hands back its own id for it (a versioned bucket).
+     *
+     * @param non-empty-string $relativePath
+     * @param non-empty-string|null $externalId
+     */
+    public function answerNextPutWith(string $relativePath, ?string $externalId = null): void
+    {
+        $this->nextAnswer = [$relativePath, $externalId];
+    }
+
     public function failNextPut(): void
     {
         $this->failNextPut = true;
@@ -78,6 +109,19 @@ final class ContentAddressableInMemoryStore implements ContentAddressableStoreIn
             throw new StoreException("Store is unavailable while writing \"{$object->relativePath}\"");
         }
 
+        if ($this->nextAnswer !== null) {
+            [$relativePath, $externalId] = $this->nextAnswer;
+            $this->nextAnswer = null;
+            $written = $this->putIfAbsent($upload, $object, $maxBytes);
+
+            return new StoreResult(
+                relativePath: $relativePath,
+                size: $written->size,
+                externalId: $externalId,
+                created: $written->created,
+            );
+        }
+
         $existing = $this->inner->bytesAt($object->relativePath);
         $contents = $upload->stream()->getContents();
 
@@ -90,7 +134,7 @@ final class ContentAddressableInMemoryStore implements ContentAddressableStoreIn
 
             return new StoreResult(
                 relativePath: $object->relativePath,
-                size: \strlen($existing),
+                size: $this->reuseSize ?? \strlen($existing),
                 created: false,
             );
         }
