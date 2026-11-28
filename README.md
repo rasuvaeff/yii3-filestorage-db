@@ -37,7 +37,11 @@ composer require rasuvaeff/yii3-filestorage-db
 ```
 
 This package binds `RepositoryInterface`, `MaintenanceRepositoryInterface`,
-`ScopedFileResolverInterface` and `BlobLedgerInterface`. Core binds the facade.
+`ScopedFileResolverInterface` and `BlobLedgerInterface`, plus `DbRepository` and
+`DbBlobLedger` by class. Core binds the facade. `BlobLedgerInterface` is what
+core's `filestorage:gc` resolves; the deduplicating storage and
+`filestorage:deduplicate` are wired with `DbBlobLedger::class` — so rebinding
+`BlobLedgerInterface` (a decorator, say) changes `gc` only.
 You still bind a `StoreInterface` — a local `FileSystemStore`, or
 `rasuvaeff/yii3-filestorage-flysystem` for S3 and friends.
 

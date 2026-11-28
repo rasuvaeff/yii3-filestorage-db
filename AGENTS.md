@@ -17,7 +17,8 @@ Public API: `DbRepository` (core's `RepositoryInterface` +
 table-name value objects `FileTableName` / `BlobTableName` /
 `BlobReservationTableName`, the migrations under `src/Migration/`, and
 `Exception\InvalidFileRowException`. `FileRowMapper`, `Timestamps`,
-`BlobRowId`, `PositiveInterval` and `ContentKeyCheck` are `@internal`.
+`BlobRowId`, `PositiveInterval`, `ContentKeyCheck` and `ExactCollation` are
+`@internal`.
 
 DI wiring: `config/di.php` binds the four contracts above, the three table
 names, `DbRepository`/`DbBlobLedger` by class (the scoped hot-path pair the
@@ -105,6 +106,7 @@ scenario the schema or the driver rules out:
 | Redundant rewinds | `$stream->rewind()` after the digest pass in `DeduplicatingStorage` and `DeduplicateCommand` | `Upload::stream()` rewinds on every access and every consumer goes through it, so a missing rewind is invisible |
 | Lines with no opcode | the continuation lines of the multi-line messages in `DeduplicatingStorageFactory` and `reclaimAdvice()`; the unreachable `return 0` of `maxBytesOption()` (the option always has a default) | pcov records no executable opcode there, so the mutant is Not Covered whatever the tests assert; the messages themselves are asserted in full |
 | MySQL rowcount fallbacks | `$activated === 0 && $this->blobRow($id) === null` in `commit()`, `$updated > 0 \|\| $this->row($id) !== null` in `updateContentHash()` | They exist for MySQL, which counts *changed* rows. SQLite counts matched rows, so the re-read half is invisible to every unit test; `CrossDatabaseMigrationTest` covers it on MySQL, but mutation runs on SQLite only |
+| Server-only branches | the `SELECT VERSION()`/`information_schema.COLLATIONS` reads in `M261128…`'s `exactCollation()` | They run only on the MySQL driver; the decision itself lives in `ExactCollation` and is unit-tested, the queries are proven by the `mysql`/`mariadb` integration legs |
 | Console option casts and guards | `(bool) $input->getOption('apply')` and the `isset() && is_string() && !== ''` chain in `stringOption()` | Symfony already guarantees the type, so only the `!== ''` half is reachable — and that half is tested. The rest exists so psalm can narrow without a suppression |
 
 Two shapes are worth knowing before adding tests here.

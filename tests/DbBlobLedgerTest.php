@@ -29,6 +29,7 @@ use Testo\Lifecycle\BeforeTest;
 use Testo\Test;
 use Yiisoft\Db\Exception\IntegrityException;
 use Yiisoft\Db\Query\Query;
+use Yiisoft\Db\Transaction\TransactionInterface;
 use Yiisoft\Test\Support\Clock\StaticClock;
 
 #[Test]
@@ -858,6 +859,73 @@ final class DbBlobLedgerTest
     private function at(string $time): DateTimeImmutable
     {
         return new DateTimeImmutable("2026-01-01T{$time}:00.000000+00:00");
+    }
+
+    /**
+     * Review pass 2 N-B1: every transaction the ledger owns runs at READ
+     * COMMITTED on the MySQL driver, and on no other.
+     */
+    public function theLedgersOwnTransactionsRunAtReadCommittedOnMysqlOnly(): void
+    {
+        $connection = new InterceptingConnection($this->database->db);
+        $ledger = $this->ledgerOver($connection);
+        $connection->driverName = 'mysql';
+
+        $ledger->commit($this->reserveWith($ledger), SqliteDatabase::file('a'));
+        $ledger->release($this->reserveWith($ledger), $this->at('01:00'));
+        $ledger->releaseFile('a', $this->at('01:00'));
+        $ledger->expireReservations($this->at('00:00'), $this->at('01:00'));
+
+        Assert::same($connection->isolationLevels, array_fill(0, 6, TransactionInterface::READ_COMMITTED));
+
+        $connection->driverName = null;
+        $connection->isolationLevels = [];
+        $ledger->expireReservations($this->at('00:00'), $this->at('01:00'));
+
+        Assert::same($connection->isolationLevels, [null]);
+    }
+
+    /**
+     * Inside an application transaction the level cannot be set, and MariaDB
+     * answers a changed row with error 1020 — which yiisoft/db raises as an
+     * `IntegrityException`. It must not reach `reserve()`'s insert-race retry
+     * or the caller as a driver error.
+     */
+    public function aSnapshotConflictIsALedgerExceptionNamingTheCause(): void
+    {
+        $connection = new InterceptingConnection($this->database->db);
+        $conflict = new IntegrityException('1020 Record has changed since last read', ['HY000', 1020, 'Record has changed']);
+        $attempts = 0;
+        $connection->onTransaction = static function () use ($conflict, &$attempts): never {
+            ++$attempts;
+
+            throw $conflict;
+        };
+
+        try {
+            $this->reserveWith($this->ledgerOver($connection));
+            Assert::fail('Expected LedgerException');
+        } catch (LedgerException $e) {
+            Assert::string($e->getMessage())->contains('MariaDB error 1020');
+            Assert::string($e->getMessage())->contains('READ COMMITTED');
+            Assert::same($e->getPrevious(), $conflict);
+            Assert::same($attempts, 1, 'a snapshot conflict is not an insert race to retry');
+        }
+    }
+
+    /** Another driver error with error info stays what it was. */
+    public function anotherDatabaseErrorIsRethrownAsIs(): void
+    {
+        $connection = new InterceptingConnection($this->database->db);
+        $failure = new \Yiisoft\Db\Exception\Exception('gone away', ['HY000', 2006, 'MySQL server has gone away']);
+        $connection->onTransaction = static fn(): never => throw $failure;
+
+        try {
+            $this->ledgerOver($connection)->releaseFile('a', $this->at('01:00'));
+            Assert::fail('Expected the driver exception');
+        } catch (\Yiisoft\Db\Exception\Exception $e) {
+            Assert::same($e, $failure);
+        }
     }
 
     public function reserveRetriesOnceWhenAnotherWriterWonTheInsertRace(): void

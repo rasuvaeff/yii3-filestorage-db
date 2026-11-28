@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Rasuvaeff\Yii3FilestorageDb\Migration;
 
+use Rasuvaeff\Yii3FilestorageDb\ExactCollation;
 use Rasuvaeff\Yii3FilestorageDb\FileTableName;
 use Yiisoft\Db\Connection\ConnectionInterface;
 use Yiisoft\Db\Migration\MigrationBuilder;
@@ -77,32 +78,15 @@ final readonly class M261128000000MakeFilestorageFileScopeIdCaseSensitive implem
     }
 
     /**
-     * A binary collation that is also NO PAD, so a trailing space counts.
-     *
-     * `utf8mb4_bin` is PAD SPACE on both servers: it would make `acme ` and
-     * `acme` one value — on MySQL 8, whose default `utf8mb4_0900_ai_ci` is NO
-     * PAD, a match that did not exist before this migration. MariaDB names its
-     * NO PAD binary collation differently, and MySQL before 8.0.17 has none;
-     * there the migration refuses rather than promise a comparison it cannot
-     * make.
+     * See {@see ExactCollation}: the server is asked, the choice is made there.
      */
     private function exactCollation(ConnectionInterface $db): string
     {
-        $version = (string) $db->createCommand('SELECT VERSION()')->queryScalar();
-        if (stripos($version, 'mariadb') !== false) {
-            return 'utf8mb4_nopad_bin';
-        }
-
-        $available = $db->createCommand(
-            "SELECT COUNT(*) FROM information_schema.COLLATIONS WHERE COLLATION_NAME = 'utf8mb4_0900_bin'",
-        )->queryScalar();
-        if ((int) $available === 0) {
-            throw new \RuntimeException(sprintf(
-                'MySQL %s has no NO PAD binary collation (utf8mb4_0900_bin needs MySQL 8.0.17 or later)',
-                $version,
-            ));
-        }
-
-        return 'utf8mb4_0900_bin';
+        return ExactCollation::choose(
+            serverVersion: $db->createCommand('SELECT VERSION()')->queryScalar(),
+            collationCount: $db->createCommand(
+                "SELECT COUNT(*) FROM information_schema.COLLATIONS WHERE COLLATION_NAME = 'utf8mb4_0900_bin'",
+            )->queryScalar(),
+        );
     }
 }

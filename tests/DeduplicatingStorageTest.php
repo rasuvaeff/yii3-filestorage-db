@@ -43,6 +43,7 @@ use Rasuvaeff\Yii3FilestorageDb\DeduplicatingStorageFactory;
 use Rasuvaeff\Yii3FilestorageDb\DedupScope;
 use Rasuvaeff\Yii3FilestorageDb\Exception\MissingScopeException;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\ContentAddressableInMemoryStore;
+use Rasuvaeff\Yii3FilestorageDb\Tests\Support\FaultyLedger;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\FixedIdGenerator;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\FixedKeyGenerator;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\FixedScope;
@@ -50,7 +51,6 @@ use Rasuvaeff\Yii3FilestorageDb\Tests\Support\NoMimeTypeDetector;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\SlashRefusingKeyGenerator;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\SpyStream;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\SqliteDatabase;
-use Rasuvaeff\Yii3FilestorageDb\Tests\Support\UnreadableLedger;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\UnsizedStream;
 use Testo\Assert;
 use Testo\Codecov\Covers;
@@ -704,12 +704,35 @@ final class DeduplicatingStorageTest
     public function aLedgerFailingAfterTheReleaseIsARemoveException(): void
     {
         $ledger = new DbBlobLedger($this->database->db, $this->repository, new StaticClock($this->at('00:00')));
-        $storage = $this->direct(store: $this->store, keys: new \Rasuvaeff\Yii3Filestorage\Path\Sha256KeyGenerator(), ledger: new UnreadableLedger($ledger));
+        $storage = $this->direct(store: $this->store, keys: new \Rasuvaeff\Yii3Filestorage\Path\Sha256KeyGenerator(), ledger: new FaultyLedger($ledger, find: true));
         $file = $this->storage->add($this->upload('hello'));
 
         Expect::exception(RemoveException::class);
 
         $storage->remove($file->id);
+    }
+
+    /**
+     * A commit that fails is followed by a release, and on MariaDB inside an
+     * application transaction the release can fail on the same snapshot
+     * conflict. The caller must still get the `AddException` for the commit —
+     * the reservation's TTL takes care of a release that never happened.
+     */
+    public function aReleaseFailingAfterAFailedCommitStillReportsTheCommit(): void
+    {
+        $ledger = new DbBlobLedger($this->database->db, $this->repository, new StaticClock($this->at('00:00')));
+        $storage = $this->direct(
+            store: $this->store,
+            keys: new \Rasuvaeff\Yii3Filestorage\Path\Sha256KeyGenerator(),
+            ledger: new FaultyLedger($ledger, commit: true, release: true),
+        );
+
+        try {
+            $storage->add($this->upload('hello'));
+            Assert::fail('Expected AddException');
+        } catch (AddException $e) {
+            Assert::same($e->getPrevious()?->getMessage(), 'commit failed');
+        }
     }
 
     public function aGeneratorRefusingTheTenantProbeIsAConfigurationError(): void

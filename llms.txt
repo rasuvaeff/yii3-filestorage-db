@@ -185,7 +185,7 @@ StorageInterface::class => static fn (DeduplicatingStorageFactory $f): StorageIn
 ```
 
 `create()` throws `InvalidConfigException` when the store does not implement
-`ContentAddressableStoreInterface`, when the bound `BlobLedgerInterface` is not
+`ContentAddressableStoreInterface`, when the ledger it is given (DI: `DbBlobLedger::class`; `BlobLedgerInterface` is what core's `gc` resolves, so rebinding it changes `gc` only) is not
 this package's `DbBlobLedger`, or when the ledger and the repository are on
 different connections (which would make `commit()` two transactions), when
 the key generator's keys do not fit the store's layout (core's

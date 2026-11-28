@@ -14,14 +14,19 @@ use Rasuvaeff\Yii3Filestorage\Store\BlobRecord;
 use Rasuvaeff\Yii3Filestorage\Store\BlobReservation;
 
 /**
- * A ledger whose writes work and whose `find()` fails, as a database that
- * drops the connection right after a commit does.
+ * A working ledger with chosen methods failing, as a database that drops the
+ * connection at that moment does.
  *
  * @internal
  */
-final readonly class UnreadableLedger implements BlobLedgerInterface
+final readonly class FaultyLedger implements BlobLedgerInterface
 {
-    public function __construct(private BlobLedgerInterface $inner) {}
+    public function __construct(
+        private BlobLedgerInterface $inner,
+        private bool $commit = false,
+        private bool $release = false,
+        private bool $find = false,
+    ) {}
 
     #[Override]
     public function reserve(BlobId $blob, string $contentHash, int $size, DateTimeImmutable $expiresAt): BlobReservation
@@ -32,12 +37,20 @@ final readonly class UnreadableLedger implements BlobLedgerInterface
     #[Override]
     public function commit(BlobReservation $reservation, File $file): void
     {
+        if ($this->commit) {
+            throw new \RuntimeException('commit failed');
+        }
+
         $this->inner->commit($reservation, $file);
     }
 
     #[Override]
     public function release(BlobReservation $reservation, DateTimeImmutable $deleteAfter): void
     {
+        if ($this->release) {
+            throw new \RuntimeException('release failed');
+        }
+
         $this->inner->release($reservation, $deleteAfter);
     }
 
@@ -50,7 +63,11 @@ final readonly class UnreadableLedger implements BlobLedgerInterface
     #[Override]
     public function find(BlobId $blob): ?BlobRecord
     {
-        throw new \RuntimeException('the ledger cannot be read');
+        if ($this->find) {
+            throw new \RuntimeException('the ledger cannot be read');
+        }
+
+        return $this->inner->find($blob);
     }
 
     #[Override]

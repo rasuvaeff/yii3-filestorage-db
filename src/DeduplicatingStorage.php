@@ -377,7 +377,15 @@ final readonly class DeduplicatingStorage implements StorageInterface
             // Releasing, never deleting. The bytes at this content key may
             // belong to a writer that committed a microsecond ago, and the
             // grace period plus the collector are what tell the difference.
-            $this->ledger->release($reservation, $this->clock->now()->add($this->deleteGracePeriod));
+            //
+            // A release that fails too must not replace the failure being
+            // reported — on MariaDB inside an application transaction it fails
+            // on the very snapshot conflict the commit did. The reservation
+            // expires on its own, and `filestorage:gc` sweeps it then.
+            try {
+                $this->ledger->release($reservation, $this->clock->now()->add($this->deleteGracePeriod));
+            } catch (Throwable) {
+            }
 
             throw $e instanceof BlobBusyException
                 ? $e

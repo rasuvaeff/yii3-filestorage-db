@@ -38,8 +38,11 @@ composer require rasuvaeff/yii3-filestorage-db
 ```
 
 Пакет биндит `RepositoryInterface`, `MaintenanceRepositoryInterface`,
-`ScopedFileResolverInterface` и `BlobLedgerInterface`. Ядро биндит фасад —
-этот пакет его не трогает.
+`ScopedFileResolverInterface` и `BlobLedgerInterface`, а также `DbRepository` и
+`DbBlobLedger` по классу. Ядро биндит фасад — этот пакет его не трогает.
+`BlobLedgerInterface` резолвит `filestorage:gc` ядра; дедуплицирующее хранилище
+и `filestorage:deduplicate` получают `DbBlobLedger::class` — поэтому
+перепривязка `BlobLedgerInterface` (например, декоратором) меняет только `gc`.
 `StoreInterface` вы биндите сами — локальный `FileSystemStore` или
 `rasuvaeff/yii3-filestorage-flysystem` для S3 и подобных.
 
