@@ -19,9 +19,10 @@ use Yiisoft\Db\Query\Query;
  * File metadata in a database table.
  *
  * Every statement this class issues carries the tenant predicate when a
- * {@see FileScopeProviderInterface} is bound. There is no method that skips
- * it — not for downloads, not for maintenance. A signed download that needs to
- * read outside the current request's scope goes through
+ * {@see FileScopeProviderInterface} is bound and resolves a tenant. No method
+ * skips it for a resolved tenant — not for downloads, not for maintenance; the
+ * only global path is the explicit `allowGlobalAccess` opt-in below. A signed
+ * download that needs to read outside the current request's scope goes through
  * {@see DbScopedFileResolver}, which matches an *authenticated* scope rather
  * than turning the filter off.
  *
@@ -33,7 +34,9 @@ use Yiisoft\Db\Query\Query;
  * every method refuses it with {@see MissingScopeException} rather than
  * dropping the predicate. The one way to act on every tenant with a provider
  * bound is the explicit `allowGlobalAccess` opt-in, meant for maintenance entry
- * points; even then a new row is not written without a tenant. Null is never a
+ * points — `config/di.php` gives it only to the `MaintenanceRepositoryInterface`
+ * and `BlobLedgerInterface` bindings, under the `globalMaintenanceAccess`
+ * parameter; even then a new row is not written without a tenant. Null is never a
  * wildcard by accident, which is also how {@see DbScopedFileResolver} treats it.
  *
  * @api
@@ -402,8 +405,9 @@ final readonly class DbRepository implements MaintenanceRepositoryInterface
     {
         return new MissingScopeException(sprintf(
             '%s is bound but returned no scope, so this repository will not %s without a tenant predicate. '
-            . 'Establish the tenant first. A maintenance entry point that must see every tenant constructs '
-            . '%s with allowGlobalAccess: true, or leaves the provider unbound',
+            . 'Establish the tenant first. A maintenance command that must see every tenant gets it through '
+            . 'the globalMaintenanceAccess parameter (or %s with allowGlobalAccess: true), or runs with the '
+            . 'provider unbound',
             FileScopeProviderInterface::class,
             $action,
             self::class,

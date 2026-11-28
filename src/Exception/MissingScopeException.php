@@ -17,8 +17,11 @@ use RuntimeException;
  * tenant's file by a leaked id, `delete()` removes it, and new rows land with no
  * scope at all. So it is refused.
  *
- * Global access is an explicit opt-in for maintenance entry points
- * (`DbRepository(allowGlobalAccess: true)`), or the provider is left unbound.
+ * Global access is an explicit opt-in for maintenance: the
+ * `globalMaintenanceAccess` parameter, which reaches only the repository and
+ * ledger core's maintenance commands resolve, or
+ * `DbRepository(allowGlobalAccess: true)` built by hand — or the provider is
+ * left unbound.
  *
  * @api
  */

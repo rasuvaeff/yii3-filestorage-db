@@ -16,9 +16,12 @@ return [
         'tablePrefix' => '',
         // With a FileScopeProviderInterface bound, a null scope is refused.
         // true lets a null scope mean "every tenant" for reads, updates and
-        // deletes — set it only in a maintenance entry point's own params,
-        // never where requests are served.
-        'allowGlobalAccess' => false,
+        // deletes — through MaintenanceRepositoryInterface and
+        // BlobLedgerInterface only, the keys core's maintenance commands
+        // resolve. RepositoryInterface, DbRepository and the deduplicating
+        // storage keep refusing, so a queue worker sharing the console params
+        // is not opened up.
+        'globalMaintenanceAccess' => false,
     ],
     'yiisoft/yii-console' => [
         'commands' => [
