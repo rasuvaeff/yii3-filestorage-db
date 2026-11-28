@@ -5,7 +5,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## 0.4.0 — 2026-11-28
+
+Pre-1.0 review fixes (#16).
 
 - **Upgrading:** see `UPGRADE.md` — run `migrate:up`, and give every console/maintenance entry point of a multi-tenant installation either an unbound scope provider or `globalMaintenanceAccess`, or core's `gc`/`stat`/`verify`/`backfill-hash` now throw `MissingScopeException` where the tenant does not resolve.
 - **Changed (security):** a bound `FileScopeProviderInterface` that returns `null` no longer drops the tenant predicate. Every `DbRepository` method throws the new `Exception\MissingScopeException`; before, `find()`, `delete()`, `files()` and `referencedPaths()` reached every tenant's rows and `save()` inserted rows with no scope. Maintenance that must act across tenants with the provider bound sets the new `params['rasuvaeff/yii3-filestorage-db']['globalMaintenanceAccess']` (default `false`), which reaches only the `MaintenanceRepositoryInterface` and `BlobLedgerInterface` bindings — the keys core's `gc`/`stat`/`verify`/`backfill-hash` resolve — while `RepositoryInterface`, `DbRepository`, `DbBlobLedger` and the deduplicating storage keep refusing, so queue workers sharing the console params are not opened up; by hand, `new DbRepository(allowGlobalAccess: true)`. A new row is still refused without a tenant. `DeduplicatingStorageFactory` and `DeduplicateCommand` are now wired with `DbBlobLedger::class` (newly bound, scoped), not `BlobLedgerInterface`. `DeduplicatingStorage::add()` and `filestorage:deduplicate` refuse a null scope too, even under the opt-in, instead of keying content into the `shared` pool. `DbScopedFileResolver` already treated null as `scope_id IS NULL`; the two now agree that null is never a wildcard.
