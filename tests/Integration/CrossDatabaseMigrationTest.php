@@ -62,10 +62,10 @@ final class CrossDatabaseMigrationTest
 
     public function migrationsAndTheLedgerLifecycleWorkOnTheConfiguredDatabase(): void
     {
-        $database = getenv('FILESTORAGE_TEST_DB');
+        $database = ServerDatabase::engine();
 
-        if ($database !== 'mysql' && $database !== 'pgsql') {
-            Assert::true($database === false || $database === '');
+        if ($database === null) {
+            Assert::true(getenv('FILESTORAGE_TEST_DB') === false || getenv('FILESTORAGE_TEST_DB') === '');
 
             return;
         }
@@ -95,9 +95,9 @@ final class CrossDatabaseMigrationTest
 
             $this->deduplicatedAddsAndRemoves($db);
             $this->reservationsAndCollection($db);
-            $this->tenantsDifferingOnlyInCaseAreApart($db);
+            $this->tenantsDifferingInCaseOrTrailingSpaceAreApart($db);
             $this->referencedPaths($db);
-            if ($database === 'mysql') {
+            if ($database !== 'pgsql') {
                 // `LIKE` without `ESCAPE` on MySQL relies on the backslash
                 // being the escape character, which this mode switches off:
                 // a directory with `_` then found nothing, and the orphan
@@ -279,9 +279,11 @@ final class CrossDatabaseMigrationTest
     /**
      * MySQL's default collation compares `Acme` and `acme` — and `acme` and
      * `acmé` — as equal, which made two tenants one for every scoped
-     * statement. The scope column is compared byte for byte.
+     * statement. The scope column is compared byte for byte — trailing spaces
+     * included: `utf8mb4_bin` is PAD SPACE, so it made `acme ` and `acme` one
+     * tenant, a match MySQL 8's NO PAD default had never made.
      */
-    private function tenantsDifferingOnlyInCaseAreApart(ConnectionInterface $db): void
+    private function tenantsDifferingInCaseOrTrailingSpaceAreApart(ConnectionInterface $db): void
     {
         $scope = new FixedScope('Acme');
         $repository = new DbRepository($db, scopes: $scope);
@@ -297,7 +299,7 @@ final class CrossDatabaseMigrationTest
 
         Assert::true((new DbRepository($db))->hasTenantRows());
 
-        foreach (['acme', 'ACME', 'Acmé'] as $other) {
+        foreach (['acme', 'ACME', 'Acmé', 'Acme ', 'Acme  '] as $other) {
             $scope->switchTo($other);
             Assert::null($repository->find('tenant-row'), "tenant \"{$other}\" must not see the row of \"Acme\"");
             Assert::false($repository->hasTenantRows());
@@ -305,6 +307,7 @@ final class CrossDatabaseMigrationTest
         }
 
         Assert::null((new DbScopedFileResolver($db))->findInScope('tenant-row', 'acme'));
+        Assert::null((new DbScopedFileResolver($db))->findInScope('tenant-row', 'Acme '));
 
         $scope->switchTo('Acme');
         Assert::true($repository->delete('tenant-row'));

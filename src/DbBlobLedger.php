@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Rasuvaeff\Yii3FilestorageDb;
 
+use Closure;
 use DateInterval;
 use DateTimeImmutable;
 use Override;
@@ -19,9 +20,11 @@ use Rasuvaeff\Yii3Filestorage\Store\BlobReservation;
 use Rasuvaeff\Yii3Filestorage\Store\BlobState;
 use Rasuvaeff\Yii3Filestorage\Store\BlobToken;
 use Yiisoft\Db\Connection\ConnectionInterface;
+use Yiisoft\Db\Exception\Exception as DbException;
 use Yiisoft\Db\Exception\IntegrityException;
 use Yiisoft\Db\Expression\Expression;
 use Yiisoft\Db\Query\Query;
+use Yiisoft\Db\Transaction\TransactionInterface;
 
 /**
  * The blob ledger, in a database.
@@ -40,6 +43,19 @@ use Yiisoft\Db\Query\Query;
  * `DELETE FROM filestorage_file WHERE id = :id` would be a cross-tenant delete
  * by id — the exact hole the scoped repository exists to close. The ledger owns
  * the transaction; the repository owns the row.
+ *
+ * **Its own transactions run at READ COMMITTED on the MySQL driver.** Each
+ * reads a row and then updates it under a guard that re-checks the row at
+ * update time, so none relies on its snapshot. MariaDB 11.6.2+ with
+ * `innodb_snapshot_isolation=ON` (its default) fails such an `UPDATE` under
+ * REPEATABLE READ with error 1020 as soon as another connection changed the
+ * row after the snapshot — two simultaneous uploads of one file, or a removal
+ * during an upload of the same bytes. Called inside a transaction the
+ * application opened, the ledger cannot set the level (`yiisoft/db` sets it
+ * only on the outermost one); there error 1020 becomes a `LedgerException`
+ * naming the cause, and the application retries its transaction or runs it at
+ * READ COMMITTED. PostgreSQL already defaults to READ COMMITTED; SQLite
+ * serialises writers and accepts no other level.
  *
  * There is no reference counter. A reference *is* a `filestorage_file` row
  * carrying this blob's id, and the guards ask `NOT EXISTS`. A counter would be
@@ -141,7 +157,7 @@ final readonly class DbBlobLedger implements BlobLedgerInterface
             );
         }
 
-        $this->db->transaction(function () use ($id, $reservation, $file): void {
+        $this->transaction(function () use ($id, $reservation, $file): void {
             $released = $this->db->createCommand()
                 ->delete($this->reservations, ['token' => $reservation->token->value, 'blob_id' => $id])
                 ->execute();
@@ -194,10 +210,10 @@ final readonly class DbBlobLedger implements BlobLedgerInterface
             // is off by default, and the connection is the application's). A
             // second commit joining an active blob at the same instant writes
             // only values the row already holds and reads 0 there. So a 0 is
-            // settled by reading the row again — with a locking read: on MySQL
-            // under REPEATABLE READ a plain SELECT answers from the snapshot
-            // the transaction started with, which still shows the state the
-            // guard just failed on.
+            // settled by reading the row again — with a locking read: inside an
+            // application's REPEATABLE READ transaction a plain SELECT answers
+            // from the snapshot that transaction started with, which still
+            // shows the state the guard just failed on.
             if ($activated === 0) {
                 $current = $this->currentBlobRow($id);
                 if ($current === null) {
@@ -223,7 +239,7 @@ final readonly class DbBlobLedger implements BlobLedgerInterface
     {
         $id = BlobRowId::for($reservation->blob);
 
-        $this->db->transaction(function () use ($id, $reservation, $deleteAfter): void {
+        $this->transaction(function () use ($id, $reservation, $deleteAfter): void {
             $this->db->createCommand()
                 ->delete($this->reservations, ['token' => $reservation->token->value, 'blob_id' => $id])
                 ->execute();
@@ -235,7 +251,7 @@ final readonly class DbBlobLedger implements BlobLedgerInterface
     #[Override]
     public function releaseFile(string $fileId, DateTimeImmutable $deleteAfter): bool
     {
-        return $this->db->transaction(function () use ($fileId, $deleteAfter): bool {
+        return $this->transaction(function () use ($fileId, $deleteAfter): bool {
             // read the blob through the scoped repository, before the row goes
             $blobRowId = $this->repository->findBlobRowId($fileId);
 
@@ -276,7 +292,7 @@ final readonly class DbBlobLedger implements BlobLedgerInterface
     {
         $at = Timestamps::toStorage($now);
 
-        $removed = $this->db->transaction(function () use ($at, $deleteAfter): int {
+        $removed = $this->transaction(function () use ($at, $deleteAfter): int {
             /** @var list<array<string, mixed>> $rows */
             $rows = (new Query($this->db))
                 ->select('blob_id')
@@ -519,7 +535,7 @@ final readonly class DbBlobLedger implements BlobLedgerInterface
     ): void {
         $now = Timestamps::toStorage($this->clock->now());
 
-        $this->db->transaction(function () use ($id, $blob, $token, $contentHash, $size, $expiresAt, $now): void {
+        $this->transaction(function () use ($id, $blob, $token, $contentHash, $size, $expiresAt, $now): void {
             $row = $this->blobRow($id);
 
             if ($row === null) {
@@ -555,6 +571,45 @@ final readonly class DbBlobLedger implements BlobLedgerInterface
             'created_at' => $now,
             'updated_at' => $now,
         ])->execute();
+    }
+
+    /**
+     * Runs one of the ledger's own transactions.
+     *
+     * READ COMMITTED on the MySQL driver, see the class comment. A nested call
+     * keeps the enclosing transaction's level, and on MariaDB error 1020 there
+     * is reported for what it is rather than as the driver's
+     * `IntegrityException` — which {@see reserve()} would otherwise retry as a
+     * duplicate-insert race, against the same stale snapshot.
+     *
+     * @template T
+     *
+     * @param Closure(): T $work
+     *
+     * @return T
+     */
+    private function transaction(Closure $work): mixed
+    {
+        try {
+            return $this->db->transaction(
+                static fn(): mixed => $work(),
+                $this->db->getDriverName() === 'mysql' ? TransactionInterface::READ_COMMITTED : null,
+            );
+        } catch (DbException $e) {
+            // yiisoft/db copies the driver's errorInfo onto the exception it
+            // converts to: [SQLSTATE, driver code, message]
+            if (($e->errorInfo[1] ?? null) !== self::SNAPSHOT_CONFLICT) {
+                throw $e;
+            }
+
+            throw new LedgerException(
+                'A blob row changed after this transaction\'s snapshot (MariaDB error 1020 under REPEATABLE READ):'
+                . ' the ledger was called inside a transaction it does not own. Retry that transaction, or run it'
+                . ' at READ COMMITTED',
+                0,
+                $e,
+            );
+        }
     }
 
     /**
@@ -721,4 +776,7 @@ final readonly class DbBlobLedger implements BlobLedgerInterface
      * losing every race to live writers should return rather than spin.
      */
     private const int CLAIM_CANDIDATES = 16;
+
+    /** MariaDB's ER_CHECKREAD: "Record has changed since last read". */
+    private const int SNAPSHOT_CONFLICT = 1020;
 }

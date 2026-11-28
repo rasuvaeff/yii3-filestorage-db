@@ -19,8 +19,11 @@ use Yiisoft\Db\Pgsql\Driver as PgsqlDriver;
 use Yiisoft\Test\Support\SimpleCache\MemorySimpleCache;
 
 /**
- * Connections to the MySQL or PostgreSQL server `FILESTORAGE_TEST_DB` names,
- * for the integration suite. CI's `database-integration` job supplies both.
+ * Connections to the MySQL, MariaDB or PostgreSQL server `FILESTORAGE_TEST_DB`
+ * names, for the integration suite. CI's `database-integration` job supplies
+ * all three. MariaDB is its own engine here, not "MySQL again": 11.6.2+ fails a
+ * REPEATABLE READ select-then-update with error 1020, and its collations pad
+ * differently — neither shows on MySQL.
  *
  * @internal
  */
@@ -36,26 +39,28 @@ final readonly class ServerDatabase
     public const string UNUSUAL_SQL_MODE = 'NO_BACKSLASH_ESCAPES,ANSI_QUOTES';
 
     /**
-     * @return 'mysql'|'pgsql'|null
+     * @return 'mysql'|'mariadb'|'pgsql'|null
      */
     public static function engine(): ?string
     {
         $engine = getenv('FILESTORAGE_TEST_DB');
 
-        return $engine === 'mysql' || $engine === 'pgsql' ? $engine : null;
+        return in_array($engine, ['mysql', 'mariadb', 'pgsql'], strict: true) ? $engine : null;
     }
 
     /**
-     * @param 'mysql'|'pgsql' $engine
-     * @param string|null $sqlMode Added to MySQL's session `sql_mode`; ignored on PostgreSQL.
+     * @param 'mysql'|'mariadb'|'pgsql' $engine
+     * @param string|null $sqlMode Added to the MySQL-family session `sql_mode`; ignored on PostgreSQL.
      */
     public static function connect(string $engine, ?string $sqlMode = null): ConnectionInterface
     {
         $cache = new SchemaCache(psrCache: new MemorySimpleCache());
-        $mysqlPort = getenv('FILESTORAGE_TEST_MYSQL_PORT') ?: '3306';
+        $mysqlPort = $engine === 'mariadb'
+            ? (getenv('FILESTORAGE_TEST_MARIADB_PORT') ?: '3307')
+            : (getenv('FILESTORAGE_TEST_MYSQL_PORT') ?: '3306');
         $pgsqlPort = getenv('FILESTORAGE_TEST_PGSQL_PORT') ?: '5432';
 
-        $db = $engine === 'mysql'
+        $db = $engine !== 'pgsql'
             ? new MysqlConnection(
                 driver: new MysqlDriver(
                     dsn: sprintf('mysql:host=127.0.0.1;port=%s;dbname=filestorage;charset=utf8mb4', $mysqlPort),
@@ -74,7 +79,7 @@ final readonly class ServerDatabase
             );
         $db->open();
 
-        if ($engine === 'mysql' && $sqlMode !== null) {
+        if ($engine !== 'pgsql' && $sqlMode !== null) {
             $db->createCommand('SET SESSION sql_mode = CONCAT(@@sql_mode, :mode)', [':mode' => ',' . $sqlMode])
                 ->execute();
         }

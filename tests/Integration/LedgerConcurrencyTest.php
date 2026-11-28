@@ -10,6 +10,7 @@ use Rasuvaeff\Yii3Filestorage\Store\BlobId;
 use Rasuvaeff\Yii3Filestorage\Store\BlobState;
 use Rasuvaeff\Yii3FilestorageDb\DbBlobLedger;
 use Rasuvaeff\Yii3FilestorageDb\DbRepository;
+use Rasuvaeff\Yii3FilestorageDb\Tests\Support\InterleavingScope;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\ServerDatabase;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\SqliteDatabase;
 use Testo\Assert;
@@ -361,6 +362,113 @@ final class LedgerConcurrencyTest
     }
 
     /**
+     * Bob commits the same blob while Alice's commit is between its first read
+     * and its activation `UPDATE`. MariaDB 11.6.2+ under REPEATABLE READ
+     * (`innodb_snapshot_isolation=ON`) failed Alice with error 1020 — the
+     * second of two simultaneous uploads of one file was an `AddException`.
+     * The ledger runs its own transactions at READ COMMITTED on the MySQL
+     * driver, so both commits land.
+     */
+    public function aCommitOverlappingAnotherCommitOfTheSameBlobLands(): void
+    {
+        [$alice, $aliceScope, $bob] = $this->interleavedWorkers();
+        if ($alice === null) {
+            Assert::true(actual: true, message: 'needs a server: SQLite serialises the two writers');
+
+            return;
+        }
+
+        $aliceReservation = $alice->reserve($this->blob(), self::HASH, 12, $this->at('00:10'));
+        $bobReservation = $bob->reserve($this->blob(), self::HASH, 12, $this->at('00:10'));
+
+        // call 1 is the read of the row's previous blob, call 2 the save
+        $aliceScope->runOnCall(2, fn() => $bob->commit($bobReservation, SqliteDatabase::file('b')));
+        $alice->commit($aliceReservation, SqliteDatabase::file('a'));
+
+        $record = $this->alice->find($this->blob());
+        Assert::same($record?->state, BlobState::Active);
+        Assert::same($record?->referenceCount, 2);
+        Assert::same($record?->reservationCount, 0);
+    }
+
+    /**
+     * Alice removes a file while Bob commits another upload of the same bytes
+     * between her read of the blob and her scheduling `UPDATE`. On MariaDB
+     * under REPEATABLE READ that was error 1020, a `RemoveException` to the
+     * user. Now the removal lands and Bob's reference keeps the blob active.
+     */
+    public function releasingAFileWhileTheSameBlobIsCommittedLands(): void
+    {
+        [$alice, $aliceScope, $bob] = $this->interleavedWorkers();
+        if ($alice === null) {
+            Assert::true(actual: true, message: 'needs a server: SQLite serialises the two writers');
+
+            return;
+        }
+
+        $alice->commit(
+            $alice->reserve($this->blob(), self::HASH, 12, $this->at('00:10')),
+            SqliteDatabase::file('a'),
+        );
+        $bobReservation = $bob->reserve($this->blob(), self::HASH, 12, $this->at('00:10'));
+
+        // call 1 reads the file's blob, call 2 is the delete of its row
+        $aliceScope->runOnCall(2, fn() => $bob->commit($bobReservation, SqliteDatabase::file('b')));
+        Assert::true($alice->releaseFile('a', $this->at('01:00')));
+
+        $record = $this->alice->find($this->blob());
+        Assert::same($record?->state, BlobState::Active);
+        Assert::same($record?->referenceCount, 1);
+    }
+
+    /**
+     * Inside a transaction the application opened, the ledger cannot choose
+     * the isolation level — `yiisoft/db` only sets it on the outermost one.
+     * On MariaDB 11.6.2+ under REPEATABLE READ the overlapping commit then
+     * fails, and must fail as a `LedgerException` naming the cause, not as a
+     * driver `IntegrityException` (which `reserve()` would mistake for a
+     * duplicate-insert race). Elsewhere it lands.
+     */
+    public function anOverlappingCommitInsideAnApplicationTransactionFailsAsALedgerException(): void
+    {
+        [$alice, $aliceScope, $bob] = $this->interleavedWorkers();
+        if ($alice === null) {
+            Assert::true(actual: true, message: 'needs a server: SQLite serialises the two writers');
+
+            return;
+        }
+
+        $aliceReservation = $alice->reserve($this->blob(), self::HASH, 12, $this->at('00:10'));
+        $bobReservation = $bob->reserve($this->blob(), self::HASH, 12, $this->at('00:10'));
+
+        $transaction = $this->first->beginTransaction();
+        $failure = null;
+
+        try {
+            $aliceScope->runOnCall(2, fn() => $bob->commit($bobReservation, SqliteDatabase::file('b')));
+            $alice->commit($aliceReservation, SqliteDatabase::file('a'));
+            $transaction->commit();
+        } catch (\Rasuvaeff\Yii3Filestorage\Exception\LedgerException $e) {
+            $failure = $e;
+        } finally {
+            if ($transaction->isActive()) {
+                $transaction->rollBack();
+            }
+        }
+
+        if (!$this->snapshotIsolated()) {
+            Assert::null($failure);
+            Assert::same($this->alice->find($this->blob())?->referenceCount, 2);
+
+            return;
+        }
+
+        Assert::true($failure instanceof \Rasuvaeff\Yii3Filestorage\Exception\LedgerException, 'expected a LedgerException');
+        Assert::string($failure?->getMessage() ?? '')->contains('READ COMMITTED');
+        Assert::same($this->alice->find($this->blob())?->referenceCount, 1, 'Bob\'s commit stands');
+    }
+
+    /**
      * Interleaved adds and removes on one blob, run through both connections.
      * The property being checked is the invariant itself: at no point does a
      * committed row exist while the blob it names does not.
@@ -408,6 +516,39 @@ final class LedgerConcurrencyTest
                 "file \"{$file->id}\" references a blob that no longer exists",
             );
         }
+    }
+
+    /**
+     * Alice and Bob under one tenant, with a hook inside Alice's statements;
+     * nulls on SQLite, where the second writer would wait on the first.
+     *
+     * @return array{0: DbBlobLedger|null, 1: InterleavingScope, 2: DbBlobLedger}
+     */
+    private function interleavedWorkers(): array
+    {
+        $scope = new InterleavingScope();
+        if ($this->database !== null) {
+            return [null, $scope, $this->bob];
+        }
+
+        return [
+            $this->ledgerOn($this->first, new DbRepository($this->first, scopes: $scope)),
+            $scope,
+            $this->ledgerOn($this->second, new DbRepository($this->second, scopes: new InterleavingScope()), '00:01'),
+        ];
+    }
+
+    /**
+     * Whether the server fails a REPEATABLE READ update of a row changed after
+     * the snapshot: MariaDB 11.6.2+ with its default `innodb_snapshot_isolation`.
+     */
+    private function snapshotIsolated(): bool
+    {
+        if (ServerDatabase::engine() !== 'mariadb') {
+            return false;
+        }
+
+        return (int) $this->first->createCommand('SELECT @@innodb_snapshot_isolation')->queryScalar() === 1;
     }
 
     private function ledgerOn(ConnectionInterface $db, DbRepository $repository, string $time = '00:00'): DbBlobLedger
