@@ -147,6 +147,11 @@ final class CrossDatabaseMigrationTest
         Assert::same($store->writeCount(), 1);
         Assert::same($ledger->find($blob)?->referenceCount, 2);
         Assert::same($ledger->find($blob)?->size, 5);
+        // the batch lookup gc uses: one statement with correlated counts
+        Assert::equals(
+            $ledger->findMany([BlobId::create('upload', 'sha/00/00/none'), $blob]),
+            [$blob->key() => $ledger->find($blob)],
+        );
 
         // re-setting the hash a row already holds still finds the row
         Assert::true($repository->updateContentHash($second->id, (string) $second->contentHash));
@@ -186,6 +191,7 @@ final class CrossDatabaseMigrationTest
         $reservation = $ledger->reserve($blob, $hash, 6, $this->at('00:10'));
         Assert::same($ledger->find($blob)?->state, BlobState::Writing);
         Assert::same($ledger->find($blob)?->reservationCount, 1);
+        Assert::same($ledger->findMany([$blob])[$blob->key()]->reservationCount, 1);
 
         $ledger->release($reservation, $this->at('01:00'));
         Assert::same($ledger->find($blob)?->state, BlobState::PendingDelete);

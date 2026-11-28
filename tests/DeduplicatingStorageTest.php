@@ -47,7 +47,9 @@ use Rasuvaeff\Yii3FilestorageDb\Tests\Support\FaultyLedger;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\FixedIdGenerator;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\FixedKeyGenerator;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\FixedScope;
+use Rasuvaeff\Yii3FilestorageDb\Tests\Support\ForwardingStorage;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\NoMimeTypeDetector;
+use Rasuvaeff\Yii3FilestorageDb\Tests\Support\PinnedProxyUrls;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\SlashRefusingKeyGenerator;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\SpyStream;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\SqliteDatabase;
@@ -671,6 +673,48 @@ final class DeduplicatingStorageTest
     }
 
     /**
+     * Core 0.10 has `Storage::withProxyUrls()` for links minted outside the
+     * tenant's request (review 1.0 pass 2, flysystem-web-images N10). With
+     * deduplication on, `StorageInterface` resolves to this decorator, and
+     * `$storage->withProxyUrls($urls->forScope($tenant))->urlFor($file)` has
+     * to work on it too: a copy whose wrapped facade mints through the given
+     * generator, sharing the ledger, the store and everything else.
+     */
+    public function withProxyUrlsMintsThroughTheGivenGeneratorAndLeavesTheOriginalAlone(): void
+    {
+        $file = $this->storage->add($this->upload('hello'));
+
+        $pinned = $this->storage->withProxyUrls(new PinnedProxyUrls('tenant-a'));
+
+        Assert::instanceOf($pinned, DeduplicatingStorage::class);
+        Assert::same($pinned->urlFor($file, $this->at('02:00')), "/files/tenant-a/{$file->id}");
+        Assert::null($this->storage->urlFor($file, $this->at('02:00')));
+        Assert::same($pinned->add($this->upload('hello'))->relativePath, $file->relativePath);
+        Assert::same($this->store->writeCount(), 1);
+    }
+
+    /**
+     * A decorator over a decorator delegates down to core's facade; a wrapped
+     * facade that cannot swap its generator is refused by name rather than
+     * silently minting through the unpinned one.
+     */
+    public function withProxyUrlsReachesCoresFacadeOrRefuses(): void
+    {
+        $file = $this->storage->add($this->upload('hello'));
+        Assert::instanceOf($this->storage, DeduplicatingStorage::class);
+        $outer = $this->wrapping($this->storage);
+
+        Assert::same(
+            $outer->withProxyUrls(new PinnedProxyUrls('tenant-b'))->urlFor($file, $this->at('02:00')),
+            "/files/tenant-b/{$file->id}",
+        );
+
+        Expect::exception(InvalidConfigException::class)->withMessageContaining('ForwardingStorage');
+
+        $this->wrapping(new ForwardingStorage($this->storage))->withProxyUrls(new PinnedProxyUrls('tenant-c'));
+    }
+
+    /**
      * Review pass 2 N-B3: the constructor is public, and the checks used to
      * live only in the factory and the command. Built directly, a flat key
      * generator on the directory layout wrote blobs `gc` can never collect,
@@ -852,6 +896,22 @@ final class DeduplicatingStorageTest
             policies: new PolicyRegistry(),
             clock: $clock,
             scopes: $scopes,
+        );
+    }
+
+    private function wrapping(StorageInterface $unique): DeduplicatingStorage
+    {
+        $clock = new StaticClock($this->at('00:00'));
+
+        return new DeduplicatingStorage(
+            unique: $unique,
+            ledger: $this->ledger,
+            store: $this->store,
+            keys: new \Rasuvaeff\Yii3Filestorage\Path\Sha256KeyGenerator(),
+            mimeTypeDetector: new FinfoMimeTypeDetector(),
+            idGenerator: new Uuid7IdGenerator($clock),
+            policies: new PolicyRegistry(),
+            clock: $clock,
         );
     }
 

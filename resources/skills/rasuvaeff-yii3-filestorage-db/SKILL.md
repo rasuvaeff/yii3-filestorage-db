@@ -81,6 +81,12 @@ delete. Namespace `Rasuvaeff\Yii3FilestorageDb\`. Full API reference:
    tenant out (`FlatSha256KeyGenerator(prefix: …)`). Tests that need flat keys
    build the store with `FlatSiblingLayout`.
 
+- `DbBlobLedger::findMany()` (core's optional batch lookup, used by `gc`):
+  one statement per 500 blobs with correlated `COUNT(*)` subqueries; it must
+  answer exactly what `find()` answers per blob — cover any change on MySQL,
+  MariaDB and PostgreSQL. `DeduplicatingStorage::withProxyUrls()` delegates to
+  core's `Storage::withProxyUrls()`; refuse rather than mint unpinned.
+
 10. **`referencedPaths()` decides in PHP, not in SQL.** The database narrows
     with `LIKE '<dir>/%' ESCAPE '!'` — never yiisoft/db's `Like`, whose MySQL
     form has no `ESCAPE` and breaks under `NO_BACKSLASH_ESCAPES`; the exact store and directory comparison happens

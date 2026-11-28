@@ -394,6 +394,16 @@ the base facade would; shared bytes are only ever deleted by the collector. A
 body that declares no length is also stopped at the group's `maxBytes` while it
 is hashed, with the base facade's `UploadSizeException`.
 
+**Links minted outside the tenant's request.** With deduplication on,
+`StorageInterface` resolves to `DeduplicatingStorage`, and it has core's
+`withProxyUrls()` too: `$storage->withProxyUrls($urls->forScope($tenantId))->urlFor($file)`
+(`-web`'s `HmacProxyUrlGenerator::forScope()`) returns the same decorator over a
+base facade minting through the pinned generator — ledger, store and keys
+shared. It delegates to the wrapped facade, so that has to be core's `Storage`
+(what `DeduplicatingStorageFactory` wraps) or another `DeduplicatingStorage`;
+anything else is an `InvalidConfigException` naming the class, not a link
+minted through the unpinned generator.
+
 ### What it does not do
 
 | Expectation | Reality | Instead |
@@ -501,6 +511,13 @@ sweep runs from an entry point with no scope provider bound.
 `findMany($ids)` reads a batch of rows in one statement per 500 ids, scoped like
 `find()`; ids that do not exist or belong to another tenant are absent from the
 result.
+
+`DbBlobLedger` implements core's optional `BlobLedgerBatchLookupInterface`:
+`filestorage:gc` asks it about every object of a quarantine page with one
+`findMany($blobs)` — one statement per 500 blobs, the blob rows with their
+reference and reservation counts as correlated subqueries — instead of three
+statements per object. The answer is what `find()` would give for each blob,
+unknown blobs left out.
 
 ## Storage format
 

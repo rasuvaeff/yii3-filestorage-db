@@ -134,7 +134,8 @@ Both values in one query. No code path here queries by id alone. Agrees with
 
 ### `DbBlobLedger`
 
-Implements core's `BlobLedgerInterface`.
+Implements core's `BlobLedgerBatchLookupInterface` (extends
+`BlobLedgerInterface`), so `filestorage:gc` batches its lookups.
 
 ```php
 new DbBlobLedger(
@@ -159,6 +160,7 @@ Add protocol: `reserve()` → store `putIfAbsent()` → `commit()`; on failure
 | `release(BlobReservation, DateTimeImmutable $deleteAfter)` | Idempotent. Never deletes bytes |
 | `releaseFile(string $fileId, DateTimeImmutable $deleteAfter)` | Scoped delete + conditional schedule. `false` when there was no such row |
 | `find(BlobId): ?BlobRecord` | Counts are derived, not stored |
+| `findMany(list<BlobId>): array<string, BlobRecord>` | What `find()` answers per blob, keyed by `BlobId::key()`, in the order asked, unknown blobs left out; one statement per `FIND_MANY_CHUNK` (500) blobs, counts as correlated subqueries |
 | `expireReservations(DateTimeImmutable $now, DateTimeImmutable $deleteAfter): int` | Run before any collection pass |
 | `claimForDeletion(DateTimeImmutable $now, DateTimeImmutable $leaseExpiresAt): ?BlobLease` | One conditional update per candidate; steals an expired lease |
 | `completeDeletion(BlobLease): bool` | `false` if the lease was lost or the blob was revived |
@@ -183,6 +185,12 @@ StorageInterface::class => static fn (DeduplicatingStorageFactory $f): StorageIn
         deleteGracePeriod: new DateInterval('PT1H'),   // > 0, as reservationTtl
     );
 ```
+
+`DeduplicatingStorage::withProxyUrls(?ProxyUrlGeneratorInterface): self` —
+core's `Storage::withProxyUrls()` through the decorator (links minted outside
+the tenant's request: `$storage->withProxyUrls($urls->forScope($tenantId))->urlFor($file)`);
+the wrapped facade must be core's `Storage` or another `DeduplicatingStorage`,
+else `InvalidConfigException`.
 
 `create()` throws `InvalidConfigException` when the store does not implement
 `ContentAddressableStoreInterface`, when the ledger it is given (DI: `DbBlobLedger::class`; `BlobLedgerInterface` is what core's `gc` resolves, so rebinding it changes `gc` only) is not

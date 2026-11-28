@@ -816,6 +816,67 @@ final class DbBlobLedgerTest
         Assert::same($this->ledger->find($this->blob())?->state, BlobState::PendingDelete);
     }
 
+    /**
+     * Core's optional batch lookup (review 1.0 pass 2, maintenance N7):
+     * `filestorage:gc` asks the ledger about every object of every quarantine
+     * entry on every run. `findMany()` answers what `find()` answers for each
+     * blob — counts and dates included — and leaves out the unknown ones.
+     */
+    public function findManyAnswersWhatFindAnswersForEachBlob(): void
+    {
+        $this->ledger->commit($this->reserve(), SqliteDatabase::file('a'));
+        $this->reserve();
+        $this->ledger->commit($this->reserveOther(), $this->fileOnOtherBlob('b'));
+        $this->ledger->releaseFile('b', $this->at('01:00'));
+        $writing = BlobId::create('upload', 'sha/aa/bb/original');
+        $this->ledger->reserve($writing, SqliteDatabase::HASH, 5, $this->at('00:10'));
+        $unknown = BlobId::create('upload', 'sha/ff/ff/original');
+
+        $records = $this->ledger->findMany([$this->blob(), $this->otherBlob(), $writing, $unknown, $this->blob()]);
+
+        Assert::same(array_keys($records), [$this->blob()->key(), $this->otherBlob()->key(), $writing->key()]);
+        foreach ([$this->blob(), $this->otherBlob(), $writing] as $blob) {
+            Assert::equals($records[$blob->key()], $this->ledger->find($blob));
+        }
+        Assert::same($records[$this->blob()->key()]->referenceCount, 1);
+        Assert::same($records[$this->blob()->key()]->reservationCount, 1);
+        Assert::same($records[$this->otherBlob()->key()]->state, BlobState::PendingDelete);
+        Assert::same($records[$writing->key()]->state, BlobState::Writing);
+    }
+
+    /**
+     * The point of the capability: one query per page of blobs — rows and
+     * both counts together — instead of three per blob; none at all for an
+     * empty page. A page longer than {@see DbBlobLedger::FIND_MANY_CHUNK}
+     * blobs is split, so no driver meets an unbounded `IN` list.
+     */
+    public function findManyIsOneQueryPerChunk(): void
+    {
+        $connection = new InterceptingConnection($this->database->db);
+        $ledger = $this->ledgerOver($connection);
+        $ledger->commit($this->reserveWith($ledger), SqliteDatabase::file('a'));
+        $queries = 0;
+        $connection->onCreateCommand = static function (?string $sql, \Closure $proceed) use (&$queries): mixed {
+            ++$queries;
+
+            return $proceed();
+        };
+
+        Assert::same($ledger->findMany([]), []);
+        Assert::same($queries, 0);
+
+        Assert::count($ledger->findMany([$this->blob(), $this->otherBlob()]), 1);
+        Assert::same($queries, 1);
+
+        $queries = 0;
+        $page = array_map(
+            static fn(int $i): BlobId => BlobId::create('upload', "sha/{$i}/original"),
+            range(1, DbBlobLedger::FIND_MANY_CHUNK * 2 + 1),
+        );
+        Assert::equals($ledger->findMany([$this->blob(), ...$page]), [$this->blob()->key() => $ledger->find($this->blob())]);
+        Assert::same($queries, 3 + 3);
+    }
+
     private function reserve(string $hash = SqliteDatabase::HASH, int $size = 12): BlobReservation
     {
         return $this->ledger->reserve($this->blob(), $hash, $size, $this->at('00:10'));

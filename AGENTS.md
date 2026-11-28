@@ -11,7 +11,8 @@ makes deduplicated bytes safe to delete. Namespace
 
 Public API: `DbRepository` (core's `RepositoryInterface` +
 `MaintenanceRepositoryInterface`), `DbScopedFileResolver`
-(`ScopedFileResolverInterface`), `DbBlobLedger` (`BlobLedgerInterface`),
+(`ScopedFileResolverInterface`), `DbBlobLedger` (`BlobLedgerBatchLookupInterface`,
+which extends `BlobLedgerInterface`),
 `DeduplicatingStorage` / `DeduplicatingStorageFactory` / `DedupScope`,
 `Command\DeduplicateCommand`, the
 table-name value objects `FileTableName` / `BlobTableName` /
@@ -160,6 +161,11 @@ MSI without any test getting worse.
   `LedgerConcurrencyTest` commits a second writer inside the ledger's
   transaction through `InterleavingScope` (the repository asks for the scope
   once per statement).
+- **`findMany()` is one statement per chunk, with the counts in it.** Correlated
+  `COUNT(*)` subqueries over aliased tables; a new form of it belongs in
+  `CrossDatabaseMigrationTest` and `LedgerBatchLookupTest` (MySQL under
+  `ANSI_QUOTES`). `DeduplicatingStorage::withProxyUrls()` forwards every
+  constructor argument — a new one added there must be added to the copy too.
 - **There is no `reference_count` column, and adding one would be a
   regression.** A reference *is* a `filestorage_file` row carrying the blob's
   id. A denormalised counter is a second source of truth that can drift from

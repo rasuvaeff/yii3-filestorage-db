@@ -14,7 +14,7 @@ use Rasuvaeff\Yii3Filestorage\Exception\LedgerException;
 use Rasuvaeff\Yii3Filestorage\File;
 use Rasuvaeff\Yii3Filestorage\Store\BlobId;
 use Rasuvaeff\Yii3Filestorage\Store\BlobLease;
-use Rasuvaeff\Yii3Filestorage\Store\BlobLedgerInterface;
+use Rasuvaeff\Yii3Filestorage\Store\BlobLedgerBatchLookupInterface;
 use Rasuvaeff\Yii3Filestorage\Store\BlobRecord;
 use Rasuvaeff\Yii3Filestorage\Store\BlobReservation;
 use Rasuvaeff\Yii3Filestorage\Store\BlobState;
@@ -57,6 +57,12 @@ use Yiisoft\Db\Transaction\TransactionInterface;
  * READ COMMITTED. PostgreSQL already defaults to READ COMMITTED; SQLite
  * serialises writers and accepts no other level.
  *
+ * **Lookups batch.** It implements core's optional
+ * {@see BlobLedgerBatchLookupInterface}: `filestorage:gc` asks about every
+ * object of a quarantine page in one call, answered by one statement per
+ * {@see self::FIND_MANY_CHUNK} blobs — rows and both counts together — instead
+ * of three statements per blob.
+ *
  * There is no reference counter. A reference *is* a `filestorage_file` row
  * carrying this blob's id, and the guards ask `NOT EXISTS`. A counter would be
  * a second source of truth that can drift from the first, and every underflow
@@ -64,8 +70,15 @@ use Yiisoft\Db\Transaction\TransactionInterface;
  *
  * @api
  */
-final readonly class DbBlobLedger implements BlobLedgerInterface
+final readonly class DbBlobLedger implements BlobLedgerBatchLookupInterface
 {
+    /**
+     * Blobs looked up by one {@see self::findMany()} statement. A longer page
+     * is split, so no driver meets an unbounded `IN` list (SQLite before 3.32
+     * allows 999 bound parameters).
+     */
+    public const int FIND_MANY_CHUNK = 500;
+
     private string $files;
     private string $blobs;
     private string $reservations;
@@ -285,6 +298,45 @@ final readonly class DbBlobLedger implements BlobLedgerInterface
             deleteAfter: Timestamps::fromStorageOrNull($row['delete_after'] ?? null, 'delete_after'),
             leaseExpiresAt: Timestamps::fromStorageOrNull($row['lease_expires_at'] ?? null, 'lease_expires_at'),
         );
+    }
+
+    #[Override]
+    public function findMany(array $blobs): array
+    {
+        /** @var array<non-empty-string, BlobId> $byRowId */
+        $byRowId = [];
+        foreach ($blobs as $blob) {
+            $byRowId[BlobRowId::for($blob)] = $blob;
+        }
+
+        $found = [];
+        foreach (array_chunk(array_keys($byRowId), self::FIND_MANY_CHUNK) as $ids) {
+            foreach ($this->blobRowsWithCounts($ids) as $row) {
+                $found[$this->string($row, 'id')] = $row;
+            }
+        }
+
+        // In the order asked, as find() called blob by blob would answer.
+        $records = [];
+        foreach ($byRowId as $id => $blob) {
+            $row = $found[$id] ?? null;
+            if ($row === null) {
+                continue;
+            }
+
+            $records[$blob->key()] = new BlobRecord(
+                blob: $blob,
+                contentHash: $this->string($row, 'content_hash'),
+                size: $this->integer($row, 'size'),
+                state: $this->state($row),
+                referenceCount: max(0, (int) ($row['reference_count'] ?? 0)),
+                reservationCount: max(0, (int) ($row['reservation_count'] ?? 0)),
+                deleteAfter: Timestamps::fromStorageOrNull($row['delete_after'] ?? null, 'delete_after'),
+                leaseExpiresAt: Timestamps::fromStorageOrNull($row['lease_expires_at'] ?? null, 'lease_expires_at'),
+            );
+        }
+
+        return $records;
     }
 
     #[Override]
@@ -684,6 +736,35 @@ final readonly class DbBlobLedger implements BlobLedgerInterface
         $row = (new Query($this->db))->from($this->blobs)->where(['id' => $id])->one();
 
         return $row;
+    }
+
+    /**
+     * Blob rows with their reference and reservation counts, in one statement:
+     * correlated `COUNT(*)` subqueries, which every supported driver runs.
+     *
+     * @param list<non-empty-string> $ids
+     *
+     * @return list<array<string, mixed>>
+     */
+    private function blobRowsWithCounts(array $ids): array
+    {
+        $references = (new Query($this->db))
+            ->select(new Expression('COUNT(*)'))
+            ->from(['f' => $this->files])
+            ->where(new Expression('[[f]].[[blob_id]] = [[b]].[[id]]'));
+        $reservations = (new Query($this->db))
+            ->select(new Expression('COUNT(*)'))
+            ->from(['r' => $this->reservations])
+            ->where(new Expression('[[r]].[[blob_id]] = [[b]].[[id]]'));
+
+        /** @var list<array<string, mixed>> $rows */
+        $rows = (new Query($this->db))
+            ->select(['b.*', 'reference_count' => $references, 'reservation_count' => $reservations])
+            ->from(['b' => $this->blobs])
+            ->where(['b.id' => $ids])
+            ->all();
+
+        return $rows;
     }
 
     /**

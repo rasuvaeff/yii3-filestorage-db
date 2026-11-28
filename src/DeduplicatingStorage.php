@@ -21,6 +21,7 @@ use Rasuvaeff\Yii3Filestorage\Mime\MimeTypeDetectorInterface;
 use Rasuvaeff\Yii3Filestorage\Path\ContentAddressedKeyGeneratorInterface;
 use Rasuvaeff\Yii3Filestorage\Policy\PolicyRegistry;
 use Rasuvaeff\Yii3Filestorage\Repository\FileScopeProviderInterface;
+use Rasuvaeff\Yii3Filestorage\Storage;
 use Rasuvaeff\Yii3Filestorage\StorageInterface;
 use Rasuvaeff\Yii3Filestorage\Store\BlobId;
 use Rasuvaeff\Yii3Filestorage\Store\BlobLedgerInterface;
@@ -28,6 +29,7 @@ use Rasuvaeff\Yii3Filestorage\Store\ContentAddressableStoreInterface;
 use Rasuvaeff\Yii3Filestorage\Store\StoredObjectId;
 use Rasuvaeff\Yii3Filestorage\Store\StoreRegistry;
 use Rasuvaeff\Yii3Filestorage\Upload;
+use Rasuvaeff\Yii3Filestorage\Url\ProxyUrlGeneratorInterface;
 use Rasuvaeff\Yii3FilestorageDb\Exception\MissingScopeException;
 use Throwable;
 
@@ -116,6 +118,48 @@ final readonly class DeduplicatingStorage implements StorageInterface
         PositiveInterval::require($reservationTtl, 'reservationTtl');
         PositiveInterval::require($deleteGracePeriod, 'deleteGracePeriod');
         ContentKeyCheck::assert($keys, $store, $scope, tenantBound: $scopes !== null);
+    }
+
+    /**
+     * The same decorator over a base facade minting proxy URLs through another
+     * generator — core's {@see Storage::withProxyUrls()}, reachable when
+     * `StorageInterface` resolves to this class. A link minted outside the
+     * tenant's request (queue job, mail) needs one pinned to the file's tenant,
+     * e.g. `-web`'s `HmacProxyUrlGenerator::forScope($tenantId)`. The ledger,
+     * the store and every other collaborator are shared with this instance.
+     *
+     * @throws InvalidConfigException When the wrapped facade is neither core's
+     *         `Storage` nor another `DeduplicatingStorage`: it cannot swap its
+     *         generator, and minting through the unpinned one would hand out a
+     *         link that answers 404 — so it is refused by name instead.
+     */
+    public function withProxyUrls(?ProxyUrlGeneratorInterface $proxyUrls): self
+    {
+        if (!$this->unique instanceof Storage && !$this->unique instanceof self) {
+            throw new InvalidConfigException(
+                'withProxyUrls() needs the wrapped facade to be ' . Storage::class . ' or another '
+                . self::class . '; ' . $this->unique::class . ' cannot change its proxy URL generator',
+            );
+        }
+
+        return new self(
+            unique: $this->unique->withProxyUrls($proxyUrls),
+            ledger: $this->ledger,
+            store: $this->store,
+            keys: $this->keys,
+            mimeTypeDetector: $this->mimeTypeDetector,
+            idGenerator: $this->idGenerator,
+            policies: $this->policies,
+            clock: $this->clock,
+            scope: $this->scope,
+            dedupMaxBytes: $this->dedupMaxBytes,
+            reservationTtl: $this->reservationTtl,
+            deleteGracePeriod: $this->deleteGracePeriod,
+            defaultGroup: $this->defaultGroup,
+            scopes: $this->scopes,
+            extensions: $this->extensions,
+            stores: $this->stores,
+        );
     }
 
     #[Override]
