@@ -29,8 +29,11 @@ delete. Namespace `Rasuvaeff\Yii3FilestorageDb\`. Full API reference:
    `scope_id IS NULL`, which is what an unscoped application's rows carry. A
    *bound* provider returning null is refused with `MissingScopeException` —
    never turn that into "no predicate". The only exception is the explicit
-   `allowGlobalAccess` opt-in for maintenance entry points, and even then a new
-   row needs a tenant. Content keys (`DeduplicatingStorage`,
+   maintenance opt-in — param `globalMaintenanceAccess`, which `config/di.php`
+   applies only to the `MaintenanceRepositoryInterface` and
+   `BlobLedgerInterface` bindings (console params are shared with queue
+   workers, so it must never reach `RepositoryInterface`/`DbRepository`) — and
+   even then a new row needs a tenant. Content keys (`DeduplicatingStorage`,
    `filestorage:deduplicate`) refuse a null from a bound provider regardless.
 
 3. **Never delete shared bytes inside a request.** `releaseFile()` and
@@ -119,9 +122,14 @@ delete. Namespace `Rasuvaeff\Yii3FilestorageDb\`. Full API reference:
 - SQLite is not enough for the ledger: it accepts `select('1')` (MySQL/PostgreSQL
   read it as a column) and reports matched rows where MySQL reports changed ones.
   Every new ledger statement goes into `tests/Integration/CrossDatabaseMigrationTest`
-  (`FILESTORAGE_TEST_DB=mysql|pgsql`), which CI runs on MySQL 8.4 and PostgreSQL;
-  `LedgerConcurrencyTest` runs there with two connections, MySQL under
-  `NO_BACKSLASH_ESCAPES,ANSI_QUOTES`.
+  (`FILESTORAGE_TEST_DB=mysql|mariadb|pgsql`), which CI runs on MySQL 8.4,
+  MariaDB 11.8 and PostgreSQL; `LedgerConcurrencyTest` runs there with two
+  connections, MySQL-family under `NO_BACKSLASH_ESCAPES,ANSI_QUOTES`.
+- Every ledger transaction goes through `DbBlobLedger::transaction()`: READ
+  COMMITTED on the MySQL driver, because MariaDB 11.6.2+ fails a REPEATABLE READ
+  read-then-update with error 1020. Never call `$db->transaction()` directly
+  there.
 - MySQL's default collation is case- and accent-insensitive. Anything compared
-  as an identifier (`scope_id`) is `utf8mb4_bin` there; paths are compared
-  exactly in PHP.
+  as an identifier (`scope_id`) is a binary NO PAD collation there
+  (`utf8mb4_0900_bin` / MariaDB `utf8mb4_nopad_bin` — not `utf8mb4_bin`, which
+  ignores trailing spaces); paths are compared exactly in PHP.

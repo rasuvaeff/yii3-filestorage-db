@@ -25,8 +25,12 @@ backend's) or `FileScopeProviderInterface` (the application's).
    (`MissingScopeException`) by every `DbRepository` method,
    `DeduplicatingStorage::add()` and `filestorage:deduplicate` — it is a tenant
    that did not resolve, not "all tenants". The only global access with a
-   provider bound is `allowGlobalAccess: true` (constructor / params), for
-   maintenance entry points; a new row still needs a tenant.
+   provider bound is the param `globalMaintenanceAccess: true`, which reaches
+   only the `MaintenanceRepositoryInterface` and `BlobLedgerInterface`
+   bindings (what core's gc/stat/verify/backfill-hash resolve) — never
+   `RepositoryInterface`, `DbRepository`, `DbBlobLedger` or the deduplicating
+   storage, so queue workers sharing console params stay refused. By hand:
+   `new DbRepository(allowGlobalAccess: true)`. A new row still needs a tenant.
 3. **`scope_id = null` is a scope** in `DbScopedFileResolver`, matching
    `scope_id IS NULL`. An unscoped token is not a wildcard.
 4. **Shared bytes are never deleted inside a request.** `releaseFile()` only
@@ -34,7 +38,10 @@ backend's) or `FileScopeProviderInterface` (the application's).
    `completeDeletion()` → purge (restore when refused) — `filestorage:gc`.
    Never `deleteObject()` before `completeDeletion()`.
 5. **Ledger guards live in the statement that acts**, and the decision is the
-   affected-row count. Never `SELECT` then `UPDATE`.
+   affected-row count. Never `SELECT` then `UPDATE`. The ledger's own
+   transactions run at READ COMMITTED on the MySQL driver (MariaDB 11.6.2+
+   fails a REPEATABLE READ read-then-update with error 1020); inside an
+   application transaction that 1020 is a `LedgerException`.
 6. **The ledger writes file rows through `DbRepository`, never itself.** Its
    own `DELETE ... WHERE id = :id` would bypass the tenant predicate.
 7. **`yiisoft/db-migration` ^2.1**, not ^2.0: on 2.0.x `setSourceNamespaces()`
@@ -59,8 +66,10 @@ MigrationService::class => [
 sweep: MySQL `relative_path(191)` prefix, PostgreSQL `varchar_pattern_ops` (a
 plain btree is not used for `LIKE 'x%'` under a non-`C` collation).
 `M261128000000MakeFilestorageFileScopeIdCaseSensitive` (0.4.0) → `scope_id` in
-`utf8mb4_bin` on MySQL/MariaDB (their default collations ignore case and
-accents); no-op elsewhere.
+a binary NO PAD collation on MySQL/MariaDB (`utf8mb4_0900_bin` on MySQL
+8.0.17+, `utf8mb4_nopad_bin` on MariaDB; `RuntimeException` on older MySQL):
+case, accents and trailing spaces count (`utf8mb4_bin` is PAD SPACE). Rebuilds
+the table (writes wait), needs `ROW_FORMAT=DYNAMIC`; no-op elsewhere.
 
 No `reference_count` column: a reference is a `filestorage_file` row with the
 blob's id, and guards ask `NOT EXISTS`. No foreign keys.
@@ -73,7 +82,7 @@ blob's id, and guards ask `NOT EXISTS`. No foreign keys.
     'blobTable' => 'filestorage_blob',
     'blobReservationTable' => 'filestorage_blob_reservation',
     'tablePrefix' => '',   // prepended to all three
-    'allowGlobalAccess' => false,   // maintenance entry points only: null scope = every tenant
+    'globalMaintenanceAccess' => false,   // true: null scope = every tenant, maintenance keys only
 ],
 ```
 
@@ -88,7 +97,7 @@ new DbRepository(
     ConnectionInterface $db,
     FileTableName $table = new FileTableName(),
     ?FileScopeProviderInterface $scopes = null,   // unbound = single tenant
-    bool $allowGlobalAccess = false,              // bound + null: refuse (default) or every tenant
+    bool $allowGlobalAccess = false,              // bound + null: refuse (default) or every tenant; DI sets it only on the maintenance bindings
 );
 
 $repository->find(string $id): ?File;
@@ -183,7 +192,8 @@ the key generator's keys do not fit the store's layout (core's
 `LayoutCompatibility::assertContentKeys()`), or when a scope provider is bound,
 the scope is not `Global` and the generator leaves the tenant out of the key
 (`FlatSha256KeyGenerator` with a prefix); `InvalidArgumentException` for a zero or negative `reservationTtl` /
-`deleteGracePeriod`.
+`deleteGracePeriod`. The last two checks run in `DeduplicatingStorage`'s own
+constructor, so `new DeduplicatingStorage(...)` is refused the same way.
 
 Content key: `ContentAddressedKeyGeneratorInterface::generate(scope, sha256,
 extension)` — the factory's optional `keys` (default `Sha256KeyGenerator`,

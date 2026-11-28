@@ -74,10 +74,16 @@ MySQL он индексирует первые 191 символ пути, на P
 (store_name, relative_path varchar_pattern_ops)` — миграция использует
 `IF NOT EXISTS` и тогда только отметит себя применённой.
 
-`M261128000000…` (0.4.0) переводит `filestorage_file.scope_id` в `utf8mb4_bin`
-на MySQL и MariaDB, чьи collation по умолчанию считают `Acme`, `acme` и `Acmé`
-одним тенантом. Сравнение только становится строже, поэтому на существующих
-строках миграция упасть не может; на SQLite и PostgreSQL она ничего не делает.
+`M261128000000…` (0.4.0) переводит `filestorage_file.scope_id` в бинарную NO
+PAD collation на MySQL и MariaDB, чьи collation по умолчанию считают `Acme`,
+`acme` и `Acmé` одним тенантом: `utf8mb4_0900_bin` на MySQL 8.0.17+,
+`utf8mb4_nopad_bin` на MariaDB. Не `utf8mb4_bin` — она PAD SPACE и сделала бы
+`acme ` и `acme` одним тенантом, чего дефолт MySQL 8 никогда не делал. В MySQL
+старше 8.0.17 такой collation нет, и миграция там бросает исключение. Сравнение
+только становится строже, поэтому на существующих строках миграция упасть не
+может; на SQLite и PostgreSQL она ничего не делает. На MySQL и MariaDB она
+пересобирает таблицу и на это время блокирует запись в неё — см.
+[UPGRADE.md](UPGRADE.md).
 
 > **`yiisoft/db-migration` ^2.1 — жёсткое требование.** На 2.0.x ровно эта
 > регистрация молча не находила ничего: резолв namespace принимал *соседний*
@@ -97,7 +103,7 @@ return [
         'blobTable' => 'filestorage_blob',
         'blobReservationTable' => 'filestorage_blob_reservation',
         'tablePrefix' => '',
-        'allowGlobalAccess' => false,
+        'globalMaintenanceAccess' => false,
     ],
 ];
 ```
@@ -105,14 +111,18 @@ return [
 Префикс подставляется ко всем трём именам. Имена валидируются типизированными
 VO — `FileTableName`, `BlobTableName`, `BlobReservationTableName`, — которые
 миграции резолвят из контейнера, поэтому схема и запросы не могут разойтись в
-имени. `allowGlobalAccess` — opt-in для обслуживания, описанный в разделе
-[Тенантный scope](#тенантный-scope).
+имени. `globalMaintenanceAccess` — opt-in для обслуживания, описанный в
+разделе [Тенантный scope](#тенантный-scope).
 
 ## Тенантный scope
 
 Забиндите `FileScopeProviderInterface` — и каждый запрос пакета получит
 предикат по `scope_id`. Не биндите — установка однотенантная: ни предиката, ни
-накладных расходов. Колонка сравнивается побайтно, на MySQL тоже.
+накладных расходов. Колонка сравнивается побайтно, на MySQL и MariaDB тоже —
+регистр, акценты и хвостовые пробелы значимы: `Acme`, `acme` и `acme ` — три
+тенанта. Миграция `M261128…` даёт `scope_id` бинарную NO PAD collation
+(`utf8mb4_0900_bin` на MySQL 8.0.17+, `utf8mb4_nopad_bin` на MariaDB; более
+старый MySQL получает отказ, см. [UPGRADE.md](UPGRADE.md)).
 
 ```php
 // config/common/di/filestorage.php
@@ -143,21 +153,31 @@ return [
 завершается с ошибкой), а не снимают предикат. До 0.4.0 предикат там молча
 снимался, и `find()`/`remove()` доставали строки всех тенантов.
 
-**Глобальный доступ — явный opt-in и только для обслуживания.** Точка входа
-обслуживания либо оставляет провайдер непривязанным, либо сохраняет его и
-включает `allowGlobalAccess` — тогда null-scope означает «все тенанты» для
-чтения, обновления и удаления (новой строке тенант всё равно нужен). Команды
-ядра `filestorage:gc`, `stat`, `verify` и `backfill-hash` читают через этот
-репозиторий, поэтому мультитенантная cron-задача, где тенант не определился,
-теперь падает, пока её точка входа не сделает одно из двух — см.
+**Глобальный доступ — явный opt-in и только для обслуживания.** Команды ядра
+`filestorage:gc`, `stat`, `verify` и `backfill-hash` (и
+`filestorage:images:warm` из `-images`) читают через
+`MaintenanceRepositoryInterface`, поэтому мультитенантная cron-задача, где
+тенант не определился, падает, пока её точка входа не оставит провайдер
+непривязанным или не включит `globalMaintenanceAccess` — см.
 [UPGRADE.md](UPGRADE.md):
 
 ```php
-// собственные params консольной точки входа, никогда не веб-точки
+// config/console/params.php
 return [
-    'rasuvaeff/yii3-filestorage-db' => ['allowGlobalAccess' => true],
+    'rasuvaeff/yii3-filestorage-db' => ['globalMaintenanceAccess' => true],
 ];
 ```
+
+Тогда null-scope означает «все тенанты» для чтения, обновления и удаления
+(новой строке тенант всё равно нужен) — но только через два ключа, которые
+резолвят эти команды: `MaintenanceRepositoryInterface` и `BlobLedgerInterface`
+(`gc` освобождает просроченные строки через реестр). `RepositoryInterface`,
+`DbRepository`, `DbBlobLedger` и дедуплицирующее хранилище по-прежнему
+отказывают. Поэтому консольные params — безопасное место для флага: Yii3 делит
+их между всеми консольными процессами, включая воркеры очередей, и воркер без
+тенанта по-прежнему получает `MissingScopeException`, а не строки всех
+тенантов. Собрать `DbRepository(allowGlobalAccess: true)` вручную — тот же
+opt-in, но без этой ограды.
 
 **Для определившегося тенанта метода, обходящего предикат, нет.** Ни для
 скачивания, ни для обслуживания. У подписанной загрузки нет окружающего
@@ -173,7 +193,7 @@ $file = $resolver->findInScope($payload->fileId, $payload->scopeId);
 `null` — это scope, а не его отсутствие: он матчится в `scope_id IS NULL`,
 именно это лежит в строках приложения без тенантов. Токен без scope никогда не
 становится wildcard — резолвер и репозиторий согласны, что null не означает
-«все тенанты», если этого не сказал `allowGlobalAccess`.
+«все тенанты», если этого не сказал opt-in обслуживания.
 
 ## Дедупликация
 
@@ -222,16 +242,21 @@ $ledger->expireReservations($now, $deleteAfter);         // сначала см�
 
 while ($lease = $ledger->claimForDeletion($now, $now->add($leaseTtl))) {
     try {
+        // null, если ни одного члена blob уже не было
         $entry = $store->quarantine($store->layout()->deletion($lease->blob->object), $now);
-    } catch (StoreException) {
+    } catch (StoreException|\InvalidArgumentException) {
+        // InvalidArgumentException: раскладка отказала ключу — ошибка
+        // конфигурации, которая тоже не должна обрывать прогон
         $ledger->abandonDeletion($lease, $retryAfter);   // backoff, строка остаётся
 
         continue;
     }
 
     if ($ledger->completeDeletion($lease)) {             // откажет, если blob ожил
-        $store->purge($entry);
-    } else {
+        if ($entry !== null) {
+            $store->purge($entry);
+        }
+    } elseif ($entry !== null) {
         $store->restore($entry);                         // сохранит повторную публикацию писателя
     }
 }
@@ -284,7 +309,24 @@ return [
 по одному (`LayoutCompatibility` ядра, см. ниже); и — при привязанном
 `FileScopeProviderInterface` и области, отличной от `Global`, — генератор
 ключей, выбрасывающий арендатора из ключа: он разделил бы байты между
-арендаторами в области, которая обещает этого не делать.
+арендаторами в области, которая обещает этого не делать. Последние две проверяет
+сам конструктор `DeduplicatingStorage`, так что хранилище, собранное без
+фабрики, получает тот же отказ (`InvalidConfigException`).
+
+**Изоляция на MySQL и MariaDB.** Реестр читает строку blob и затем обновляет её
+под guard, который перепроверяет строку, поэтому свои транзакции он выполняет
+как `READ COMMITTED` на драйвере MySQL, каким бы ни был уровень сессии. Под
+REPEATABLE READ MariaDB 11.6.2+ с `innodb_snapshot_isolation=ON` (её дефолт)
+отвечает на такой `UPDATE` ошибкой 1020 «Record has changed since last read»,
+если другое соединение изменило строку в промежутке, — две одновременные
+загрузки одного файла или удаление файла во время загрузки тех же байтов.
+Внутри транзакции, которую открыли вы, уровень задать нельзя (`yiisoft/db`
+задаёт его только для внешней транзакции): там ошибка 1020 приходит как
+`LedgerException` с названной причиной — `AddException`/`RemoveException` из
+`DeduplicatingStorage`, — и вы повторяете свою транзакцию или открываете её с
+`READ COMMITTED`. PostgreSQL и так по умолчанию `READ COMMITTED`; SQLite не
+трогается. Запись под `READ COMMITTED` требует `binlog_format` `ROW` или
+`MIXED` (дефолты MySQL и MariaDB), а не `STATEMENT`.
 
 Ключ содержимого строит `ContentAddressedKeyGeneratorInterface` ядра
 (`Sha256KeyGenerator`, если ничего не привязано), и он получает расширение
@@ -416,7 +458,7 @@ content-ключе, распознаётся и пропускается. Про
 подмешивает ту же область — поэтому multi-tenant установка запускает это по
 разу на арендатора, устанавливая арендатора так же, как это делают остальные её
 CLI-задачи. Действующая область печатается до начала работы, а привязанный
-провайдер без тенанта получает отказ — даже при `allowGlobalAccess`, который
+провайдер без тенанта получает отказ — даже при opt-in обслуживания, который
 слил бы строки всех тенантов в один пул. Если провайдер **не** привязан, команда
 не различает арендаторов, поэтому отказывается, пока хоть одна строка несёт
 `scope_id` (`DbRepository::hasTenantRows()`), — кроме `--scope=global`, который

@@ -20,8 +20,9 @@ table-name value objects `FileTableName` / `BlobTableName` /
 `BlobRowId`, `PositiveInterval` and `ContentKeyCheck` are `@internal`.
 
 DI wiring: `config/di.php` binds the four contracts above, the three table
-names, `DeduplicatingStorageFactory` and `Command\DeduplicateCommand`;
-`config/params.php` names the command under `yiisoft/yii-console`. It must
+names, `DbRepository`/`DbBlobLedger` by class (the scoped hot-path pair the
+factory and the command take), `DeduplicatingStorageFactory` and
+`Command\DeduplicateCommand`; `config/params.php` names the command under `yiisoft/yii-console`. It must
 **not** bind `StorageInterface` (core's), `StoreInterface` (a store backend's) or `FileScopeProviderInterface` (the application's) —
 `yiisoft/config` allows exactly one vendor package per key, and two packages
 claiming one is a `Duplicate key` error by design.
@@ -41,7 +42,11 @@ claiming one is a `Duplicate key` error by design.
    download uses `DbScopedFileResolver`; turning the filter off for downloads
    reads any file whose id leaks. A bound provider returning null is refused
    (`MissingScopeException`), never read as "no predicate"; the one global
-   path is the explicit `allowGlobalAccess` maintenance opt-in.
+   path is the explicit maintenance opt-in: the `globalMaintenanceAccess`
+   param, which `config/di.php` applies only to the
+   `MaintenanceRepositoryInterface` and `BlobLedgerInterface` bindings.
+   Console params are shared with queue workers, so it must never reach
+   `RepositoryInterface`, `DbRepository` or the deduplicating storage.
 4. **Preserve the public contract.** Update `README.md` **and `README.ru.md`**,
    `llms.txt` and the tests with any API change.
 
@@ -64,9 +69,9 @@ make release-check
 `composer:2` container because the base image has no coverage driver.
 
 `tests/Integration/CrossDatabaseMigrationTest` runs only when
-`FILESTORAGE_TEST_DB=mysql|pgsql` names a live server (database `filestorage`,
-password `filestorage`; ports via `FILESTORAGE_TEST_MYSQL_PORT` /
-`FILESTORAGE_TEST_PGSQL_PORT`). `composer:2` has neither `pdo_mysql` nor
+`FILESTORAGE_TEST_DB=mysql|mariadb|pgsql` names a live server (database
+`filestorage`, password `filestorage`; ports via `FILESTORAGE_TEST_MYSQL_PORT` /
+`FILESTORAGE_TEST_MARIADB_PORT` (default 3307) / `FILESTORAGE_TEST_PGSQL_PORT`). `composer:2` has neither `pdo_mysql` nor
 `pdo_pgsql` — use an image with them (`FROM composer:2` +
 `docker-php-ext-install pdo_mysql pdo_pgsql`) and `--network host`:
 
@@ -141,8 +146,18 @@ MSI without any test getting worse.
   matched rows (`CLIENT_FOUND_ROWS` is off, and the connection is the
   application's). An `UPDATE` whose decision is its affected count must either
   always change a column (a state or a fresh token) or re-read the row on 0.
-  `CrossDatabaseMigrationTest` drives every ledger statement on both servers in
-  the `database-integration` CI job; a new statement belongs there too (#12).
+  `CrossDatabaseMigrationTest` drives every ledger statement on MySQL, MariaDB
+  and PostgreSQL in the `database-integration` CI job; a new statement belongs
+  there too (#12).
+- **The ledger's transactions run at READ COMMITTED on the MySQL driver**
+  (`DbBlobLedger::transaction()`). MariaDB 11.6.2+ (`innodb_snapshot_isolation`
+  on) fails a REPEATABLE READ read-then-update with error 1020 when another
+  connection changed the row after the snapshot; MySQL never does, so only the
+  `mariadb` CI leg sees it. Inside an application transaction the level cannot
+  be set, and 1020 there becomes a `LedgerException`.
+  `LedgerConcurrencyTest` commits a second writer inside the ledger's
+  transaction through `InterleavingScope` (the repository asks for the scope
+  once per statement).
 - **There is no `reference_count` column, and adding one would be a
   regression.** A reference *is* a `filestorage_file` row carrying the blob's
   id. A denormalised counter is a second source of truth that can drift from

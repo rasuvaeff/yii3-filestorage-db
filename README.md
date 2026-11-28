@@ -71,10 +71,15 @@ busy table create it first with `CREATE INDEX CONCURRENTLY idx_filestorage_file_
 ON filestorage_file (store_name, relative_path varchar_pattern_ops)` — the
 migration uses `IF NOT EXISTS` and then only records itself.
 
-`M261128000000…` (0.4.0) switches `filestorage_file.scope_id` to `utf8mb4_bin`
-on MySQL and MariaDB, whose default collations compare `Acme`, `acme` and
-`Acmé` as one tenant. It only makes comparison stricter, so it cannot fail on
-existing rows; on SQLite and PostgreSQL it does nothing.
+`M261128000000…` (0.4.0) switches `filestorage_file.scope_id` to a binary NO
+PAD collation on MySQL and MariaDB, whose default collations compare `Acme`,
+`acme` and `Acmé` as one tenant: `utf8mb4_0900_bin` on MySQL 8.0.17+,
+`utf8mb4_nopad_bin` on MariaDB. Not `utf8mb4_bin` — that one is PAD SPACE and
+would make `acme ` and `acme` one tenant, a match MySQL 8's default never
+made. MySQL older than 8.0.17 has no such collation and the migration throws
+there. It only makes comparison stricter, so it cannot fail on existing rows;
+on SQLite and PostgreSQL it does nothing. On MySQL and MariaDB it rebuilds the
+table and blocks writes to it meanwhile — see [UPGRADE.md](UPGRADE.md).
 
 > **`yiisoft/db-migration` ^2.1 is a hard requirement.** On 2.0.x this exact
 > registration silently found nothing: namespace resolution matched a
@@ -94,7 +99,7 @@ return [
         'blobTable' => 'filestorage_blob',
         'blobReservationTable' => 'filestorage_blob_reservation',
         'tablePrefix' => '',
-        'allowGlobalAccess' => false,
+        'globalMaintenanceAccess' => false,
     ],
 ];
 ```
@@ -102,14 +107,18 @@ return [
 The prefix is prepended to all three. Names are validated by typed value
 objects — `FileTableName`, `BlobTableName`, `BlobReservationTableName` — which
 the migrations resolve from the container, so the schema and the queries cannot
-disagree about a name. `allowGlobalAccess` is the maintenance opt-in described
-under [Tenant scoping](#tenant-scoping).
+disagree about a name. `globalMaintenanceAccess` is the maintenance opt-in
+described under [Tenant scoping](#tenant-scoping).
 
 ## Tenant scoping
 
 Bind `FileScopeProviderInterface` and every statement this package issues gains
 a `scope_id` predicate. Leave it unbound and the installation is single-tenant:
-no predicate, no cost. The column is compared byte for byte, on MySQL too.
+no predicate, no cost. The column is compared byte for byte, on MySQL and
+MariaDB too — case, accents and trailing spaces count: `Acme`, `acme` and
+`acme ` are three tenants. The `M261128…` migration gives `scope_id` a binary
+NO PAD collation (`utf8mb4_0900_bin` on MySQL 8.0.17+, `utf8mb4_nopad_bin` on
+MariaDB; older MySQL is refused, see [UPGRADE.md](UPGRADE.md)).
 
 ```php
 // config/common/di/filestorage.php
@@ -141,20 +150,30 @@ command, exit with an error) rather than drop the predicate. Before 0.4.0 the
 predicate was silently dropped there, and `find()`/`remove()` reached every
 tenant's rows.
 
-**Global access is an explicit opt-in, for maintenance only.** A maintenance
-entry point either leaves the provider unbound, or keeps it and sets
-`allowGlobalAccess` — then a null scope means "every tenant" for reads,
-updates and deletes (a new row still needs a tenant). Core's `filestorage:gc`,
-`stat`, `verify` and `backfill-hash` read through this repository, so a
-multi-tenant cron job whose tenant does not resolve now throws until its entry
-point does one of the two — see [UPGRADE.md](UPGRADE.md):
+**Global access is an explicit opt-in, for maintenance only.** Core's
+`filestorage:gc`, `stat`, `verify` and `backfill-hash` (and `-images`'
+`filestorage:images:warm`) read through `MaintenanceRepositoryInterface`, so a
+multi-tenant cron job whose tenant does not resolve throws until its entry
+point either leaves the provider unbound, or sets `globalMaintenanceAccess` —
+see [UPGRADE.md](UPGRADE.md):
 
 ```php
-// the console entry point's own params, never the web one's
+// config/console/params.php
 return [
-    'rasuvaeff/yii3-filestorage-db' => ['allowGlobalAccess' => true],
+    'rasuvaeff/yii3-filestorage-db' => ['globalMaintenanceAccess' => true],
 ];
 ```
+
+Then a null scope means "every tenant" for reads, updates and deletes (a new
+row still needs a tenant) — but only through the two keys those commands
+resolve: `MaintenanceRepositoryInterface` and `BlobLedgerInterface` (`gc`
+releases expired rows through the ledger). `RepositoryInterface`,
+`DbRepository`, `DbBlobLedger` and the deduplicating storage keep refusing. That
+is what makes the console params a safe place for it: Yii3 shares them with
+every console process, queue workers included, and a worker without a tenant
+still gets `MissingScopeException`, not every tenant's rows. Constructing
+`DbRepository(allowGlobalAccess: true)` yourself is the same opt-in, without
+that fence.
 
 **No method skips the predicate for a resolved tenant.** Not for downloads, not
 for maintenance. A signed download has no ambient tenant, which is the point of
@@ -170,7 +189,7 @@ $file = $resolver->findInScope($payload->fileId, $payload->scopeId);
 `null` is a scope, not the absence of one: it matches `scope_id IS NULL`, which
 is what an unscoped application's rows carry. An unscoped token is never a
 wildcard — the resolver and the repository agree that null never means "every
-tenant" unless `allowGlobalAccess` says so.
+tenant" unless the maintenance opt-in says so.
 
 ## Deduplication
 
@@ -217,16 +236,21 @@ $ledger->expireReservations($now, $deleteAfter);         // sweep abandoned writ
 
 while ($lease = $ledger->claimForDeletion($now, $now->add($leaseTtl))) {
     try {
+        // null when no member of the blob existed any more
         $entry = $store->quarantine($store->layout()->deletion($lease->blob->object), $now);
-    } catch (StoreException) {
+    } catch (StoreException|\InvalidArgumentException) {
+        // InvalidArgumentException: the layout refused the key — a
+        // configuration mistake, which must not end the run either
         $ledger->abandonDeletion($lease, $retryAfter);   // back off, keep the row
 
         continue;
     }
 
     if ($ledger->completeDeletion($lease)) {             // refuses if the blob was revived
-        $store->purge($entry);
-    } else {
+        if ($entry !== null) {
+            $store->purge($entry);
+        }
+    } elseif ($entry !== null) {
         $store->restore($entry);                         // keeps a writer's re-publication
     }
 }
@@ -280,7 +304,25 @@ with no row; content keys the store's layout cannot delete one by one (core's
 `LayoutCompatibility`, below); and — with a `FileScopeProviderInterface` bound
 and a scope other than `Global` — a key generator that leaves the tenant out of
 the key, which would share bytes across tenants under a scope that promises
-not to.
+not to. The last two are checked by `DeduplicatingStorage`'s own constructor,
+so a storage built without the factory is refused the same way
+(`InvalidConfigException`).
+
+**Isolation on MySQL and MariaDB.** The ledger reads a blob row and then
+updates it under a guard that re-checks the row, so it runs its own
+transactions as `READ COMMITTED` on the MySQL driver whatever the session
+default is. Under REPEATABLE READ, MariaDB 11.6.2+ with
+`innodb_snapshot_isolation=ON` (its default) fails that `UPDATE` with error 1020
+"Record has changed since last read" whenever another connection changed the
+row in between — two simultaneous uploads of one file, or removing a file
+while the same bytes are uploaded. Called inside a transaction you already
+opened, the level cannot be set (`yiisoft/db` sets it only on the outermost
+transaction): there error 1020 surfaces as a `LedgerException` naming the
+cause — an `AddException`/`RemoveException` from `DeduplicatingStorage` — and
+you retry your transaction or run it at `READ COMMITTED`. PostgreSQL already
+defaults to `READ COMMITTED`; SQLite is left alone. Writes under
+`READ COMMITTED` need `binlog_format` `ROW` or `MIXED` (the MySQL and MariaDB
+defaults), not `STATEMENT`.
 
 The content key comes from core's `ContentAddressedKeyGeneratorInterface`
 (`Sha256KeyGenerator` unless one is bound), and it is given the extension of
@@ -411,7 +453,7 @@ filters by whatever `FileScopeProviderInterface` reports, and the content key
 mixes that same scope in — so a multi-tenant installation runs this once per
 tenant, with the tenant established the way its other CLI jobs establish it. The
 scope in force is printed before any work starts, and a bound provider with no
-tenant is refused — even under `allowGlobalAccess`, which would page every
+tenant is refused — even under the maintenance opt-in, which would page every
 tenant's rows into one pool. With **no** provider bound the command cannot tell
 tenants apart, so it refuses while any row carries a `scope_id`
 (`DbRepository::hasTenantRows()`), unless `--scope=global` pools them on purpose.
