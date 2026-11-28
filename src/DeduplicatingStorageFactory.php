@@ -101,8 +101,9 @@ final readonly class DeduplicatingStorageFactory
             );
         }
 
+        // the content-key checks run in DeduplicatingStorage's constructor,
+        // so a storage built without this factory gets them too
         $keys = $this->keys ?? new Sha256KeyGenerator();
-        ContentKeyCheck::assert($keys, $store, $scope, tenantBound: $this->scopes !== null);
 
         return new DeduplicatingStorage(
             unique: $this->unique,

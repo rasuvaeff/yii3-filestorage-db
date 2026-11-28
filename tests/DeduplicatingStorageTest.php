@@ -50,6 +50,7 @@ use Rasuvaeff\Yii3FilestorageDb\Tests\Support\NoMimeTypeDetector;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\SlashRefusingKeyGenerator;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\SpyStream;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\SqliteDatabase;
+use Rasuvaeff\Yii3FilestorageDb\Tests\Support\UnreadableLedger;
 use Rasuvaeff\Yii3FilestorageDb\Tests\Support\UnsizedStream;
 use Testo\Assert;
 use Testo\Codecov\Covers;
@@ -669,6 +670,48 @@ final class DeduplicatingStorageTest
         )->create();
     }
 
+    /**
+     * Review pass 2 N-B3: the constructor is public, and the checks used to
+     * live only in the factory and the command. Built directly, a flat key
+     * generator on the directory layout wrote blobs `gc` can never collect,
+     * and a tenant-dropping one pooled every tenant without a signal.
+     */
+    public function theConstructorRefusesAFlatKeyGeneratorOnTheDirectoryLayout(): void
+    {
+        Expect::exception(InvalidConfigException::class)->withMessageContaining('cannot share a store');
+
+        $this->direct(store: $this->store, keys: new FlatSha256KeyGenerator());
+    }
+
+    public function theConstructorRefusesAGeneratorThatIgnoresTheTenant(): void
+    {
+        Expect::exception(InvalidConfigException::class)->withMessageContaining('ignores the tenant');
+
+        $store = $this->flatStores()->get('upload');
+        Assert::instanceOf($store, ContentAddressableStoreInterface::class);
+        $this->direct(
+            store: $store,
+            keys: new FlatSha256KeyGenerator(prefix: 'blobs'),
+            scopes: new FixedScope('tenant-a'),
+        );
+    }
+
+    /**
+     * Review pass 2 N-C3: the ledger is read once more after the row is gone,
+     * to tell a shared blob from a unique object. A failure there escaped as
+     * the raw driver exception instead of the promised `RemoveException`.
+     */
+    public function aLedgerFailingAfterTheReleaseIsARemoveException(): void
+    {
+        $ledger = new DbBlobLedger($this->database->db, $this->repository, new StaticClock($this->at('00:00')));
+        $storage = $this->direct(store: $this->store, keys: new \Rasuvaeff\Yii3Filestorage\Path\Sha256KeyGenerator(), ledger: new UnreadableLedger($ledger));
+        $file = $this->storage->add($this->upload('hello'));
+
+        Expect::exception(RemoveException::class);
+
+        $storage->remove($file->id);
+    }
+
     public function aGeneratorRefusingTheTenantProbeIsAConfigurationError(): void
     {
         Expect::exception(InvalidConfigException::class)
@@ -764,6 +807,28 @@ final class DeduplicatingStorageTest
             scopes: $scopes,
             keys: $keys,
             extensions: $extensions,
+        );
+    }
+
+    private function direct(
+        ContentAddressableStoreInterface $store,
+        ContentAddressedKeyGeneratorInterface $keys,
+        ?FixedScope $scopes = null,
+        ?BlobLedgerInterface $ledger = null,
+    ): DeduplicatingStorage {
+        $clock = new StaticClock($this->at('00:00'));
+        $stores = new StoreRegistry([$store]);
+
+        return new DeduplicatingStorage(
+            unique: $this->baseStorage($stores, $this->repository),
+            ledger: $ledger ?? new DbBlobLedger($this->database->db, $this->repository, $clock),
+            store: $store,
+            keys: $keys,
+            mimeTypeDetector: new FinfoMimeTypeDetector(),
+            idGenerator: new Uuid7IdGenerator($clock),
+            policies: new PolicyRegistry(),
+            clock: $clock,
+            scopes: $scopes,
         );
     }
 

@@ -11,6 +11,7 @@ use Psr\Clock\ClockInterface;
 use Psr\Http\Message\StreamInterface;
 use Rasuvaeff\Yii3Filestorage\Exception\AddException;
 use Rasuvaeff\Yii3Filestorage\Exception\BlobBusyException;
+use Rasuvaeff\Yii3Filestorage\Exception\InvalidConfigException;
 use Rasuvaeff\Yii3Filestorage\Exception\RemoveException;
 use Rasuvaeff\Yii3Filestorage\Exception\UploadSizeException;
 use Rasuvaeff\Yii3Filestorage\File;
@@ -87,6 +88,12 @@ final readonly class DeduplicatingStorage implements StorageInterface
      *        `filestorage:gc --orphans`.
      *
      * @throws \InvalidArgumentException When an interval is not positive.
+     * @throws InvalidConfigException When the key generator's keys do not fit
+     *         the store's layout, or — with a scope provider bound and a scope
+     *         other than `Global` — leave the tenant out. Checked here, not
+     *         only in {@see DeduplicatingStorageFactory}: built directly, such
+     *         a pair writes blobs `filestorage:gc` can never collect, or pools
+     *         every tenant without a signal.
      */
     public function __construct(
         private StorageInterface $unique,
@@ -108,6 +115,7 @@ final readonly class DeduplicatingStorage implements StorageInterface
     ) {
         PositiveInterval::require($reservationTtl, 'reservationTtl');
         PositiveInterval::require($deleteGracePeriod, 'deleteGracePeriod');
+        ContentKeyCheck::assert($keys, $store, $scope, tenantBound: $scopes !== null);
     }
 
     #[Override]
@@ -196,18 +204,20 @@ final readonly class DeduplicatingStorage implements StorageInterface
             return $released;
         }
 
-        // Decided on the path the row was read with. A shared row's path is a
-        // ledger blob, and those bytes belong to the collector. A row that
-        // `filestorage:deduplicate` repointed between the read and the
-        // release was read at its old unique path — an orphan from that moment
-        // on, so deleting it is what the sweep would have done later.
-        if ($this->ledger->find(BlobId::create($file->storeName, $file->relativePath)) !== null) {
-            return true;
-        }
-
         try {
-            // inside the try: the row is already gone, so a store the
-            // registry no longer knows is this remove failing, too
+            // Decided on the path the row was read with. A shared row's path
+            // is a ledger blob, and those bytes belong to the collector. A row
+            // that `filestorage:deduplicate` repointed between the read and
+            // the release was read at its old unique path — an orphan from
+            // that moment on, so deleting it is what the sweep would have done
+            // later.
+            if ($this->ledger->find(BlobId::create($file->storeName, $file->relativePath)) !== null) {
+                return true;
+            }
+
+            // inside the try: the row is already gone, so a ledger that cannot
+            // be read, or a store the registry no longer knows, is this remove
+            // failing, too
             $store = $this->stores?->get($file->storeName)
                 ?? ($file->storeName === $this->store->name() ? $this->store : null);
             $store?->delete($file);
