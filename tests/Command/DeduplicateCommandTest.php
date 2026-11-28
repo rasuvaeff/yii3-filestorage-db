@@ -838,6 +838,7 @@ final class DeduplicateCommandTest
 
         Assert::same($tester->getStatusCode(), Command::FAILURE);
         Assert::string($this->display($tester))->contains('ignores the tenant');
+        Assert::string($this->display($tester))->contains('choose the "global" scope to share across tenants on purpose');
         Assert::same($global->getStatusCode(), Command::SUCCESS);
     }
 

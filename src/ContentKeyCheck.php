@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 namespace Rasuvaeff\Yii3FilestorageDb;
 
-use InvalidArgumentException;
 use Rasuvaeff\Yii3Filestorage\Exception\InvalidConfigException;
 use Rasuvaeff\Yii3Filestorage\Path\ContentAddressedKeyGeneratorInterface;
 use Rasuvaeff\Yii3Filestorage\Store\Layout\LayoutCompatibility;
@@ -20,7 +19,10 @@ use Rasuvaeff\Yii3Filestorage\Store\StoreInterface;
  * 2. It drops the tenant from the key — `FlatSha256KeyGenerator` with a
  *    prefix — while a provider is bound and the scope keeps tenants apart.
  *    Every tenant would then share one pool, which is the content-existence
- *    oracle {@see DedupScope} documents.
+ *    oracle {@see DedupScope} documents. Core's
+ *    {@see LayoutCompatibility::tenantProblem()} probes it with the scope
+ *    strings this package really generates for two tenants; whether sharing
+ *    is intended (`DedupScope::Global`) only this package knows.
  *
  * Shared by {@see DeduplicatingStorageFactory} and
  * {@see Command\DeduplicateCommand}, which must refuse the same pairs.
@@ -30,7 +32,6 @@ use Rasuvaeff\Yii3Filestorage\Store\StoreInterface;
 final readonly class ContentKeyCheck
 {
     private const string PROBE_GROUP = 'probe';
-    private const string PROBE_DIGEST = 'abcd0000000000000000000000000000000000000000000000000000000000ef';
 
     private function __construct() {}
 
@@ -49,25 +50,16 @@ final readonly class ContentKeyCheck
             return;
         }
 
-        try {
-            $first = $keys->generate($scope->keyFor(self::PROBE_GROUP, 'tenant-a'), self::PROBE_DIGEST, 'jpg');
-            $second = $keys->generate($scope->keyFor(self::PROBE_GROUP, 'tenant-b'), self::PROBE_DIGEST, 'jpg');
-        } catch (InvalidArgumentException $e) {
-            throw new InvalidConfigException(
-                'Content-addressed key generator ' . $keys::class . " refused a probe key: {$e->getMessage()}",
-                0,
-                $e,
-            );
-        }
-
-        if ($first === $second) {
+        $problem = LayoutCompatibility::tenantProblem(
+            $keys,
+            $scope->keyFor(self::PROBE_GROUP, 'tenant-a'),
+            $scope->keyFor(self::PROBE_GROUP, 'tenant-b'),
+        );
+        if ($problem !== null) {
             throw new InvalidConfigException(sprintf(
-                'Content-addressed key generator %s ignores the tenant: two tenants\' identical bytes both get '
-                    . '"%s", so the "%s" scope would share them across tenants. Use a generator that keeps the '
-                    . 'scope in the key, or choose the "%s" scope to share across tenants on purpose',
-                $keys::class,
-                $first,
-                $scope->value,
+                '%s. Use a generator that keeps the scope in the key, or choose the "%s" scope to share across '
+                    . 'tenants on purpose',
+                $problem,
                 DedupScope::Global->value,
             ));
         }

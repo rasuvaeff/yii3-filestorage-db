@@ -658,7 +658,9 @@ final class DeduplicatingStorageTest
      */
     public function aGeneratorThatIgnoresTheTenantIsRefusedUnderATenantScope(): void
     {
-        Expect::exception(InvalidConfigException::class)->withMessageContaining('ignores the tenant');
+        Expect::exception(InvalidConfigException::class)->withMessageContaining(
+            'ignores the tenant: identical bytes under the scopes "sha/',
+        );
 
         $this->factory(
             stores: $this->flatStores(),
@@ -670,7 +672,7 @@ final class DeduplicatingStorageTest
     public function aGeneratorRefusingTheTenantProbeIsAConfigurationError(): void
     {
         Expect::exception(InvalidConfigException::class)
-            ->withMessageContaining(SlashRefusingKeyGenerator::class . ' refused a probe key: Nested scope');
+            ->withMessageContaining(SlashRefusingKeyGenerator::class . ' refused a probe scope: Nested scope');
 
         $this->factory(scopes: new FixedScope('tenant-a'), keys: new SlashRefusingKeyGenerator())->create();
     }

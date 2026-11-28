@@ -214,9 +214,12 @@ MSI without any test getting worse.
 - **The factory and the command refuse the same key generators, through one
   class.** `ContentKeyCheck` runs core's `LayoutCompatibility::assertContentKeys()`
   (flat keys under `DirectoryLayout` delete their `ab/cd/` neighbours) and, with
-  a provider bound and a scope other than `Global`, probes two tenants with one
-  digest — equal keys mean the generator drops the tenant and the scope's
-  separation is fake. Without a provider the command also refuses a table with
+  a provider bound and a scope other than `Global`, core's
+  `LayoutCompatibility::tenantProblem()` with the scope strings this package
+  really generates (`DedupScope::keyFor('probe', 'tenant-a'|'tenant-b')`) — one
+  digest, equal keys mean the generator drops the tenant and the scope's
+  separation is fake. Do not grow a local copy of the probe; only the
+  `Global` exemption and the hint are this package's. Without a provider the command also refuses a table with
   tenant rows (`DbRepository::hasTenantRows()`): it cannot see `scope_id`, and
   would pool every tenant. Tests that use flat keys need a `FlatSiblingLayout`
   store.
