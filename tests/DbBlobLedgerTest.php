@@ -967,8 +967,13 @@ final class DbBlobLedgerTest
             $this->reserveWith($this->ledgerOver($connection));
             Assert::fail('Expected LedgerException');
         } catch (LedgerException $e) {
-            Assert::string($e->getMessage())->contains('MariaDB error 1020');
-            Assert::string($e->getMessage())->contains('READ COMMITTED');
+            Assert::same(
+                $e->getMessage(),
+                'A blob row changed after this transaction\'s snapshot (MariaDB error 1020 under REPEATABLE READ):'
+                . ' the ledger was called inside a transaction it does not own. Retry that transaction, or run it'
+                . ' at READ COMMITTED',
+            );
+            Assert::same($e->getCode(), 0);
             Assert::same($e->getPrevious(), $conflict);
             Assert::same($attempts, 1, 'a snapshot conflict is not an insert race to retry');
         }
@@ -1204,5 +1209,93 @@ final class DbBlobLedgerTest
     private function callPrivate(string $method, mixed ...$arguments): mixed
     {
         return (new \ReflectionMethod(DbBlobLedger::class, $method))->invoke($this->ledger, ...$arguments);
+    }
+
+    /**
+     * An unknown blob anywhere in the page is left out, not the end of the
+     * answer: `gc` asks about every object of a quarantine entry at once, and
+     * a blob after the unknown one is still referenced.
+     */
+    public function findManyAnswersPastAnUnknownBlob(): void
+    {
+        $this->ledger->commit($this->reserve(), SqliteDatabase::file('a'));
+        $unknown = BlobId::create('upload', 'sha/ff/ff/original');
+
+        $records = $this->ledger->findMany([$unknown, $this->blob()]);
+
+        Assert::same(array_keys($records), [$this->blob()->key()]);
+    }
+
+    /**
+     * Two collectors died mid-delete. A writer joining one of the expired
+     * deletions takes that blob back and leaves the other one leased — still
+     * the stale collector's to finish or the next one's to steal.
+     */
+    public function joiningAnExpiredDeletionTakesBackOnlyThatBlob(): void
+    {
+        $this->ledger->release($this->reserve(), $this->at('01:00'));
+        $this->ledger->release($this->reserveOther(), $this->at('01:00'));
+        Assert::instanceOf($this->ledger->claimForDeletion($this->at('01:00'), $this->at('01:05')), BlobLease::class);
+        Assert::instanceOf($this->ledger->claimForDeletion($this->at('01:00'), $this->at('01:05')), BlobLease::class);
+
+        $later = $this->ledgerAt('01:05');
+        $later->reserve($this->blob(), SqliteDatabase::HASH, 12, $this->at('01:20'));
+
+        Assert::same($later->find($this->blob())?->state, BlobState::Writing);
+        $other = $later->find($this->otherBlob());
+        Assert::same($other?->state, BlobState::Deleting);
+        Assert::equals($other?->leaseExpiresAt, $this->at('01:05'));
+    }
+
+    /**
+     * The re-read that settles a zero affected-row count reads this blob's
+     * row, not whichever row comes first: another blob created earlier and
+     * still `writing` must not make a claimed blob look committable.
+     */
+    public function commitReReadsItsOwnBlobBesideAnEarlierOne(): void
+    {
+        $this->reserveOther();
+        $reservation = $this->reserve();
+        $this->database->db->createCommand()->update(
+            'filestorage_blob',
+            ['state' => BlobState::Deleting->value, 'lease_token' => 'cafebabecafebabe', 'lease_expires_at' => '2026-01-01T01:05:00.000000+00:00'],
+            ['id' => BlobRowId::for($this->blob())],
+        )->execute();
+
+        try {
+            $this->ledger->commit($reservation, SqliteDatabase::file('a'));
+            Assert::fail('Expected LedgerException');
+        } catch (LedgerException $e) {
+            Assert::same(
+                $e->getMessage(),
+                sprintf('Blob "%s" is being deleted; its reservation cannot be committed', $this->blob()->key()),
+            );
+        }
+
+        Assert::null($this->repository->find('a'));
+    }
+
+    /**
+     * Off SQLite the re-read is a locking read (`FOR UPDATE`): inside an
+     * application's REPEATABLE READ transaction a plain SELECT answers from
+     * the snapshot. Driven here with the MySQL driver name over SQLite's
+     * query builder, whose refusal of a `FOR` clause is the evidence that the
+     * lock was asked for.
+     */
+    public function theReReadAsksForARowLockOffSqlite(): void
+    {
+        $connection = new InterceptingConnection($this->database->db);
+        $ledger = $this->ledgerOver($connection);
+        $reservation = $this->reserveWith($ledger);
+        $this->database->db->createCommand()->update(
+            'filestorage_blob',
+            ['state' => BlobState::Deleting->value, 'lease_token' => 'cafebabecafebabe', 'lease_expires_at' => '2026-01-01T01:05:00.000000+00:00'],
+            ['id' => BlobRowId::for($this->blob())],
+        )->execute();
+        $connection->driverName = 'mysql';
+
+        Expect::exception(\Yiisoft\Db\Exception\NotSupportedException::class)->withMessageContaining('FOR clause');
+
+        $ledger->commit($reservation, SqliteDatabase::file('a'));
     }
 }

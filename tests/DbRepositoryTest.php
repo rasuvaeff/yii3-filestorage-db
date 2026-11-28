@@ -260,6 +260,11 @@ final class DbRepositoryTest
         $this->repository->save(SqliteDatabase::file('e', relativePath: 'x!zy/original'));
         Assert::same($this->repository->referencedPaths('upload', ['x!_y']), ['x!_y/original']);
         Assert::same($this->repository->referencedPaths('upload', ['x!']), []);
+
+        // a `!` before an ordinary character would otherwise be read as an
+        // escape of that character, and `a!b` would look for `ab/...`
+        $this->repository->save(SqliteDatabase::file('f', relativePath: 'a!b/original'));
+        Assert::same($this->repository->referencedPaths('upload', ['a!b']), ['a!b/original']);
     }
 
     /**
@@ -715,5 +720,36 @@ final class DbRepositoryTest
         }
 
         return false;
+    }
+
+    /**
+     * An id repeated across more than one statement's worth of ids is still
+     * one file: the list is de-duplicated before it is split into batches.
+     */
+    public function findManyAnswersARepeatedIdOnceAcrossBatches(): void
+    {
+        $this->repository->save(SqliteDatabase::file('a'));
+
+        $files = $this->repository->findMany(array_fill(0, 501, 'a'));
+
+        Assert::same(array_map(static fn(File $file): string => $file->id, $files), ['a']);
+    }
+
+    /**
+     * The refusal says how to get the global view on purpose, in full.
+     */
+    public function theMissingScopeRefusalExplainsTheWayOut(): void
+    {
+        $scoped = new DbRepository($this->database->db, scopes: new FixedScope());
+
+        Expect::exception(MissingScopeException::class)->withMessage(
+            \Rasuvaeff\Yii3Filestorage\Repository\FileScopeProviderInterface::class . ' is bound but returned no '
+            . 'scope, so this repository will not run a statement without a tenant predicate. Establish the '
+            . 'tenant first. A maintenance command that must see every tenant gets it through the '
+            . 'globalMaintenanceAccess parameter (or ' . DbRepository::class . ' with allowGlobalAccess: true), '
+            . 'or runs with the provider unbound',
+        );
+
+        $scoped->find('a');
     }
 }

@@ -379,7 +379,11 @@ final class DeduplicateCommandTest
         ));
 
         Assert::same($tester->execute(['--apply' => true]), Command::FAILURE);
-        Assert::string($this->display($tester))->contains('returned no scope');
+        Assert::string($this->display($tester))->contains($this->normalised(
+            FileScopeProviderInterface::class . ' is bound but returned no scope. This command keys rows by the '
+            . 'tenant in force, so establish the tenant first and run it once per tenant — or, for a '
+            . 'single-tenant installation, leave the provider unbound.',
+        ));
         Assert::same($this->repository->find('a')?->relativePath, $file->relativePath);
         Assert::same($this->store->writeCount(), $writes);
     }
@@ -800,7 +804,11 @@ final class DeduplicateCommandTest
         $tester = $this->run(['--apply' => true]);
 
         Assert::same($tester->getStatusCode(), Command::FAILURE);
-        Assert::string($this->display($tester))->contains('rows belong to tenants');
+        Assert::string($this->display($tester))->contains($this->normalised(
+            'No ' . FileScopeProviderInterface::class . ' is bound, but rows belong to tenants. Run this command '
+            . 'once per tenant with the tenant established, as the application\'s other CLI jobs do, or pass '
+            . '--scope=global to share across tenants on purpose.',
+        ));
         Assert::same($this->repository->find('a')?->relativePath, $acme->relativePath);
         Assert::same($this->repository->find('b')?->relativePath, $beta->relativePath);
         Assert::null($this->ledger->find($this->blobFor('common', 'hello')));
@@ -981,7 +989,12 @@ final class DeduplicateCommandTest
      */
     private function display(CommandTester $tester): string
     {
-        return (string) preg_replace('/[\\s!\\[\\]]+/u', ' ', $tester->getDisplay());
+        return $this->normalised($tester->getDisplay());
+    }
+
+    private function normalised(string $text): string
+    {
+        return (string) preg_replace('/[\\s!\\[\\]]+/u', ' ', $text);
     }
 
     public function theMaxBytesRefusalExplainsWhyZeroIsNotAnAnswer(): void

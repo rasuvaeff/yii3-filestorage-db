@@ -33,6 +33,7 @@ final class ExactCollationTest
         yield 'MariaDB 11.8, even if it listed a 0900 name' => ['11.8.9-MariaDB-ubu2404', '1', 'utf8mb4_nopad_bin'];
         yield 'MariaDB 10.6' => ['10.6.21-MariaDB', '0', 'utf8mb4_nopad_bin'];
         yield 'lower-case vendor string' => ['10.11.0-mariadb-log', 0, 'utf8mb4_nopad_bin'];
+        yield 'version typed as a number by the driver' => [8.4, 1, 'utf8mb4_0900_bin'];
     }
 
     #[DataProvider('withoutTheCollationProvider')]
